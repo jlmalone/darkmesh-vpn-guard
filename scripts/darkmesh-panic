@@ -1,0 +1,21 @@
+#!/bin/bash
+# One-button recovery to plain connectivity. It preserves Tailscale routes and
+# uses only fixed passwordless helper verbs, so it cannot destroy the SSH path.
+set -uo pipefail
+
+DESIRED_FILE="${DARKMESH_VPN_DESIRED:-$HOME/.config/darkmesh/vpn-desired}"
+PLAIN_RESTORE="${DARKMESH_PLAIN_RESTORE:-$(command -v darkmesh-restore-plain-network 2>/dev/null || echo "$(cd "$(dirname "$0")" && pwd)/darkmesh-restore-plain-network")}"
+
+echo "===> darkmesh-panic: restoring plain internet"
+mkdir -p "$(dirname "$DESIRED_FILE")"
+printf 'off\n' > "$DESIRED_FILE"
+echo "  [1/2] vpn-desired=off"
+
+[[ -x "$PLAIN_RESTORE" ]] || { echo "ERROR: plain-network restore helper missing: $PLAIN_RESTORE" >&2; exit 1; }
+"$PLAIN_RESTORE" || exit 1
+echo "  [2/2] ordinary network restored; transfer client remains contained"
+
+echo
+ping -c 1 -t 3 1.1.1.1 >/dev/null 2>&1 && echo "internet: reachable" || echo "internet: unreachable"
+host -W 3 example.com >/dev/null 2>&1 && echo "DNS: resolves" || echo "DNS: still broken"
+echo "Tailscale routes were left untouched. Re-arm later with: darkmesh-up"

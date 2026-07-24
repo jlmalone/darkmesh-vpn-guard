@@ -1,0 +1,10 @@
+# Sensitive hotspot SSIDs — case-insensitive substring match.
+# One pattern per line. Lines starting with # and blank lines are ignored.
+# An SSID containing any pattern below is treated as "unsafe" by vpn-guard.
+#
+# Defaults are personal phone names this machine has connected to or expects.
+# Add more as you connect to new hotspots.
+
+Pixel
+Galaxy
+iPhone

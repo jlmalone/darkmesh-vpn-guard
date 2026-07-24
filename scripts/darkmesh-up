@@ -1,0 +1,25 @@
+#!/bin/bash
+# darkmesh-up — declare we WANT the VPN up. Counterpart to darkmesh-panic (which
+# sets it down). Sets desired=on; the reconnect watchdog brings the VPN up on its
+# next tick, but ONLY once there is open (un-captive) internet — so this is safe
+# to run at any time, including right after captive sign-in.
+set -uo pipefail
+
+DESIRED_FILE="${DARKMESH_VPN_DESIRED:-$HOME/.config/darkmesh/vpn-desired}"
+CTL="/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl"
+PID_FILE="${DARKMESH_RECONNECT_PID_FILE:-$HOME/.config/darkmesh/reconnect.pid}"
+
+mkdir -p "$(dirname "$DESIRED_FILE")"
+printf 'on\n' > "$DESIRED_FILE"
+echo "darkmesh: vpn-desired=on"
+echo "  the reconnect watchdog will connect the VPN once open internet is detected."
+
+pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+  kill -USR1 "$pid" 2>/dev/null || true
+fi
+
+if [ -x "$CTL" ]; then
+  st="$("$CTL" --timeout 4 get connectionstate 2>/dev/null | head -1)"
+  echo "  ExpressVPN now: ${st:-unknown}"
+fi

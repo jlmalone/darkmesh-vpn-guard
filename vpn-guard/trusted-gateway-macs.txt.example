@@ -1,0 +1,7 @@
+# One stable gateway MAC per line. Case-insensitive exact match.
+#
+# Use this only when a known non-hotspot router has a locally-administered MAC
+# and would otherwise trigger the conservative hotspot fallback. Explicit SSID
+# matches and known tether subnets still take precedence.
+
+02:00:00:00:00:01

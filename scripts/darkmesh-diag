@@ -1,0 +1,198 @@
+#!/bin/bash
+# darkmesh-diag — capture pre/during/post state of an ExpressVPN connect
+# attempt to diagnose why Tailscale/CRD bypass and general internet fail when
+# VPN connects on certain networks.
+#
+# NON-INTERACTIVE: drives the VPN itself via expressvpnctl. Safe to run over
+# SSH-over-Tailscale even when VPN connect breaks Tailscale, because a detached
+# deadman process guarantees `expressvpnctl disconnect` runs at the end of the
+# window regardless of whether the SSH session survives.
+#
+# Internet-down window: ~35 seconds. Recovery is guaranteed (deadman + EXIT trap
+# + signal traps + standalone disowned safety process).
+#
+# Usage:
+#   darkmesh-diag [--window-seconds N] [--region SMART|<region>]
+#
+# Output: /tmp/darkmesh-diag-<timestamp>.log
+
+set -uo pipefail
+
+EXPRESSVPN_CTL="/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl"
+TAILSCALE_CLI="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+WINDOW=35
+REGION=""
+# Optional peer to probe during diagnostics. Set these in your shell / untracked config;
+# they intentionally do NOT hardcode any machine name or tailnet IP (public-repo hygiene).
+DIAG_PEER_HOST="${DARKMESH_DIAG_PEER_HOST:-}"
+DIAG_PEER_IP="${DARKMESH_DIAG_PEER_IP:-}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      cat <<'EOF'
+darkmesh-diag — capture state of an ExpressVPN connect attempt.
+
+The script drives the connect/disconnect itself. It is non-interactive and
+safe over flakey remote SSH: a detached deadman guarantees the VPN is
+disconnected within --window-seconds + 10s even if SSH drops mid-run.
+
+Options:
+  --window-seconds N   Time VPN is left connected for sampling (default 35).
+  --region REGION      ExpressVPN region (default: current saved region).
+  -h, --help           Show this help.
+
+Output: /tmp/darkmesh-diag-<timestamp>.log
+EOF
+      exit 0 ;;
+    --window-seconds) WINDOW="$2"; shift 2 ;;
+    --region)         REGION="$2"; shift 2 ;;
+    *) echo "ERROR: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+TS="$(date +%Y%m%d-%H%M%S)"
+LOG="/tmp/darkmesh-diag-$TS.log"
+
+exec > >(tee -a "$LOG") 2>&1
+
+[[ -x "$EXPRESSVPN_CTL" ]] || { echo "FATAL: $EXPRESSVPN_CTL missing"; exit 1; }
+[[ -x "$TAILSCALE_CLI"  ]] || echo "WARN: Tailscale CLI not found"
+
+DEADMAN_DELAY=$((WINDOW + 10))
+
+# Deadman: a fully detached process that runs `expressvpnctl disconnect`
+# unconditionally after DEADMAN_DELAY seconds. Survives parent death, SSH drop,
+# and signal-killed main script. Uses setsid (via nohup) + disown + redirected
+# I/O so it's not a child of this shell.
+spawn_deadman() {
+  nohup bash -c "
+    sleep $DEADMAN_DELAY
+    '$EXPRESSVPN_CTL' --timeout 5 disconnect >/dev/null 2>&1 || true
+    '$EXPRESSVPN_CTL' --timeout 5 set networklock false >/dev/null 2>&1 || true
+  " >/dev/null 2>&1 &
+  disown
+  echo "deadman scheduled: t+${DEADMAN_DELAY}s will force-disconnect (pid: detached)"
+}
+
+cleanup() {
+  local rc=$?
+  echo
+  echo "--- cleanup: ensuring ExpressVPN disconnected ---"
+  "$EXPRESSVPN_CTL" --timeout 5 disconnect >/dev/null 2>&1 || true
+  sleep 1
+  printf 'final connectionstate: '
+  "$EXPRESSVPN_CTL" get connectionstate 2>&1 | head -1
+  echo "log: $LOG"
+  exit $rc
+}
+trap cleanup EXIT INT TERM HUP
+
+section() { printf '\n========== %s ==========\n' "$*"; }
+
+snapshot() {
+  local label="$1"
+  section "$label @ $(date -u +%FT%TZ)"
+
+  echo "--- ExpressVPN ---"
+  "$EXPRESSVPN_CTL" --timeout 3 status 2>&1
+  printf 'connectionstate: '; "$EXPRESSVPN_CTL" --timeout 3 get connectionstate 2>&1 | head -1
+  printf 'splittunnel:     '; "$EXPRESSVPN_CTL" --timeout 3 get splittunnel 2>&1 | head -1
+  printf 'networklock:     '; "$EXPRESSVPN_CTL" --timeout 3 get networklock 2>&1 | head -1
+  printf 'protocol:        '; "$EXPRESSVPN_CTL" --timeout 3 get protocol 2>&1 | head -1
+  printf 'vpnip:           '; "$EXPRESSVPN_CTL" --timeout 3 get vpnip 2>&1 | head -1
+
+  echo
+  echo "--- Default routes (inet) ---"
+  netstat -rn -f inet 2>/dev/null | awk '/^Internet:/,/^Internet6:/' | grep -E '^(Destination|default|0/1|128/1)' || true
+
+  echo
+  echo "--- Interface IPs (non-loopback) ---"
+  ifconfig 2>/dev/null | awk '/^[a-z]/{iface=$1} /inet /{print iface, $0}' | grep -v 'inet 127' || true
+
+  echo
+  echo "--- DNS resolvers ---"
+  scutil --dns 2>/dev/null | grep -E 'nameserver|if_index|search domain' | head -20
+
+  echo
+  echo "--- Tailscale state ---"
+  "$TAILSCALE_CLI" status --self 2>&1 | head -3 || true
+
+  echo
+  echo "--- Reachability probes (each 4s timeout) ---"
+  local en1_ip
+  en1_ip="$(ifconfig en1 2>/dev/null | awk '/inet /{print $2; exit}')"
+  printf 'ping 1.1.1.1 (default):     '
+  ping -c 1 -W 1500 -t 4 1.1.1.1 2>&1 | awk '/packet loss/{print; found=1; exit} END{if(!found) print "timeout"}'
+  if [[ -n "$en1_ip" ]]; then
+    printf 'ping 1.1.1.1 (-b en1):      '
+    ping -c 1 -W 1500 -t 4 -b en1 1.1.1.1 2>&1 | awk '/packet loss/{print; found=1; exit} END{if(!found) print "timeout"}'
+  fi
+  printf 'dig @8.8.8.8 (default):     '
+  dig +timeout=3 +tries=1 @8.8.8.8 example.com +short 2>&1 | head -1
+  if [[ -n "$en1_ip" ]]; then
+    printf 'dig @8.8.8.8 (-b %s): ' "$en1_ip"
+    dig +timeout=3 +tries=1 -b "$en1_ip" @8.8.8.8 example.com +short 2>&1 | head -1
+  fi
+  if [[ -n "$DIAG_PEER_HOST" ]]; then
+    printf 'dig @100.100.100.100 (peer): '
+    dig +timeout=3 +tries=1 @100.100.100.100 "$DIAG_PEER_HOST" +short 2>&1 | head -1
+  fi
+  if [[ -n "$DIAG_PEER_IP" ]]; then
+    printf 'ping peer (Tailscale):      '
+    ping -c 1 -W 1500 -t 4 "$DIAG_PEER_IP" 2>&1 | awk '/packet loss/{print; found=1; exit} END{if(!found) print "timeout"}'
+  fi
+}
+
+section "darkmesh-diag start  log=$LOG  window=${WINDOW}s  region=${REGION:-(saved)}"
+date
+uname -a
+
+snapshot "PRE-VPN baseline"
+
+section "Spawning deadman (force-disconnect at t+${DEADMAN_DELAY}s) and initiating connect"
+spawn_deadman
+
+if [[ -n "$REGION" ]]; then
+  "$EXPRESSVPN_CTL" --timeout 10 connect "$REGION" || true
+else
+  "$EXPRESSVPN_CTL" --timeout 10 connect || true
+fi
+
+sleep 5;  snapshot "+5s after connect command"
+sleep 10; snapshot "+15s"
+sleep $((WINDOW - 15)); snapshot "+${WINDOW}s (window end)"
+
+section "Disconnecting ExpressVPN (main path)"
+"$EXPRESSVPN_CTL" --timeout 10 disconnect 2>&1 || true
+
+sleep 5
+snapshot "POST-DISCONNECT (+5s)"
+
+section "Tailscale netcheck (post-recovery)"
+"$TAILSCALE_CLI" netcheck 2>&1 | head -40 || true
+
+section "Recent ExpressVPN log file (if any)"
+recent_log="$(ls -t ~/Library/Logs/ExpressVPN/*.log 2>/dev/null | head -1 || true)"
+if [[ -n "$recent_log" && -s "$recent_log" ]]; then
+  echo "tail of $recent_log:"
+  tail -100 "$recent_log"
+else
+  echo "(no ExpressVPN user-side logs with content)"
+fi
+
+section "Unified log: SplitTunnel + Tailscale ext + ExpressVPN daemon (last 5m)"
+/usr/bin/log show \
+  --predicate '(process == "com.expressvpn.vpn.splittunnel" OR process == "io.tailscale.ipn.macsys.network-extension" OR process == "expressvpn-daemon" OR process == "ExpressVPN")' \
+  --last 5m 2>&1 | tail -120
+
+section "Unified log: ExpressVPN connect-relevant messages (last 5m)"
+/usr/bin/log show \
+  --predicate '(eventMessage CONTAINS[c] "lightway" OR eventMessage CONTAINS[c] "openvpn" OR eventMessage CONTAINS[c] "wireguard" OR eventMessage CONTAINS[c] "connect" OR eventMessage CONTAINS[c] "tunnel" OR eventMessage CONTAINS[c] "handshake") AND (process == "expressvpn-daemon" OR process == "ExpressVPN")' \
+  --last 5m 2>&1 | tail -60
+
+section "Route table — show any 100.64.x entries that may collide with Tailscale"
+netstat -rn -f inet 2>/dev/null | grep -E '^(Destination|100\.)'
+
+section "done"
+echo "Full log: $LOG"

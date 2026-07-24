@@ -1,0 +1,30 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell-tests:
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check shell syntax
+        run: |
+          find scripts tests vpn-guard -type f \( -name '*.sh' -o -perm -u+x \) -print0 |
+            while IFS= read -r -d '' file; do bash -n "$file"; done
+      - name: Run mocked tests
+        run: |
+          for test in tests/*.sh; do
+            bash "$test"
+          done

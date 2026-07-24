@@ -1,0 +1,35 @@
+#!/bin/bash
+# emergency-restore-internet — when general internet is dead, run this.
+# Disables Network Lock AND disconnects ExpressVPN. Internet should flow
+# through your normal Wi-Fi/Ethernet route within seconds.
+#
+# Sets vpn-desired=off so the reconnect watchdog stands down. It forces vpn-guard
+# unsafe but does not change split-tunnel rules, Tailscale routes, or client binding.
+# Re-arm later with darkmesh-up.
+#
+# Idempotent. Internet-free.
+
+set -uo pipefail
+
+DESIRED_FILE="${DARKMESH_VPN_DESIRED:-$HOME/.config/darkmesh/vpn-desired}"
+PLAIN_RESTORE="${DARKMESH_PLAIN_RESTORE:-$(command -v darkmesh-restore-plain-network 2>/dev/null || echo "$(cd "$(dirname "$0")" && pwd)/darkmesh-restore-plain-network")}"
+
+echo "==> Step 1: standing down darkmesh reconnect"
+mkdir -p "$(dirname "$DESIRED_FILE")"
+printf 'off\n' > "$DESIRED_FILE"
+echo "  vpn-desired=off"
+
+echo
+echo "==> Step 2: restoring ordinary network state"
+[[ -x "$PLAIN_RESTORE" ]] || { echo "ERROR: plain-network restore helper missing: $PLAIN_RESTORE" >&2; exit 1; }
+"$PLAIN_RESTORE" || exit 1
+
+echo
+echo "Internet should be working now via your normal route. ExpressVPN autoconnect and Network Lock are off."
+echo
+echo "the transfer client is still bound to the (now-down) ExpressVPN tunnel — transfer cannot"
+echo "leak even with VPN off, because its sockets have no interface."
+echo
+echo "When you want the airtight setup back:"
+echo "  1. darkmesh-up                         # lets the watchdog reconnect after open internet"
+echo "  2. (Do NOT re-enable Network Lock; leave it off so this trap cannot recur)"

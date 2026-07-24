@@ -1,0 +1,453 @@
+#!/bin/bash
+# darkmesh-protocol-trial — autonomous test harness searching for an ExpressVPN
+# protocol/region/mitigation combination that lets ExpressVPN + Tailscale
+# coexist with working DNS and internet.
+#
+# Designed to run unattended (`nohup darkmesh-protocol-trial &`). Survives:
+#   - SSH session death (detached, doesn't read stdin)
+#   - Repeated VPN-induced internet outages (each test has bounded recovery)
+#   - Total tunnel wedge (escalating recovery: disconnect → kill → restart)
+#   - Its own crash (deadman launched on start unconditionally restores state
+#     after MAX_RUNTIME no matter what)
+#
+# Outputs:
+#   /tmp/darkmesh-trial.log              full chronological log
+#   /tmp/darkmesh-trial-results.json     machine-readable per-test outcomes
+#   /tmp/darkmesh-trial-status           current state (one line)
+#
+# Test phases (in order; later phases only run if no earlier test was healthy):
+#   Phase 1: protocol matrix (auto, lightwayudp, lightwaytcp, openvpnudp,
+#            openvpntcp, wireguard) x Smart region
+#   Phase 2: best phase-1 candidate x several geographic regions
+#   Phase 3: Tailscale mitigations (--accept-dns=false, --disable-ipv4)
+#            combined with the best phase-1 protocol
+
+set -uo pipefail
+
+EXPRESSVPN_CTL="/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl"
+TAILSCALE_CLI="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+LOG=/tmp/darkmesh-trial.log
+RESULTS=/tmp/darkmesh-trial-results.json
+STATUS=/tmp/darkmesh-trial-status
+HEALTHCHECK_PLIST="$HOME/Library/LaunchAgents/com.user.darkmesh-healthcheck.plist"
+
+CONNECT_TIMEOUT=45         # max seconds to wait for state=Connected
+OBSERVE_WINDOW=25          # seconds to observe after Connected before judging
+COOLDOWN=10                # seconds between tests (let DNS/routes settle)
+MAX_RUNTIME=$((90 * 60))   # absolute kill switch — 90 minutes total
+
+# --- preflight --------------------------------------------------------------
+
+[[ -x "$EXPRESSVPN_CTL" ]] || { echo "FATAL: $EXPRESSVPN_CTL missing" >&2; exit 1; }
+[[ -x "$TAILSCALE_CLI"  ]] || { echo "FATAL: $TAILSCALE_CLI missing"  >&2; exit 1; }
+
+START_EPOCH=$(date +%s)
+
+# Truncate the log so previous runs don't confuse the user, but keep results
+# JSON from the prior run as a fallback in case this run aborts before writing.
+: > "$LOG"
+exec >>"$LOG" 2>&1
+
+set_status() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" > "$STATUS"; }
+log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
+
+# Initialize results JSON as an empty array; we append objects as the trial
+# progresses, then rewrite the file each time so it's always parseable.
+RESULTS_TMP="${RESULTS}.tmp"
+declare -a RESULT_ROWS=()
+flush_results() {
+  printf '[\n'                                                > "$RESULTS_TMP"
+  local i n=${#RESULT_ROWS[@]}
+  for ((i = 0; i < n; i++)); do
+    if (( i < n - 1 )); then printf '  %s,\n' "${RESULT_ROWS[i]}" >> "$RESULTS_TMP"
+    else                     printf '  %s\n'  "${RESULT_ROWS[i]}" >> "$RESULTS_TMP"
+    fi
+  done
+  printf ']\n' >> "$RESULTS_TMP"
+  mv "$RESULTS_TMP" "$RESULTS"
+}
+
+# --- absolute deadman watchdog ---------------------------------------------
+# Forks an unconditionally-detached recovery process: after MAX_RUNTIME,
+# regardless of what this script is doing or whether it's even alive, restore
+# the machine to a known-good state (VPN off, Network Lock off, Tailscale up).
+spawn_deadman() {
+  local pid=$$
+  nohup bash -c "
+    sleep $MAX_RUNTIME
+    # If main script still alive, do nothing — its cleanup trap will run.
+    if kill -0 $pid 2>/dev/null; then exit 0; fi
+    {
+      echo \"\$(date -u +%FT%TZ) DEADMAN fired (trial pid \$pid no longer alive)\"
+      '$EXPRESSVPN_CTL' --timeout 5 disconnect       >/dev/null 2>&1 || true
+      '$EXPRESSVPN_CTL' --timeout 5 set networklock false >/dev/null 2>&1 || true
+      '$TAILSCALE_CLI' up                            >/dev/null 2>&1 || true
+    } >> '$LOG' 2>&1
+  " </dev/null >/dev/null 2>&1 &
+  disown
+  log "deadman scheduled: fires absolute cleanup at t+${MAX_RUNTIME}s (pid: detached)"
+}
+
+# --- recovery escalation ---------------------------------------------------
+
+probe_internet_quick() { ping -c 1 -W 1500 -t 3 1.1.1.1 >/dev/null 2>&1; }
+probe_dns_quick()      { host -W 3 example.com >/dev/null 2>&1; }
+probe_tailscale_quick() {
+  [[ -x "$TAILSCALE_CLI" ]] || return 0
+  local out
+  out="$("$TAILSCALE_CLI" status --self --peers=false 2>&1)" || return 1
+  printf '%s' "$out" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+.*-[[:space:]]*$' \
+    || printf '%s' "$out" | grep -qv 'offline'
+}
+
+machine_healthy() { probe_internet_quick && probe_dns_quick; }
+
+escalate_recovery() {
+  log "recovery: starting escalation"
+  set_status "RECOVERING (step 1: disconnect)"
+  "$EXPRESSVPN_CTL" --timeout 10 disconnect >/dev/null 2>&1 || true
+  sleep 4
+  if machine_healthy; then log "recovery: OK after disconnect"; return 0; fi
+
+  log "recovery: still broken — step 2: networklock off + force disconnect"
+  set_status "RECOVERING (step 2: networklock off)"
+  "$EXPRESSVPN_CTL" --timeout 5 set networklock false >/dev/null 2>&1 || true
+  "$EXPRESSVPN_CTL" --timeout 5 disconnect           >/dev/null 2>&1 || true
+  sleep 4
+  if machine_healthy; then log "recovery: OK after networklock off"; return 0; fi
+
+  log "recovery: step 3 — restart Tailscale"
+  set_status "RECOVERING (step 3: tailscale down/up)"
+  "$TAILSCALE_CLI" down >/dev/null 2>&1 || true
+  sleep 2
+  "$TAILSCALE_CLI" up   >/dev/null 2>&1 || true
+  sleep 4
+  if machine_healthy; then log "recovery: OK after tailscale bounce"; return 0; fi
+
+  log "recovery: step 4 — kill ExpressVPN processes"
+  set_status "RECOVERING (step 4: kill expressvpn)"
+  pkill -9 -x expressvpn-daemon 2>/dev/null || true
+  pkill -9 -x ExpressVPN        2>/dev/null || true
+  sleep 5
+  # ExpressVPN GUI relaunches the daemon via launchd; just give it space.
+  if machine_healthy; then log "recovery: OK after expressvpn kill"; return 0; fi
+
+  log "recovery: step 5 — bounce Tailscale again after expressvpn kill"
+  "$TAILSCALE_CLI" down >/dev/null 2>&1 || true
+  sleep 2
+  "$TAILSCALE_CLI" up   >/dev/null 2>&1 || true
+  sleep 5
+  if machine_healthy; then log "recovery: OK after final tailscale bounce"; return 0; fi
+
+  log "recovery: ALL STEPS FAILED — machine still unhealthy"
+  set_status "CRITICAL: recovery failed at $(date -u +%FT%TZ)"
+  return 1
+}
+
+# --- per-test execution ----------------------------------------------------
+
+current_vpn_iface_ip() {
+  # The /1-route trick ExpressVPN uses to override default — its tunnel
+  # interface is the netif for "0/1" or "0.0.0.0/1".
+  local iface
+  iface="$(netstat -rn -f inet 2>/dev/null | awk '$1=="0/1" {print $NF; exit}')"
+  [[ -n "$iface" ]] || iface="$(netstat -rn -f inet 2>/dev/null | awk '$1=="default" && $NF ~ /^utun[0-9]+$/ {print $NF; exit}')"
+  [[ -z "$iface" ]] && { printf 'iface=unknown addr=unknown peer=unknown'; return; }
+  local line addr peer
+  line="$(ifconfig "$iface" 2>/dev/null | awk '/inet /{print; exit}')"
+  addr="$(printf '%s' "$line" | awk '{print $2}')"
+  peer="$(printf '%s' "$line" | awk '/-->/{for(i=1;i<=NF;i++) if($i=="-->") print $(i+1); exit}')"
+  printf 'iface=%s addr=%s peer=%s' "$iface" "${addr:-?}" "${peer:-?}"
+}
+
+# JSON-string-escape a value (newlines, quotes, backslashes).
+jesc() { python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1" 2>/dev/null \
+        || printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/$/\\n/' | tr -d '\n' | sed 's/\\n$//')"; }
+
+record_result() {
+  # All args as key=value pairs; emit a JSON object string.
+  local row="{"
+  local first=yes
+  while [[ $# -gt 0 ]]; do
+    local k="${1%%=*}" v="${1#*=}"
+    if [[ "$first" == "yes" ]]; then first=no; else row+=", "; fi
+    row+="\"$k\": $(jesc "$v")"
+    shift
+  done
+  row+="}"
+  RESULT_ROWS+=("$row")
+  flush_results
+}
+
+# Run a single connect attempt with current settings; return one of:
+#   HEALTHY      — Connected, all probes pass after observe window
+#   DEGRADED     — Connected, internet+dns OK but tailscale wobbly
+#   BROKEN-DNS   — Connected, internet OK but DNS fails
+#   BROKEN-INTERNET — Connected, basic internet fails
+#   TIMEOUT      — Never reached Connected within CONNECT_TIMEOUT
+#   ERROR        — couldn't even initiate
+#
+# Echoes one summary line to the log and to record_result.
+run_one_attempt() {
+  local label="$1" protocol="$2" region="$3"
+
+  log ""
+  log "=== TEST: $label (protocol=$protocol region=$region) ==="
+  set_status "TESTING: $label"
+
+  # Pre-test recovery if previous test left things broken.
+  if ! machine_healthy; then
+    log "pre-test: machine unhealthy, running recovery"
+    escalate_recovery || { record_result label="$label" protocol="$protocol" region="$region" outcome=PRE_BROKEN; return 1; }
+  fi
+
+  # Apply protocol.
+  if [[ -n "$protocol" && "$protocol" != "(skip)" ]]; then
+    log "set protocol=$protocol"
+    "$EXPRESSVPN_CTL" --timeout 5 set protocol "$protocol" 2>&1 | head -3 \
+      || { log "  set protocol failed"; record_result label="$label" protocol="$protocol" region="$region" outcome=ERROR error="set_protocol_failed"; return 2; }
+  fi
+
+  log "initiating connect..."
+  local connect_start=$(date +%s)
+  if [[ "$region" == "smart" || -z "$region" ]]; then
+    "$EXPRESSVPN_CTL" --timeout 10 connect 2>&1 | head -3
+  else
+    "$EXPRESSVPN_CTL" --timeout 10 connect "$region" 2>&1 | head -3
+  fi
+
+  # Wait for Connected (or fail).
+  local state="" elapsed=0
+  while (( elapsed < CONNECT_TIMEOUT )); do
+    state="$("$EXPRESSVPN_CTL" --timeout 3 get connectionstate 2>/dev/null | head -1)"
+    [[ "$state" == "Connected" ]] && break
+    sleep 2
+    elapsed=$(($(date +%s) - connect_start))
+  done
+
+  if [[ "$state" != "Connected" ]]; then
+    log "  TIMEOUT: state=$state after ${elapsed}s"
+    "$EXPRESSVPN_CTL" --timeout 10 disconnect >/dev/null 2>&1 || true
+    record_result label="$label" protocol="$protocol" region="$region" \
+                  outcome=TIMEOUT seconds_to_connect="$elapsed" final_state="$state"
+    sleep "$COOLDOWN"
+    return 0
+  fi
+
+  local connect_time=$elapsed
+  log "  Connected after ${connect_time}s. Protocol now in use: $("$EXPRESSVPN_CTL" status 2>/dev/null | awk -F': ' '/Protocol in use/{print $2}')"
+
+  local tunnel_info
+  tunnel_info="$(current_vpn_iface_ip)"
+  log "  tunnel: $tunnel_info"
+  local tunnel_collides=no
+  if printf '%s' "$tunnel_info" | grep -qE 'addr=100\.64\.'; then
+    tunnel_collides=yes
+    log "  WARN: tunnel address falls within Tailscale's 100.64.0.0/10 range"
+  fi
+
+  # Observe window — probe at intervals so a transient hiccup doesn't decide.
+  local i internet_ok=no dns_ok=no tailscale_ok=no
+  sleep 5  # let the dust settle
+  for i in 1 2 3 4; do
+    probe_internet_quick && internet_ok=yes || true
+    probe_dns_quick      && dns_ok=yes      || true
+    probe_tailscale_quick && tailscale_ok=yes || true
+    [[ "$internet_ok" == "yes" && "$dns_ok" == "yes" ]] && break
+    sleep 5
+  done
+
+  local dns_resolvers
+  dns_resolvers="$(scutil --dns 2>/dev/null | awk '/nameserver\[0\]/{print $3}' | sort -u | tr '\n' ',' | sed 's/,$//')"
+  log "  observed: internet=$internet_ok dns=$dns_ok tailscale=$tailscale_ok dns_resolvers=$dns_resolvers"
+
+  local outcome
+  if [[ "$internet_ok" == "yes" && "$dns_ok" == "yes" && "$tailscale_ok" == "yes" ]]; then
+    outcome=HEALTHY
+  elif [[ "$internet_ok" == "yes" && "$dns_ok" == "yes" ]]; then
+    outcome=DEGRADED
+  elif [[ "$internet_ok" == "yes" ]]; then
+    outcome=BROKEN-DNS
+  else
+    outcome=BROKEN-INTERNET
+  fi
+
+  log "  RESULT: $outcome"
+
+  # Always disconnect at the end of an attempt so each test starts clean.
+  "$EXPRESSVPN_CTL" --timeout 10 disconnect >/dev/null 2>&1 || true
+
+  record_result label="$label" protocol="$protocol" region="$region" \
+                outcome="$outcome" seconds_to_connect="$connect_time" \
+                tunnel="$tunnel_info" tunnel_collides="$tunnel_collides" \
+                dns_resolvers="$dns_resolvers" \
+                internet_ok="$internet_ok" dns_ok="$dns_ok" tailscale_ok="$tailscale_ok"
+
+  sleep "$COOLDOWN"
+  if ! machine_healthy; then escalate_recovery || true; fi
+}
+
+# --- coordination with healthcheck -----------------------------------------
+
+pause_healthcheck() {
+  if [[ -f "$HEALTHCHECK_PLIST" ]]; then
+    log "pausing darkmesh-healthcheck LaunchAgent (so it doesn't disconnect mid-observation)"
+    launchctl bootout "gui/$(id -u)" "$HEALTHCHECK_PLIST" 2>/dev/null || true
+  fi
+}
+
+resume_healthcheck() {
+  if [[ -f "$HEALTHCHECK_PLIST" ]]; then
+    log "resuming darkmesh-healthcheck LaunchAgent"
+    launchctl bootstrap "gui/$(id -u)" "$HEALTHCHECK_PLIST" 2>/dev/null \
+      || launchctl load -w "$HEALTHCHECK_PLIST" 2>/dev/null || true
+  fi
+}
+
+# --- final cleanup trap ----------------------------------------------------
+
+cleanup() {
+  local rc=$?
+  log ""
+  log "=== TRIAL ENDING (exit rc=$rc) ==="
+  set_status "CLEANUP"
+  "$EXPRESSVPN_CTL" --timeout 10 disconnect >/dev/null 2>&1 || true
+  # If for any reason Tailscale was left in --disable-ipv4 mode or DNS-off,
+  # restore defaults so we don't leave the user in an unexpected state.
+  "$TAILSCALE_CLI" set --accept-dns=true --advertise-routes= 2>/dev/null || true
+  "$TAILSCALE_CLI" up >/dev/null 2>&1 || true
+  resume_healthcheck
+  flush_results
+  set_status "DONE at $(date -u +%FT%TZ) — see $RESULTS"
+  log "results: $RESULTS"
+  log "log:     $LOG"
+  exit $rc
+}
+trap cleanup EXIT INT TERM HUP
+
+# --- start ------------------------------------------------------------------
+
+log "=== darkmesh-protocol-trial start  pid=$$  hostname=$(hostname -s)  date=$(date) ==="
+set_status "STARTING at $(date -u +%FT%TZ)"
+spawn_deadman
+pause_healthcheck
+
+# Save original protocol so we can restore.
+ORIGINAL_PROTOCOL="$("$EXPRESSVPN_CTL" --timeout 3 get protocol 2>/dev/null | head -1)"
+log "original protocol: ${ORIGINAL_PROTOCOL:-unknown}"
+
+# Sanity baseline (no VPN) — confirms the machine starts healthy.
+"$EXPRESSVPN_CTL" --timeout 10 disconnect >/dev/null 2>&1 || true
+sleep 3
+if machine_healthy; then log "baseline: machine healthy with VPN off"
+else log "baseline: WARN machine not fully healthy before any test"
+fi
+
+# === Phase 1: protocol matrix on Smart region ============================
+log ""
+log "########## PHASE 1: protocol matrix (Smart region) ##########"
+PROTOCOLS=(wireguard openvpnudp openvpntcp lightwayudp lightwaytcp)
+for p in "${PROTOCOLS[@]}"; do
+  run_one_attempt "phase1-$p" "$p" "smart" || true
+done
+
+# === Phase 2: best phase-1 candidate across regions =======================
+# Pick the best-performing protocol from phase 1 (HEALTHY > DEGRADED > others).
+best_proto=""
+best_outcome=""
+for row in "${RESULT_ROWS[@]}"; do
+  case "$row" in
+    *'"outcome": "HEALTHY"'*)   o=HEALTHY ;;
+    *'"outcome": "DEGRADED"'*)  o=DEGRADED ;;
+    *'"outcome": "BROKEN-DNS"'*) o=BROKEN-DNS ;;
+    *) continue ;;
+  esac
+  # Extract the protocol value.
+  p="$(printf '%s' "$row" | python3 -c 'import json,sys;d=json.loads(sys.stdin.read());print(d.get("protocol",""))' 2>/dev/null)"
+  case "$o:$best_outcome" in
+    HEALTHY:*)            best_proto=$p; best_outcome=$o ;;
+    DEGRADED:)            best_proto=$p; best_outcome=$o ;;
+    DEGRADED:BROKEN-DNS)  best_proto=$p; best_outcome=$o ;;
+    BROKEN-DNS:)          best_proto=$p; best_outcome=$o ;;
+  esac
+done
+log ""
+log "phase 1 winner: protocol=${best_proto:-NONE} outcome=${best_outcome:-NONE}"
+
+if [[ -n "$best_proto" && "$best_outcome" == "HEALTHY" ]]; then
+  log "Phase 1 found a HEALTHY config — skipping phase 2 region sweep and phase 3 mitigations."
+  log "Best config: protocol=$best_proto"
+  # Apply it as the persistent setting and finish.
+  "$EXPRESSVPN_CTL" --timeout 5 set protocol "$best_proto" >/dev/null 2>&1 || true
+elif [[ -n "$best_proto" ]]; then
+  log ""
+  log "########## PHASE 2: $best_proto across regions ##########"
+  REGIONS=(usa-los-angeles-2 usa-new-york canada-toronto-2 uk-london netherlands-the-hague)
+  for r in "${REGIONS[@]}"; do
+    run_one_attempt "phase2-$best_proto-$r" "$best_proto" "$r" || true
+  done
+else
+  log ""
+  log "Phase 1 had no usable outcomes. Skipping phase 2; jumping to phase 3 mitigations on wireguard."
+  best_proto=wireguard
+fi
+
+# === Phase 3: Tailscale-side mitigations (only if nothing healthy yet) ====
+needs_phase3=yes
+for row in "${RESULT_ROWS[@]}"; do
+  case "$row" in *'"outcome": "HEALTHY"'*) needs_phase3=no; break ;; esac
+done
+
+if [[ "$needs_phase3" == "yes" ]]; then
+  log ""
+  log "########## PHASE 3: Tailscale mitigations with protocol=$best_proto ##########"
+
+  log "mitigation A: tailscale set --accept-dns=false"
+  "$TAILSCALE_CLI" set --accept-dns=false 2>&1 | head -3 || true
+  sleep 3
+  run_one_attempt "phase3-accept-dns-false" "$best_proto" "smart" || true
+  "$TAILSCALE_CLI" set --accept-dns=true 2>&1 | head -3 || true
+  sleep 3
+
+  log "mitigation B: disable Tailscale MagicDNS at the node level by setting use-tailscale-dns off"
+  # On macsys Tailscale, this is the same toggle as --accept-dns=false above; we
+  # retry it in conjunction with explicit nameserver pinning via /etc/resolver
+  # is too invasive here. Move on.
+
+  log "mitigation C: tailscale down (let ExpressVPN have the network exclusively, sanity check)"
+  "$TAILSCALE_CLI" down >/dev/null 2>&1 || true
+  sleep 3
+  run_one_attempt "phase3-tailscale-down" "$best_proto" "smart" || true
+  "$TAILSCALE_CLI" up >/dev/null 2>&1 || true
+  sleep 3
+fi
+
+# === Restore final state ====================================================
+log ""
+log "########## restoring final state ##########"
+
+# Pick the single best result and leave the protocol set to its winner.
+final_winner=""
+for row in "${RESULT_ROWS[@]}"; do
+  case "$row" in
+    *'"outcome": "HEALTHY"'*)
+      p="$(printf '%s' "$row" | python3 -c 'import json,sys;d=json.loads(sys.stdin.read());print(d.get("protocol",""))' 2>/dev/null)"
+      [[ -n "$p" && "$p" != "(skip)" ]] && final_winner="$p"
+      break ;;
+  esac
+done
+
+if [[ -n "$final_winner" ]]; then
+  log "applying winning protocol=$final_winner persistently"
+  "$EXPRESSVPN_CTL" --timeout 5 set protocol "$final_winner" >/dev/null 2>&1 || true
+elif [[ -n "$ORIGINAL_PROTOCOL" ]]; then
+  log "no winner — restoring original protocol=$ORIGINAL_PROTOCOL"
+  "$EXPRESSVPN_CTL" --timeout 5 set protocol "$ORIGINAL_PROTOCOL" >/dev/null 2>&1 || true
+fi
+
+log ""
+log "########## SUMMARY ##########"
+log "results JSON: $RESULTS"
+for row in "${RESULT_ROWS[@]}"; do log "  $row"; done
+
+# cleanup trap handles the rest (final disconnect, tailscale up, healthcheck resume).

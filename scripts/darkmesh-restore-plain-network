@@ -1,0 +1,62 @@
+#!/bin/bash
+# Restore ordinary DHCP-backed connectivity without weakening transfer-client
+# containment. This helper changes network state only; callers own vpn-desired.
+set -uo pipefail
+
+EXPRESSVPN_CTL="${EXPRESSVPN_CTL:-/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl}"
+TAILSCALE_CLI="${TAILSCALE_CLI:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
+ROOT_HELPER="${DARKMESH_ROOT_HELPER:-/Library/darkmesh/bin/darkmesh-root-helper}"
+VPN_GUARD="${DARKMESH_VPN_GUARD:-$(command -v vpn-guard.sh 2>/dev/null || true)}"
+PROBE_NAME="${DARKMESH_PROBE_NAME:-.}"
+QUIET=no
+[[ "${1:-}" == --quiet ]] && QUIET=yes
+[[ $# -le 1 ]] || { echo "Usage: darkmesh-restore-plain-network [--quiet]" >&2; exit 2; }
+[[ $# -eq 0 || "${1:-}" == --quiet ]] || { echo "Usage: darkmesh-restore-plain-network [--quiet]" >&2; exit 2; }
+
+log() { [[ "$QUIET" == yes ]] || printf 'darkmesh: %s\n' "$*" >&2; }
+root_call() {
+  local verb="$1"
+  [[ -x "$ROOT_HELPER" ]] || return 1
+  if [[ "${DARKMESH_NO_SUDO:-0}" == 1 ]]; then
+    "$ROOT_HELPER" "$verb"
+  else
+    sudo -n "$ROOT_HELPER" "$verb"
+  fi
+}
+
+# Close the only strict component before changing the machine's default path.
+# If containment cannot be confirmed, do not disconnect the VPN underneath it.
+if [[ "${DARKMESH_SKIP_GUARD:-0}" != 1 ]]; then
+  if [[ -z "$VPN_GUARD" || ! -x "$VPN_GUARD" ]]; then
+    log "ERROR: transfer guard missing; refusing plain-network transition"
+    exit 1
+  fi
+  if ! "$VPN_GUARD" --force-unsafe >/dev/null 2>&1; then
+    log "ERROR: transfer containment failed; refusing plain-network transition"
+    exit 1
+  fi
+fi
+
+if [[ -x "$EXPRESSVPN_CTL" ]]; then
+  "$EXPRESSVPN_CTL" set autoconnect false >/dev/null 2>&1 || true
+  "$EXPRESSVPN_CTL" set networklock false >/dev/null 2>&1 || true
+  "$EXPRESSVPN_CTL" --timeout 10 disconnect >/dev/null 2>&1 \
+    || "$EXPRESSVPN_CTL" disconnect >/dev/null 2>&1 || true
+fi
+
+# Undo only helper-owned DNS state, then keep Tailscale out of the system DNS
+# path. Tailscale remains running and its routes are untouched.
+root_call dns-restore >/dev/null 2>&1 || true
+if [[ -x "$TAILSCALE_CLI" ]]; then
+  "$TAILSCALE_CLI" set --accept-dns=false >/dev/null 2>&1 || true
+fi
+root_call dns-flush >/dev/null 2>&1 || true
+
+# If restored system DNS still cannot answer a neutral root-zone query, promote
+# the current network's DHCP resolvers through the existing journaled helper.
+if ! host -W 3 -t NS "$PROBE_NAME" >/dev/null 2>&1; then
+  root_call dns-override >/dev/null 2>&1 || true
+fi
+
+log "plain network restored (VPN autoconnect off, Network Lock off, DHCP DNS preferred)"
+exit 0

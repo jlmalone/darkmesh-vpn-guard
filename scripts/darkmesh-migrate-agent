@@ -1,0 +1,210 @@
+#!/bin/bash
+# Replace legacy per-script LaunchAgents with Server Monitor's signed supervisor.
+set -euo pipefail
+
+APPLY=no
+case "${1:-}" in
+  --apply) APPLY=yes ;;
+  --dry-run|"") ;;
+  *) echo "Usage: darkmesh-migrate-agent [--dry-run|--apply]" >&2; exit 2 ;;
+esac
+
+uid="$(id -u)"
+domain="gui/$uid"
+app="${SERVER_MONITOR_APP:-/Applications/ServerMonitor.app}"
+agent_label=vision.salient.InfrastructureAgent
+agent_binary="$app/Contents/Resources/InfrastructureAgent"
+agent_plist="$app/Contents/Library/LaunchAgents/vision.salient.InfrastructureAgent.plist"
+config="$HOME/.config/server-monitor/infrastructure-agent.json"
+status="$HOME/Library/Application Support/ServerMonitor/infrastructure-agent-status.json"
+legacy=(
+  com.user.darkmesh-netchange
+  com.user.choam-autodrain
+  com.user.vpnguard
+  com.user.darkmesh-reconnect
+  com.user.darkmesh-healthcheck
+)
+
+fail() { echo "ERROR: $*" >&2; exit 1; }
+[[ -x "$agent_binary" ]] || fail "signed supervisor missing: $agent_binary"
+[[ -f "$agent_plist" ]] || fail "bundled LaunchAgent missing: $agent_plist"
+[[ -r "$config" ]] || fail "supervisor config missing: $config"
+codesign --verify --deep --strict "$app" >/dev/null 2>&1 \
+  || fail "Server Monitor signature is invalid"
+app_team="$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+agent_team="$(codesign -dv --verbose=4 "$agent_binary" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+[[ -n "$app_team" && "$app_team" != "not set" && "$agent_team" == "$app_team" ]] \
+  || fail "app and supervisor must share a real signing Team ID"
+app_authority="$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^Authority=//p' | sed -n '1p')"
+agent_authority="$(codesign -dv --verbose=4 "$agent_binary" 2>&1 | sed -n 's/^Authority=//p' | sed -n '1p')"
+[[ "$app_authority" == "Developer ID Application:"* \
+   && "$agent_authority" == "Developer ID Application:"* ]] \
+  || fail "app and supervisor must be signed with a Developer ID Application certificate"
+app_bundle="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null || true)"
+associated_bundle="$(/usr/libexec/PlistBuddy -c 'Print :AssociatedBundleIdentifiers:0' "$agent_plist" 2>/dev/null || true)"
+[[ -n "$app_bundle" && "$associated_bundle" == "$app_bundle" ]] \
+  || fail "LaunchAgent association does not match the signed app bundle"
+
+/usr/bin/python3 - "$config" <<'PY' || fail "supervisor config is invalid or references a missing executable"
+import json, os, sys
+d = json.load(open(sys.argv[1]))
+assert d.get("schema") == 1
+commands = [x["command"] for x in d.get("persistentChildren", []) + d.get("scheduledJobs", [])]
+assert commands and all(c and os.access(os.path.expanduser(c[0]), os.X_OK) for c in commands)
+PY
+
+echo "Unified agent: $agent_binary"
+echo "Config:        $config"
+for label in "${legacy[@]}"; do
+  if launchctl print "$domain/$label" >/dev/null 2>&1 || [[ -f "$HOME/Library/LaunchAgents/$label.plist" ]]; then
+    echo "Legacy item:   $label"
+  fi
+done
+[[ "$APPLY" == yes ]] || { echo "Dry run only; pass --apply to migrate."; exit 0; }
+
+# Launching the app performs SMAppService registration. User approval may still
+# be required in System Settings; never remove the old guards until registration
+# is visible to launchd.
+/usr/bin/open -gj "$app"
+loaded=no
+for _ in {1..30}; do
+  if launchctl print "$domain/$agent_label" >/dev/null 2>&1; then loaded=yes; break; fi
+  sleep 1
+done
+[[ "$loaded" == yes ]] || fail "unified agent not registered; open Server Monitor settings and approve it first"
+
+backup_parent="$HOME/.local/state/darkmesh"
+mkdir -p "$backup_parent"
+backup="$(mktemp -d "$backup_parent/legacy-launchagents-$(date +%Y%m%d-%H%M%S).XXXXXX")" \
+  || fail "unable to create rollback directory"
+cp -p "$config" "$backup/infrastructure-agent.json"
+for label in "${legacy[@]}"; do
+  plist="$HOME/Library/LaunchAgents/$label.plist"
+  [[ -f "$plist" ]] && cp -p "$plist" "$backup/"
+  launchctl bootout "$domain/$label" >/dev/null 2>&1 \
+    || launchctl bootout "$domain" "$plist" >/dev/null 2>&1 \
+    || true
+  rm -f "$plist"
+done
+
+healthy=no
+for _ in {1..45}; do
+  if [[ -r "$status" ]] && /usr/bin/python3 - "$status" <<'PY' >/dev/null 2>&1
+import datetime, json, os, sys, time
+p = sys.argv[1]
+d = json.load(open(p))
+children = {x.get("id"): x for x in d.get("children", [])}
+jobs = {x.get("id"): x for x in d.get("scheduledJobs", [])}
+now = datetime.datetime.now(datetime.timezone.utc)
+def job_healthy(row):
+    if row.get("timedOut") is True:
+        return False
+    if row.get("running") is True:
+        return True
+    if row.get("lastExitStatus") != 0 or not row.get("lastRunAt"):
+        return False
+    completed = datetime.datetime.fromisoformat(row["lastRunAt"].replace("Z", "+00:00"))
+    max_age = max(90.0, float(row.get("intervalSeconds", 0)) * 2 + 30)
+    return (now - completed).total_seconds() <= max_age
+ok = d.get("schema") == 2 and time.time() - os.path.getmtime(p) < 90
+ok = ok and d.get("configLoaded") is True
+ok = ok and all(k in children for k in ("darkmesh-healthcheck", "darkmesh-reconnect"))
+ok = ok and all(row.get("running") is True and row.get("responsive") is True
+                for row in children.values())
+ok = ok and "vpn-guard" in jobs and all(job_healthy(row) for row in jobs.values())
+raise SystemExit(0 if ok else 1)
+PY
+  then healthy=yes; break
+  fi
+  sleep 1
+done
+
+if [[ "$healthy" != yes ]]; then
+  echo "ERROR: unified children did not become healthy; restoring legacy plists from $backup" >&2
+  # Remove only workloads for which a legacy plist can actually be restored.
+  # Other teams may also use this generic supervisor; never erase their jobs as
+  # collateral damage during a darkmesh rollback.
+  if ! /usr/bin/python3 - "$config" "$backup" <<'PY'
+import json, os, sys, tempfile
+path, backup = sys.argv[1:]
+with open(path, encoding="utf-8") as stream:
+    payload = json.load(stream)
+child_plists = {
+    "darkmesh-healthcheck": ("com.user.darkmesh-healthcheck.plist",),
+    "darkmesh-reconnect": (
+        "com.user.darkmesh-reconnect.plist",
+        "com.user.darkmesh-netchange.plist",
+    ),
+}
+job_plists = {
+    "vpn-guard": ("com.user.vpnguard.plist",),
+    "choam-autodrain": ("com.user.choam-autodrain.plist",),
+}
+def restorable(names):
+    return any(os.path.isfile(os.path.join(backup, name)) for name in names)
+remove_children = {key for key, names in child_plists.items() if restorable(names)}
+remove_jobs = {key for key, names in job_plists.items() if restorable(names)}
+payload["persistentChildren"] = [
+    row for row in payload.get("persistentChildren", [])
+    if row.get("id") not in remove_children
+]
+payload["scheduledJobs"] = [
+    row for row in payload.get("scheduledJobs", [])
+    if row.get("id") not in remove_jobs
+]
+if not any(row.get("networkChangeSignal") for row in payload["persistentChildren"]):
+    payload["watchNetworkChanges"] = False
+fd, temp = tempfile.mkstemp(prefix="infrastructure-agent.rollback.", suffix=".json",
+                            dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        json.dump(payload, stream, indent=2)
+        stream.write("\n")
+    os.replace(temp, path)
+except Exception:
+    try: os.unlink(temp)
+    except OSError: pass
+    raise
+PY
+  then
+    fail "unable to prepare filtered supervisor rollback config"
+  fi
+  # Ask the still-registered service to restart onto the filtered config. This
+  # preserves unrelated supervised work; bootout would take all of it offline.
+  launchctl kill SIGTERM "$domain/$agent_label" >/dev/null 2>&1 || true
+  for _ in {1..10}; do
+    if [[ ! -r "$status" ]] || /usr/bin/python3 - "$status" "$backup" <<'PY' >/dev/null 2>&1
+import json, os, sys
+status, backup = sys.argv[1:]
+d = json.load(open(status))
+children = {row.get("id") for row in d.get("children", [])}
+jobs = {row.get("id") for row in d.get("scheduledJobs", [])}
+restored_children = set()
+restored_jobs = set()
+if os.path.isfile(os.path.join(backup, "com.user.darkmesh-healthcheck.plist")):
+    restored_children.add("darkmesh-healthcheck")
+if any(os.path.isfile(os.path.join(backup, name)) for name in
+       ("com.user.darkmesh-reconnect.plist", "com.user.darkmesh-netchange.plist")):
+    restored_children.add("darkmesh-reconnect")
+if os.path.isfile(os.path.join(backup, "com.user.vpnguard.plist")):
+    restored_jobs.add("vpn-guard")
+if os.path.isfile(os.path.join(backup, "com.user.choam-autodrain.plist")):
+    restored_jobs.add("choam-autodrain")
+raise SystemExit(0 if children.isdisjoint(restored_children)
+                 and jobs.isdisjoint(restored_jobs) else 1)
+PY
+    then
+      break
+    fi
+    sleep 1
+  done
+  for plist in "$backup"/*.plist; do
+    [[ -f "$plist" ]] || continue
+    dst="$HOME/Library/LaunchAgents/$(basename "$plist")"
+    cp -p "$plist" "$dst"
+    launchctl bootstrap "$domain" "$dst" >/dev/null 2>&1 || true
+  done
+  exit 1
+fi
+
+echo "Migration complete. Legacy backup: $backup"

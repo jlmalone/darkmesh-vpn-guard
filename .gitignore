@@ -1,0 +1,7 @@
+# Untracked local notes/briefs that carry REAL names (transfer client, VPN vendor,
+# hosts). Synced out of band, NEVER committed — this public repo stays euphemized.
+*.local.*
+docs/server-monitor-darkmesh-brief.md
+
+# macOS cruft
+.DS_Store

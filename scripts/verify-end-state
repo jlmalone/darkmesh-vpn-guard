@@ -1,0 +1,16 @@
+#!/bin/bash
+# Verify the desired ExpressVPN + Tailscale + transfer-client end state.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+"$ROOT/scripts/darkmesh-expressvpn-tailscale" verify
+echo
+"$ROOT/scripts/transfer-vpn-doctor"
+echo
+if [[ -x /usr/local/bin/vpn-guard.sh ]]; then
+  /usr/local/bin/vpn-guard.sh
+else
+  echo "WARN: /usr/local/bin/vpn-guard.sh is not installed"
+fi

@@ -1,0 +1,48 @@
+#!/bin/bash
+# relax-network-lock — disable ExpressVPN Network Lock so a tunnel hiccup or
+# manual disconnect never blocks general internet. transfer-leak protection still
+# stands via:
+#   1. the transfer client bound to the ExpressVPN tunnel interface (fail-closed)
+#   2. vpn-guard PF anchor blocks transfer ports on every interface when UNSAFE
+#   3. vpn-guard pauses the transfer client via Web API when UNSAFE
+#
+# Idempotent. Internet-free (uses only the local ExpressVPN daemon socket).
+
+set -uo pipefail
+
+EXPRESSVPN_CTL="/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl"
+
+if [[ ! -x "$EXPRESSVPN_CTL" ]]; then
+  echo "ERROR: $EXPRESSVPN_CTL not found. ExpressVPN may not be installed." >&2
+  exit 1
+fi
+
+show() {
+  echo "  networklock: $("$EXPRESSVPN_CTL" get networklock 2>/dev/null | head -n1)"
+  echo "  splittunnel: $("$EXPRESSVPN_CTL" get splittunnel 2>/dev/null | head -n1)"
+  echo "  connectionstate: $("$EXPRESSVPN_CTL" get connectionstate 2>/dev/null | head -n1)"
+}
+
+echo "==> Before:"
+show
+
+echo
+echo "==> Disabling Network Lock (transfer leak protection remains via interface binding + PF + Web API pause)"
+"$EXPRESSVPN_CTL" set networklock false 2>&1 || {
+  echo "WARN: 'expressvpnctl set networklock false' failed. ExpressVPN GUI may need to be open."
+  exit 2
+}
+
+echo
+echo "==> After:"
+show
+
+echo
+echo "Network Lock is now off. General internet will not be blocked if ExpressVPN drops."
+echo "transfer containment remains intact:"
+echo "  - the transfer client bound to ExpressVPN tunnel (fail-closed)"
+echo "  - vpn-guard PF anchor blocks transfer ports when VPN is down"
+echo "  - vpn-guard pauses the transfer client via Web API when VPN is down"
+echo
+echo "If you ever want it back on (not recommended given the trap-internet issue):"
+echo "  $EXPRESSVPN_CTL set networklock true"

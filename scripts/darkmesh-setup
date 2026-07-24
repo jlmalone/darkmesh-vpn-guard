@@ -1,0 +1,308 @@
+#!/bin/bash
+# darkmesh-setup — the ONE post-install command. Configures Server Monitor's signed
+# supervisor + arms the PF kill-switch on this node. Run as YOU (it sudoes internally
+# for the PF bits); do NOT run under sudo. Idempotent.
+#
+#   darkmesh setup            # unified supervisor + PF kill-switch (no client creds)
+#   darkmesh setup --pf-only  # alias for the same (creds are a separate step)
+#   darkmesh setup --legacy-agents  # explicit fallback without Server Monitor
+#
+# Homebrew can't install the root bootstrap in the formula. The first setup may
+# prompt once; later runs detect the durable scoped bootstrap and do not prompt.
+#
+# Client Web-UI creds are NOT set here; pause/resume uses the SIGSTOP fallback until
+# you add them (see vpn-guard-install.sh for the credentialed path).
+set -euo pipefail
+
+# A unified-config merge becomes live as soon as an already-registered agent
+# notices it. Restore the exact pre-setup config if any later privileged or
+# migration step fails, so legacy and unified copies cannot remain active after
+# a partial installation.
+ROLLBACK_AGENT_CONFIG=0
+AGENT_CONFIG_EXISTED=0
+AGENT_CONFIG_BACKUP=""
+rollback_agent_config_on_error() {
+  local rc=$?
+  trap - EXIT
+  if [[ "$rc" -ne 0 && "$ROLLBACK_AGENT_CONFIG" == 1 ]]; then
+    if [[ "$AGENT_CONFIG_EXISTED" == 1 ]]; then
+      mv -f "$AGENT_CONFIG_BACKUP" "$AGENT_CONFIG"
+    else
+      rm -f "$AGENT_CONFIG" "$AGENT_CONFIG_BACKUP"
+    fi
+    warn "restored the pre-setup infrastructure-agent config after failure"
+  elif [[ -n "$AGENT_CONFIG_BACKUP" ]]; then
+    rm -f "$AGENT_CONFIG_BACKUP"
+  fi
+  exit "$rc"
+}
+trap rollback_agent_config_on_error EXIT
+
+[ "$(id -u)" -ne 0 ] || { echo "Run as your user, NOT sudo: darkmesh setup" >&2; exit 1; }
+
+DRY=0; LEGACY=0
+for a in "$@"; do case "$a" in
+  --dry-run) DRY=1 ;;
+  --legacy-agents) LEGACY=1 ;;
+  --pf-only) ;;
+  *) warn_pending="unknown argument: $a" ;;
+esac; done
+[[ -z "${warn_pending:-}" ]] || { echo "ERROR: $warn_pending" >&2; exit 2; }
+
+uid="$(id -u)"; user="$(id -un)"
+LA_DIR="$HOME/Library/LaunchAgents"; mkdir -p "$LA_DIR"
+log()  { printf '==> %s\n' "$*"; }
+warn() { printf 'WARN: %s\n' "$*" >&2; }
+
+ROOT_HELPER=/Library/darkmesh/bin/darkmesh-root-helper
+ROOT_PF_CONF=/usr/local/etc/vpn-guard/unsafe.pf.conf
+ROOT_NEWSYSLOG=/etc/newsyslog.d/darkmesh.conf
+
+# --- locate the installed tools + data files ----------------------------------
+# Derive the install dir from THIS script's own location, so it's correct even when
+# ~/.local/bin shadows the brew prefix on PATH (common on already-provisioned nodes).
+self="$0"
+case "$self" in
+  /*)  ;;
+  */*) self="$(cd "$(dirname "$self")" 2>/dev/null && pwd)/$(basename "$self")" ;;
+  *)   self="$(command -v "$self" 2>/dev/null || echo "$self")" ;;
+esac
+BIN="$(cd "$(dirname "$self")" 2>/dev/null && pwd || true)"
+{ [ -n "${BIN:-}" ] && [ -x "$BIN/darkmesh-healthcheck" ]; } || \
+  BIN="$(dirname "$(command -v darkmesh-healthcheck 2>/dev/null || echo /nonexistent)")"
+[ -x "$BIN/darkmesh-healthcheck" ] || {
+  warn "darkmesh tools not found next to darkmesh-setup or on PATH. Install:  brew install jlmalone/tap/darkmesh"; exit 1; }
+[ -x "$BIN/vpn-guard.sh" ] || warn "vpn-guard.sh not found in $BIN (PF agent may not load)"
+
+PREFIX="$(brew --prefix 2>/dev/null || true)"
+SHARE=""
+for d in "$PREFIX/share/darkmesh" "$BIN/../share/darkmesh" "$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/vpn-guard"; do
+  [ -n "$d" ] && [ -f "$d/com.user.vpnguard.plist" ] && { SHARE="$d"; break; }
+done
+[ -n "$SHARE" ] || { warn "can't find darkmesh data files (plists / pf rules / sudoers)"; exit 1; }
+log "tools: $BIN"
+log "data:  $SHARE"
+
+privileged_bootstrap_current() {
+  local permissions
+  [[ -x "$ROOT_HELPER" && -f "$ROOT_NEWSYSLOG" && -f "$ROOT_PF_CONF" ]] || return 1
+  cmp -s "$BIN/darkmesh-root-helper" "$ROOT_HELPER" || return 1
+  cmp -s "$SHARE/unsafe.pf.conf" "$ROOT_PF_CONF" || return 1
+  permissions="$(sudo -n -l 2>/dev/null)" || return 1
+  printf '%s\n' "$permissions" | grep -Fq "$ROOT_HELPER dns-flush" || return 1
+  printf '%s\n' "$permissions" | grep -Fq '/sbin/pfctl -a com.apple/vpn-guard -f /usr/local/etc/vpn-guard/unsafe.pf.conf' || return 1
+  printf '%s\n' "$permissions" | grep -Fq '/sbin/pfctl -a com.apple/vpn-guard -F all' || return 1
+  printf '%s\n' "$permissions" | grep -Fq '/sbin/pfctl -s info' || return 1
+  sudo -n "$ROOT_HELPER" dns-flush >/dev/null 2>&1 || return 1
+  sudo -n /sbin/pfctl -s info >/dev/null 2>&1 || return 1
+}
+
+ROOT_BOOTSTRAP_CURRENT=0
+privileged_bootstrap_current && ROOT_BOOTSTRAP_CURRENT=1
+
+if [ "$DRY" = 1 ]; then
+  echo "  [dry-run] detection only — no services registered, no sudo, no changes."
+  app=/Applications/ServerMonitor.app
+  [ -x "$app/Contents/Resources/InfrastructureAgent" ] \
+    && echo "  [dry-run] unified agent available: $app" \
+    || echo "  [dry-run] unified agent MISSING: $app"
+  for t in darkmesh-healthcheck darkmesh-reconnect vpn-guard.sh darkmesh-audit; do
+    [ -x "$BIN/$t" ] && echo "  [dry-run] tool ok:   $BIN/$t" || echo "  [dry-run] MISSING:   $BIN/$t"
+  done
+  if [[ "$ROOT_BOOTSTRAP_CURRENT" == 1 ]]; then
+    echo "  [dry-run] privileged bootstrap current; setup would not prompt"
+  else
+    echo "  [dry-run] privileged bootstrap missing or changed; one admin approval required"
+  fi
+  [ "$LEGACY" = 1 ] && echo "  [dry-run] explicit legacy per-script LaunchAgents requested"
+  exit 0
+fi
+
+# Install the fixed root helper before starting recovery agents. This is the
+# only admin prompt needed for future DNS override/restore and CRD recovery.
+if [[ "$ROOT_BOOTSTRAP_CURRENT" == 1 ]]; then
+  log "privileged bootstrap current; no administrator prompt needed"
+elif [ -x "$BIN/install-root-helper.sh" ]; then
+  log "installing fixed privileged recovery helper"
+  sudo "$BIN/install-root-helper.sh" "$user"
+else
+  warn "install-root-helper.sh missing; refusing to arm an incomplete recovery stack"
+  exit 1
+fi
+
+# --- background supervisor ----------------------------------------------------
+# Prefer the signed agent bundled with Server Monitor. Legacy per-script plists
+# remain available only as an explicit fallback for machines without the app.
+APP="${SERVER_MONITOR_APP:-/Applications/ServerMonitor.app}"
+AGENT_BIN="$APP/Contents/Resources/InfrastructureAgent"
+UNIFIED=0
+if [[ "$LEGACY" == 0 ]]; then
+  [[ -x "$AGENT_BIN" ]] || {
+    warn "Server Monitor's signed InfrastructureAgent is not installed"
+    warn "install Server Monitor first, or explicitly use --legacy-agents"
+    exit 1
+  }
+  [[ -x "$BIN/darkmesh-migrate-agent" ]] || {
+    warn "darkmesh-migrate-agent missing from $BIN"; exit 1;
+  }
+  UNIFIED=1
+fi
+
+# Decide whether the healthcheck runs with --protect-tailscale. That flag drops the
+# VPN when Tailscale fails: right for a HEADLESS node (the tailnet is the only way
+# in), but it flaps the VPN on a laptop where the operator is present. Default by
+# chassis (a battery means laptop, so off); override with the file
+# ~/.config/darkmesh/protect-tailscale containing "on" or "off".
+protect_ts_repl() {
+  local f="$HOME/.config/darkmesh/protect-tailscale" want
+  if [ -f "$f" ]; then
+    want="$(tr '[:upper:]' '[:lower:]' < "$f" | tr -d '[:space:]')"
+  elif /usr/bin/pmset -g batt 2>/dev/null | grep -qi 'InternalBattery'; then
+    want=off
+  else
+    want=on
+  fi
+  case "$want" in on|yes|1|true) printf '<string>--protect-tailscale</string>' ;; *) printf '' ;; esac
+}
+PROTECT_TS_REPL="$(protect_ts_repl)"
+[ -n "$PROTECT_TS_REPL" ] && log "healthcheck: --protect-tailscale ON (headless or override)" \
+                          || log "healthcheck: --protect-tailscale off (laptop or override)"
+
+install_agent() { # <plist> <token> <bin-path>
+  local plist="$1" token="$2" bin="$3" dst="$LA_DIR/$1"
+  if [ -n "$PROTECT_TS_REPL" ]; then
+    sed -e "s|$token|$bin|g" -e "s|__PROTECT_TS__|$PROTECT_TS_REPL|g" "$SHARE/$plist" > "$dst"
+  else
+    sed -e "s|$token|$bin|g" -e "/__PROTECT_TS__/d" "$SHARE/$plist" > "$dst"
+  fi
+  launchctl bootout   "gui/$uid" "$dst" 2>/dev/null || true
+  if ! launchctl bootstrap "gui/$uid" "$dst" 2>/dev/null \
+      && ! launchctl load -w "$dst" 2>/dev/null; then
+    warn "failed to load legacy LaunchAgent $plist"
+    return 1
+  fi
+}
+if [[ "$UNIFIED" == 1 ]]; then
+  AGENT_CONFIG="$HOME/.config/server-monitor/infrastructure-agent.json"
+  mkdir -p "$(dirname "$AGENT_CONFIG")"
+  AGENT_CONFIG_BACKUP="$(mktemp "$(dirname "$AGENT_CONFIG")/.infrastructure-agent.pre-darkmesh.XXXXXX")"
+  if [[ -f "$AGENT_CONFIG" ]]; then
+    cp -p "$AGENT_CONFIG" "$AGENT_CONFIG_BACKUP"
+    AGENT_CONFIG_EXISTED=1
+  fi
+  ROLLBACK_AGENT_CONFIG=1
+  protect=no; [[ -n "$PROTECT_TS_REPL" ]] && protect=yes
+  /usr/bin/python3 - "$AGENT_CONFIG" "$BIN/darkmesh-healthcheck" "$BIN/darkmesh-reconnect" \
+    "$BIN/vpn-guard.sh" "$protect" <<'PY'
+import json, os, sys, tempfile
+path, health, reconnect, guard, protect = sys.argv[1:]
+health_command = [health, "--watch", "--interval", "20"]
+if protect == "yes":
+    health_command.insert(2, "--protect-tailscale")
+if os.path.exists(path):
+    with open(path, encoding="utf-8") as stream:
+        payload = json.load(stream)
+else:
+    payload = {
+        "schema": 1,
+        "statusFile": os.path.expanduser(
+            "~/Library/Application Support/ServerMonitor/infrastructure-agent-status.json"
+        ),
+        "persistentChildren": [],
+        "scheduledJobs": [],
+        "watchPaths": [],
+    }
+if payload.get("schema") != 1:
+    raise SystemExit("unsupported infrastructure-agent config schema")
+owned_children = {"darkmesh-healthcheck", "darkmesh-reconnect"}
+children = [row for row in payload.setdefault("persistentChildren", [])
+            if row.get("id") not in owned_children]
+children.extend([
+    {"id": "darkmesh-healthcheck", "command": health_command, "restartDelaySeconds": 10,
+     "maxSilenceSeconds": 90},
+    {"id": "darkmesh-reconnect", "command": [reconnect], "restartDelaySeconds": 10,
+     "networkChangeSignal": "USR1"},
+])
+payload["persistentChildren"] = children
+jobs = [row for row in payload.setdefault("scheduledJobs", []) if row.get("id") != "vpn-guard"]
+jobs.append({"id": "vpn-guard", "command": [guard], "intervalSeconds": 30,
+             "timeoutSeconds": 25, "runAtStart": True})
+payload["scheduledJobs"] = jobs
+payload["watchNetworkChanges"] = True
+paths = payload.setdefault("watchPaths", [])
+for item in ("/etc/resolv.conf", "/var/run/resolv.conf"):
+    if item not in paths:
+        paths.append(item)
+fd, temp = tempfile.mkstemp(prefix="infrastructure-agent.", suffix=".json", dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        json.dump(payload, stream, indent=2)
+        stream.write("\n")
+    os.replace(temp, path)
+except Exception:
+    try: os.unlink(temp)
+    except OSError: pass
+    raise
+PY
+  log "unified supervisor configured: $AGENT_CONFIG"
+else
+  install_agent com.user.darkmesh-healthcheck.plist __HEALTHCHECK_BIN__ "$BIN/darkmesh-healthcheck"
+  install_agent com.user.darkmesh-reconnect.plist   __RECONNECT_BIN__   "$BIN/darkmesh-reconnect"
+  if [ -f "$SHARE/com.user.darkmesh-netchange.plist" ]; then
+    install_agent com.user.darkmesh-netchange.plist __RECONNECT_BIN__ "$BIN/darkmesh-reconnect"
+  fi
+  install_agent com.user.vpnguard.plist             __VPNGUARD_BIN__    "$BIN/vpn-guard.sh"
+  log "legacy LaunchAgents loaded: healthcheck, reconnect, netchange, vpnguard"
+fi
+
+# --- migrate off legacy ~/.local/bin copies that would shadow the brew install -
+# (the agents above now point at $BIN, so removing the old shadows is safe).
+if [ "$BIN" != "$HOME/.local/bin" ] && [ -d "$HOME/.local/bin" ]; then
+  removed=0
+  for t in darkmesh darkmesh-setup darkmesh-audit darkmesh-healthcheck darkmesh-breaker \
+           darkmesh-root-helper darkmesh-reconnect darkmesh-repair darkmesh-restore-plain-network \
+           darkmesh-up darkmesh-panic darkmesh-captive darkmesh-diag \
+           install-root-helper.sh transfer-vpn-doctor darkmesh-expressvpn-tailscale \
+           relax-network-lock emergency-restore-internet vpn-guard.sh; do
+    if [ -e "$HOME/.local/bin/$t" ] && [ -e "$BIN/$t" ]; then
+      rm -f "$HOME/.local/bin/$t" && removed=$((removed + 1))
+    fi
+  done
+  [ "$removed" -gt 0 ] && log "migrated off $removed legacy ~/.local/bin shadow(s) — brew is now the source"
+fi
+
+# --- PF kill-switch (privileged) ----------------------------------------------
+# Rules + sudoers live in ROOT-owned paths so the NOPASSWD pfctl rule can't be
+# subverted by editing a user-writable file. (The brew prefix is user-writable,
+# so we deliberately do NOT reference it from sudoers.)
+if [[ "$ROOT_BOOTSTRAP_CURRENT" == 1 ]]; then
+  log "reusing root-owned PF rules and scoped passwordless commands"
+else
+  log "arming PF kill-switch; one administrator approval establishes durable scoped access"
+  sudo install -d -m 0755 /usr/local/etc/vpn-guard
+  sudo install -m 0644 "$SHARE/unsafe.pf.conf" /usr/local/etc/vpn-guard/unsafe.pf.conf
+  tmp="$(mktemp)"; sed "s/^USERNAME /$user /" "$SHARE/sudoers.d-vpn-guard" > "$tmp"
+  if sudo visudo -cf "$tmp" >/dev/null 2>&1; then
+    sudo install -m 0440 -o root -g wheel "$tmp" /etc/sudoers.d/vpn-guard
+    log "sudoers installed (NOPASSWD pfctl for $user)"
+  else
+    warn "sudoers failed validation; NOT installed (PF arm/flush will need a password)"
+  fi
+  rm -f "$tmp"
+  sudo /sbin/pfctl -a com.apple/vpn-guard -F all 2>/dev/null || true
+fi
+
+# --- arm now + verify ---------------------------------------------------------
+"$BIN/vpn-guard.sh" >/dev/null 2>&1 || true   # write the PF sidecar immediately
+if [[ "$UNIFIED" == 1 ]]; then
+  log "registering signed supervisor and retiring legacy background items"
+  "$BIN/darkmesh-migrate-agent" --apply || {
+    warn "unified migration did not complete; legacy guards were preserved or restored"
+    exit 1
+  }
+fi
+ROLLBACK_AGENT_CONFIG=0
+echo
+"$BIN/darkmesh-audit" || true
+echo
+log "done. Status any time:  darkmesh status     Re-verify:  darkmesh audit"

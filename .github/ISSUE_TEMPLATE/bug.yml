@@ -1,0 +1,48 @@
+name: Bug report
+description: Report a reproducible Darkmesh failure.
+title: "Bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: Remove private machine details and credentials before submitting diagnostics.
+  - type: input
+    id: version
+    attributes:
+      label: Darkmesh version
+      placeholder: "0.1.11"
+    validations:
+      required: true
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Impact
+      options:
+        - General connectivity
+        - Remote access
+        - Transfer fail-closed protection
+        - Status or diagnostics
+        - Installation or upgrade
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observed behavior
+      description: Explain what happened and what you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide the smallest safe sequence that reproduces the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: checks
+    attributes:
+      label: Sanitized checks
+      description: Include relevant sanitized output from darkmesh status or darkmesh audit.

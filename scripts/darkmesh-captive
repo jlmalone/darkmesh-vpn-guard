@@ -1,0 +1,25 @@
+#!/bin/bash
+# darkmesh-captive — you're on captive wifi (hotel/cafe/airport/bank) and need to
+# negotiate connectivity NOW. Stands every guard down so the portal loads and you
+# can sign in: desired=off (watchdog stands down), Network Lock off, ExpressVPN
+# disconnected. The installed fixed helper restores any temporary DNS override
+# passwordlessly. Re-arm the VPN afterwards with: darkmesh-up
+#
+# The reconnect watchdog is already captive-aware and won't fight a portal; this
+# is the explicit "just get me online" button for when you want it immediately.
+set -uo pipefail
+
+DESIRED_FILE="${DARKMESH_VPN_DESIRED:-$HOME/.config/darkmesh/vpn-desired}"
+PLAIN_RESTORE="${DARKMESH_PLAIN_RESTORE:-$(command -v darkmesh-restore-plain-network 2>/dev/null || echo "$(cd "$(dirname "$0")" && pwd)/darkmesh-restore-plain-network")}"
+
+mkdir -p "$(dirname "$DESIRED_FILE")"
+printf 'off\n' > "$DESIRED_FILE"
+echo "darkmesh-captive: vpn-desired=off (reconnect watchdog stands down)"
+
+[[ -x "$PLAIN_RESTORE" ]] || { echo "ERROR: plain-network restore helper missing: $PLAIN_RESTORE" >&2; exit 1; }
+"$PLAIN_RESTORE" || exit 1
+
+echo
+echo "Now open the captive portal and sign in. The transfer client stays fail-closed"
+echo "(it only runs over the VPN), so nothing leaks while you're on open wifi."
+echo "When you're back online, re-arm the VPN with:  darkmesh-up"

@@ -1,0 +1,84 @@
+#!/bin/bash
+# darkmesh — front-door dispatcher for the darkmesh-* tools.
+#
+# `darkmesh <command> [args]` forwards to `darkmesh-<command>` (on PATH or next to
+# this script), with a few friendly built-ins. Lets the single `darkmesh` formula
+# present one coherent command instead of a dozen darkmesh-* binaries.
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Find a darkmesh-<x> helper on PATH, or as a sibling of this script.
+resolve() {
+  command -v "darkmesh-$1" 2>/dev/null && return 0
+  [ -x "$SELF_DIR/darkmesh-$1" ] && { printf '%s\n' "$SELF_DIR/darkmesh-$1"; return 0; }
+  return 1
+}
+
+cmd="${1:-help}"; shift 2>/dev/null || true
+
+case "$cmd" in
+  help|-h|--help)
+    cat <<'EOF'
+darkmesh — Tailscale + VPN coexistence with port-scoped transfer-client fail-closed (macOS)
+
+Usage: darkmesh <command> [args]
+
+  setup [--pf-only]   configure the signed supervisor + PF kill-switch (sudo once)
+  status              one-line verdict from the status file
+  audit               verify the stack is installed, running, and PF-wired
+  up                  arm: mark VPN desired-on and nudge a reconnect
+  captive             get online behind a captive portal (drops guards safely)
+  panic               restore plain connectivity without touching Tailscale routes
+  repair              re-arm watchdogs and close recovery breakers
+  undo                emergency restore internet (legacy `darkmesh --undo`)
+  doctor              transfer-client VPN-binding diagnostics
+  apply | verify      darkmesh-expressvpn-tailscale apply / verify
+  help                this text
+
+Each subcommand is also available directly as `darkmesh-<command>`.
+EOF
+    ;;
+  status)
+    f="${DARKMESH_STATUS_FILE:-/tmp/darkmesh-status.json}"
+    if [ -r "$f" ]; then
+      python3 - "$f" <<'PY'
+import datetime,json,os,sys,time
+try:
+    d=json.load(open(sys.argv[1]))
+    authored=datetime.datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00")).timestamp()
+except Exception as exc:
+    print("verdict=UNKNOWN error=invalid-status detail=%s" % str(exc).replace(" ", "_"))
+    raise SystemExit(1)
+age=max(0, time.time()-authored, time.time()-os.path.getmtime(sys.argv[1]))
+limit=d.get("max_age_seconds",60)
+if age > limit:
+    print("verdict=STALE age=%.1fh last=%s@%s" % (age/3600, d.get("verdict","?"), d.get("timestamp","?")))
+    raise SystemExit(3)
+pf=(d.get("pf") or {})
+print("verdict=%s vpn=%s internet=%s dns=%s tailscale=%s pf_wired=%s" % (
+  d.get("verdict","?"), d.get("vpn_state","?"), d.get("internet_ok"),
+  d.get("dns_ok"), d.get("tailscale_ok"), pf.get("pf_anchor_evaluated")))
+PY
+    else
+      echo "no status file ($f) — is the healthcheck agent loaded?  (darkmesh audit)"
+      exit 3
+    fi
+    ;;
+  doctor)
+    t="$(command -v transfer-vpn-doctor 2>/dev/null || true)"
+    [ -n "$t" ] && exec "$t" "$@" || { echo "darkmesh: transfer-vpn-doctor not found" >&2; exit 1; }
+    ;;
+  undo|--undo)
+    t="$(command -v emergency-restore-internet 2>/dev/null || true)"
+    [ -n "$t" ] && exec "$t" "$@" || { echo "darkmesh: emergency-restore-internet not found" >&2; exit 1; }
+    ;;
+  apply|verify)
+    if t="$(resolve expressvpn-tailscale)"; then exec "$t" "$cmd" "$@"
+    else echo "darkmesh: darkmesh-expressvpn-tailscale not found" >&2; exit 1; fi
+    ;;
+  *)
+    if t="$(resolve "$cmd")"; then exec "$t" "$@"
+    else echo "darkmesh: unknown command '$cmd' (try: darkmesh help)" >&2; exit 2; fi
+    ;;
+esac

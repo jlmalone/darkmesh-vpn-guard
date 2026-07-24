@@ -1,0 +1,703 @@
+#!/bin/bash
+# Network safety watcher and single author of darkmesh status/breaker state.
+# One-shot mode is strictly read-only. Recovery is enabled only for the one
+# launchd --watch instance, protected by a per-user lock.
+set -uo pipefail
+
+EXPRESSVPN_CTL="${EXPRESSVPN_CTL:-/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl}"
+TAILSCALE_CLI="${TAILSCALE_CLI:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
+ROOT_HELPER="${DARKMESH_ROOT_HELPER:-/Library/darkmesh/bin/darkmesh-root-helper}"
+PLAIN_RESTORE="${DARKMESH_PLAIN_RESTORE:-$(command -v darkmesh-restore-plain-network 2>/dev/null || echo "$HOME/.local/bin/darkmesh-restore-plain-network")}"
+BREAKER_LIB="${DARKMESH_BREAKER_LIB:-$(cd "$(dirname "$0")" && pwd)/darkmesh-breaker}"
+STATUS_FILE="${DARKMESH_STATUS_FILE:-/tmp/darkmesh-status.json}"
+RECONNECT_SIDECAR="${DARKMESH_RECONNECT_SIDECAR:-/tmp/darkmesh-reconnect.json}"
+PF_SIDECAR="${DARKMESH_PF_SIDECAR:-/tmp/darkmesh-pf.json}"
+INFRA_STATUS="${DARKMESH_INFRA_STATUS:-$HOME/Library/Application Support/ServerMonitor/infrastructure-agent-status.json}"
+DESIRED_FILE="${DARKMESH_VPN_DESIRED:-$HOME/.config/darkmesh/vpn-desired}"
+CRD_REQUIRED_FILE="${DARKMESH_CRD_REQUIRED_FILE:-$HOME/.config/darkmesh/crd-required}"
+DNS_OVERRIDE_JOURNAL="${DARKMESH_DNS_OVERRIDE_JOURNAL:-/Library/darkmesh/state/dns-override.state}"
+DNS_RESTORE_FAILURE_MARKER="${DARKMESH_DNS_RESTORE_FAILURE_MARKER:-$HOME/.config/darkmesh/dns-restore-failed}"
+LOG_DIR="${DARKMESH_LOG_DIR:-$HOME/Library/Logs/darkmesh}"
+LOG="$LOG_DIR/healthcheck.log"
+ACTION_LOG="$LOG_DIR/actions.log"
+LOCK_DIR="${DARKMESH_HEALTHCHECK_LOCK:-$HOME/.config/darkmesh/healthcheck.lock}"
+
+APPLE_PROBE="${DARKMESH_APPLE_PROBE:-http://captive.apple.com/hotspot-detect.html}"
+GOOGLE_PROBE="${DARKMESH_GOOGLE_PROBE:-https://www.gstatic.com/generate_204}"
+CRD_PROBE="${DARKMESH_CRD_PROBE:-https://remotedesktop-pa.googleapis.com}"
+PROBE_HOST="${DARKMESH_PROBE_HOST:-1.1.1.1}"
+PROBE_NAME="${DARKMESH_PROBE_NAME:-example.com}"
+
+GRACE="${DARKMESH_GRACE:-15}"
+INTERVAL="${DARKMESH_INTERVAL:-20}"
+WATCH=no
+REVERT=yes
+PROTECT_TS=no
+MAX_TICKS="${DARKMESH_MAX_TICKS:-0}"
+MAX_CYCLES="${DARKMESH_MAX_CYCLES:-2}"
+BREAKER_WINDOW="${DARKMESH_BREAKER_WINDOW:-1800}"
+BREAKER_COOLDOWN="${DARKMESH_BREAKER_COOLDOWN:-1200}"
+FLAP_LIMIT="${DARKMESH_FLAP_LIMIT:-5}"
+OVERRIDE_MIN_AGE="${DARKMESH_OVERRIDE_MIN_AGE:-600}"
+VPN_FAIL_TICKS_REQUIRED="${DARKMESH_VPN_FAIL_TICKS_REQUIRED:-2}"
+PROBE_DEADLINE="${DARKMESH_PROBE_DEADLINE:-12}"
+STATUS_MAX_AGE="${DARKMESH_STATUS_MAX_AGE:-60}"
+
+usage() {
+  cat <<'EOF'
+Usage: darkmesh-healthcheck [--watch] [--no-revert] [--protect-tailscale]
+                            [--grace N] [--interval N]
+
+Without --watch this is a read-only probe: it prints JSON but never writes the
+shared status/breaker files and never performs recovery.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --watch) WATCH=yes; shift ;;
+    --no-revert) REVERT=no; shift ;;
+    --protect-tailscale) PROTECT_TS=yes; shift ;;
+    --grace) GRACE="$2"; shift 2 ;;
+    --interval) INTERVAL="$2"; shift 2 ;;
+    --probe-host) PROBE_HOST="$2"; shift 2 ;;
+    --probe-name) PROBE_NAME="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "ERROR: unknown arg: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
+if [[ "$WATCH" == yes ]]; then
+  mkdir -p "$LOG_DIR" "$(dirname "$DESIRED_FILE")"
+  [ -f "$DESIRED_FILE" ] || printf 'on\n' > "$DESIRED_FILE"
+fi
+
+now_epoch() { date +%s; }
+now_iso() { date -u +%FT%TZ; }
+
+log() {
+  local line="$(now_iso) $*"
+  if [[ "$WATCH" == yes ]]; then printf '%s\n' "$line" >> "$LOG"; else printf '%s\n' "$line" >&2; fi
+}
+
+action_log() {
+  printf '%s fault=%s rung=%s verb=%s result=%s breaker=%s\n' \
+    "$(now_iso)" "$1" "$2" "$3" "$4" "$5" >> "$ACTION_LOG"
+}
+
+run_with_deadline() {
+  local seconds="$1"; shift
+  local output pid started status=0
+  output="$(mktemp -t darkmesh-command)" || return 1
+  "$@" > "$output" 2>/dev/null & pid=$!
+  started="$(now_epoch)"
+  while kill -0 "$pid" 2>/dev/null && (( $(now_epoch) - started < seconds )); do sleep 0.1; done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 1
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+  wait "$pid" || status=$?
+  cat "$output"
+  rm -f "$output"
+  return "$status"
+}
+
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/[[:cntrl:]]/ /g'
+}
+
+acquire_watch_lock() {
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" > "$LOCK_DIR/pid"
+    trap 'rm -rf "$LOCK_DIR" 2>/dev/null' EXIT
+    trap 'exit 0' INT TERM
+    return 0
+  fi
+  local pid=""
+  [ -f "$LOCK_DIR/pid" ] && pid="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    echo "darkmesh-healthcheck: watch instance already running (pid $pid)" >&2
+    return 1
+  fi
+  rm -rf "$LOCK_DIR" 2>/dev/null
+  mkdir "$LOCK_DIR" 2>/dev/null || return 1
+  printf '%s\n' "$$" > "$LOCK_DIR/pid"
+  trap 'rm -rf "$LOCK_DIR" 2>/dev/null' EXIT
+  trap 'exit 0' INT TERM
+}
+
+root_call() {
+  local verb="$1"
+  if [[ "${DARKMESH_NO_SUDO:-0}" == 1 ]]; then
+    "$ROOT_HELPER" "$verb"
+  else
+    sudo -n "$ROOT_HELPER" "$verb"
+  fi
+}
+
+vpn_state() {
+  "$EXPRESSVPN_CTL" --timeout 3 get connectionstate 2>/dev/null | head -1
+}
+
+desired_state() {
+  local value="on"
+  [ -f "$DESIRED_FILE" ] && value="$(tr -d '[:space:]' < "$DESIRED_FILE" 2>/dev/null)"
+  printf '%s' "${value:-on}"
+}
+
+probe_ip() {
+  local i host
+  for i in 1 2; do ping -c 1 -W 1500 -t 3 "$PROBE_HOST" >/dev/null 2>&1 && return 0; done
+  for host in "$PROBE_HOST" 8.8.8.8 9.9.9.9; do
+    nc -z -G 2 -w 2 "$host" 443 >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+
+probe_dns() {
+  local i result
+  for i in 1 2; do
+    result="$(host -W 3 -t NS . 2>&1)"
+    printf '%s' "$result" | grep -qiE 'name server|NS record' && return 0
+  done
+  result="$(host -W 3 "$PROBE_NAME" 2>&1)"
+  printf '%s' "$result" | grep -qE 'has address|has IPv6 address' && return 0
+  return 1
+}
+
+probe_e2e() {
+  local dir apid gpid aok=1 gok=1 code
+  dir="$(mktemp -d -t darkmesh-e2e)" || return 1
+  (
+    curl -sS --max-time 7 "$APPLE_PROBE" > "$dir/apple.body" 2>/dev/null \
+      && grep -q 'Success' "$dir/apple.body"
+  ) & apid=$!
+  (
+    code="$(curl -sS --max-time 7 -o /dev/null -w '%{http_code}' "$GOOGLE_PROBE" 2>/dev/null)"
+    [ "$code" = 204 ]
+  ) & gpid=$!
+  wait "$apid" || aok=0
+  wait "$gpid" || gok=0
+  rm -rf "$dir"
+  [[ "$aok" == 1 || "$gok" == 1 ]]
+}
+
+probe_tailscale() {
+  if [[ ! -x "$TAILSCALE_CLI" ]]; then [[ "$PROTECT_TS" != yes ]]; return; fi
+  local js
+  js="$(run_with_deadline "$PROBE_DEADLINE" "$TAILSCALE_CLI" status --json)" || return 1
+  printf '%s' "$js" | grep -q '"BackendState": *"Running"' || return 1
+  printf '%s' "$js" | awk '/"Self": \{/{f=1} f&&/"Online"/{print; exit}' | grep -q true
+}
+
+crd_required() {
+  local configured=""
+  [ -f "$CRD_REQUIRED_FILE" ] && configured="$(tr -d '[:space:]' < "$CRD_REQUIRED_FILE")"
+  case "$configured" in
+    on|true|yes) return 0 ;;
+    off|false|no) return 1 ;;
+  esac
+  [[ "${DARKMESH_CRD_INSTALLED:-}" == yes ]] && return 0
+  [[ "${DARKMESH_CRD_INSTALLED:-}" == no ]] && return 1
+  [[ -d /Library/PrivilegedHelperTools/ChromeRemoteDesktopHost.app ]] && return 0
+  launchctl print system/org.chromium.chromoting >/dev/null 2>&1 && return 0
+  launchctl print "gui/$(id -u)/org.chromium.chromoting" >/dev/null 2>&1
+}
+
+probe_crd() {
+  pgrep -f 'remoting_me2me_host' >/dev/null 2>&1 || { CRD_REASON=host-down; return 1; }
+  local code
+  code="$(curl -sS --max-time 7 -o /dev/null -w '%{http_code}' "$CRD_PROBE" 2>/dev/null)"
+  if [[ "$code" =~ ^[1-5][0-9][0-9]$ ]]; then CRD_REASON=ok; return 0; fi
+  CRD_REASON=signaling-unreachable
+  return 1
+}
+
+default_interface() {
+  route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}'
+}
+
+dhcp_dns_for_interface() {
+  local iface="$1"
+  ipconfig getpacket "$iface" 2>/dev/null | awk '
+    /domain_name_server/ {
+      line=$0; sub(/^[^{]*\{/, "", line); sub(/\}.*/, "", line)
+      gsub(/,/, " ", line)
+      n=split(line, a, /[[:space:]]+/)
+      for (i=1; i<=n; i++) if (a[i] != "") { printf "%s%s", sep, a[i]; sep=" " }
+      print ""; exit
+    }
+  '
+}
+
+default_gateway() {
+  route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}'
+}
+
+system_nameservers() {
+  scutil --dns 2>/dev/null | awk '/nameserver\[[0-9]+\]/{print $3}' | sort -u
+}
+
+is_cgnat_resolver() {
+  local a b c d
+  IFS=. read -r a b c d <<EOF
+$1
+EOF
+  [[ "$a" == 100 && "$b" =~ ^[0-9]+$ && "$b" -ge 64 && "$b" -le 127 ]]
+}
+
+suspicious_resolver_present() {
+  local server
+  while IFS= read -r server; do
+    [[ -n "$server" ]] && is_cgnat_resolver "$server" && [[ "$server" != 100.100.100.100 ]] && return 0
+  done <<EOF
+$(system_nameservers)
+EOF
+  return 1
+}
+
+probe_resolver_list() {
+  local server
+  for server in $1; do
+    host -W 2 "$PROBE_NAME" "$server" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+
+journal_value() {
+  local key="$1"
+  sed -n "s/^${key}=//p" "$DNS_OVERRIDE_JOURNAL" 2>/dev/null | head -1
+}
+
+override_network_changed() {
+  [[ -r "$DNS_OVERRIDE_JOURNAL" ]] || return 1
+  local old_iface old_dns old_gateway iface dns gateway
+  old_iface="$(journal_value INTERFACE)"; old_dns="$(journal_value OVERRIDE_DNS)"
+  old_gateway="$(journal_value GATEWAY)"
+  iface="$(default_interface)"; dns="$(dhcp_dns_for_interface "$iface")"; gateway="$(default_gateway)"
+  [[ -z "$iface" || "$iface" != "$old_iface" || -z "$dns" || "$dns" != "$old_dns" \
+     || -z "$gateway" || "$gateway" != "$old_gateway" ]]
+}
+
+maybe_restore_override() {
+  [[ -r "$DNS_OVERRIDE_JOURNAL" ]] || return 0
+  local restore=no created now journal_version failed_version
+  override_network_changed && restore=yes
+  created="$(journal_value CREATED_EPOCH)"; now="$(now_epoch)"
+  if [[ "$restore" == no && "$created" =~ ^[0-9]+$ ]] \
+      && (( now - created >= OVERRIDE_MIN_AGE )) && ! suspicious_resolver_present; then
+    restore=yes
+  fi
+  if [[ "$restore" == yes ]]; then
+    journal_version="$(stat -f %m "$DNS_OVERRIDE_JOURNAL" 2>/dev/null || echo 0)"
+    failed_version="$(cat "$DNS_RESTORE_FAILURE_MARKER" 2>/dev/null || true)"
+    [[ "$failed_version" == "$journal_version" ]] && return 0
+    if root_call dns-restore >/dev/null 2>&1; then
+      rm -f "$DNS_RESTORE_FAILURE_MARKER"
+      log "dns override restored before probing (network/source changed)"
+      action_log dns_dead restore dns-restore ok closed
+    else
+      printf '%s\n' "$journal_version" > "$DNS_RESTORE_FAILURE_MARKER"
+      log "dns override restore failed"
+      action_log dns_dead restore dns-restore failed open
+      notify_once dns-restore
+    fi
+  fi
+}
+
+dns_override_supported() {
+  local iface dhcp
+  iface="$(default_interface)"; [[ -n "$iface" ]] || return 1
+  dhcp="$(dhcp_dns_for_interface "$iface")"; [[ -n "$dhcp" ]] || return 1
+  suspicious_resolver_present || return 1
+  probe_resolver_list "$dhcp"
+}
+
+reconnect_phase() {
+  grep -oE '"phase"[[:space:]]*:[[:space:]]*"[A-Za-z0-9._-]+"' "$RECONNECT_SIDECAR" 2>/dev/null \
+    | head -1 | sed -E 's/.*"([A-Za-z0-9._-]+)"$/\1/'
+}
+
+plain_hold() {
+  [[ -f "$RECONNECT_SIDECAR" ]] || return 1
+  local age=$(( $(now_epoch) - $(stat -f %m "$RECONNECT_SIDECAR" 2>/dev/null || echo 0) ))
+  (( age < 90 )) || return 1
+  grep -Eq '"phase"[[:space:]]*:[[:space:]]*"(captive-standdown|captive-clear-wait|offline|restricted-wait|restricted-plain|plain-cooldown|retry-wait|safety-standdown|desired-off)"' "$RECONNECT_SIDECAR" 2>/dev/null
+}
+
+restore_plain_network() {
+  if [[ -x "$PLAIN_RESTORE" ]]; then
+    "$PLAIN_RESTORE" --quiet >> "$LOG" 2>&1
+    return $?
+  fi
+  log "plain-network restore helper missing; refusing unsafe transition"
+  return 1
+}
+
+notify_once() {
+  local fault="$1"
+  osascript -e "display notification \"Recovery stopped for $fault; manual attention needed\" with title \"darkmesh\"" >/dev/null 2>&1 || true
+}
+
+if [[ "$WATCH" == yes ]]; then
+  acquire_watch_lock || exit 75
+  [[ -r "$BREAKER_LIB" ]] || { echo "missing breaker library: $BREAKER_LIB" >&2; exit 1; }
+  # shellcheck source=scripts/darkmesh-breaker
+  source "$BREAKER_LIB"
+  breaker_init
+fi
+
+open_breaker() {
+  local fault="$1" rung="$2" action="$3" now
+  now="$(now_epoch)"
+  breaker_update "$fault" state string open rung integer "$rung" opened_at integer "$now" \
+    alerted_at integer "$now" gave_up bool true last_action string "$action" last_action_at integer "$now"
+  notify_once "$fault"
+  action_log "$fault" "$rung" "$action" gave-up open
+}
+
+prepare_breaker_fault() {
+  local fault="$1" now state opened window flaps
+  now="$(now_epoch)"; state="$(breaker_get "$fault" state closed)"
+  window="$(breaker_get "$fault" window_started_at 0)"
+  if [[ ! "$window" =~ ^[0-9]+$ ]] || (( window == 0 || now - window >= BREAKER_WINDOW )); then
+    breaker_update "$fault" cycles integer 0 rung integer 0 dead_ticks integer 0 \
+      window_started_at integer "$now" recover_refail_count integer 0
+  fi
+  flaps="$(breaker_get "$fault" recover_refail_count 0)"
+  if [[ "$flaps" =~ ^[0-9]+$ ]] && (( flaps >= FLAP_LIMIT )) && [[ "$state" != open ]]; then
+    open_breaker "$fault" 0 flap-limit
+    return 1
+  fi
+  if [[ "$state" == open ]]; then
+    opened="$(breaker_get "$fault" opened_at 0)"
+    if [[ "$opened" =~ ^[0-9]+$ ]] && (( now - opened >= BREAKER_COOLDOWN )); then
+      breaker_update "$fault" state string half_open rung integer 0 cycles integer 0 gave_up bool false
+      return 0
+    fi
+    return 1
+  fi
+  return 0
+}
+
+fault_recovered() {
+  local fault="$1" state rung ticks flaps now
+  state="$(breaker_get "$fault" state closed)"; rung="$(breaker_get "$fault" rung 0)"
+  if [[ "$state" != closed || "$rung" != 0 ]]; then
+    flaps="$(breaker_get "$fault" recover_refail_count 0)"; flaps=$((flaps + 1)); now="$(now_epoch)"
+    breaker_update "$fault" state string closed rung integer 0 cycles integer 0 dead_ticks integer 0 \
+      opened_at integer 0 alerted_at integer 0 gave_up bool false recover_refail_count integer "$flaps" \
+      last_action string recovered last_action_at integer "$now"
+    action_log "$fault" recovered none ok closed
+  else
+    ticks="$(breaker_get "$fault" dead_ticks 0)"
+    [[ "$ticks" == 0 ]] || breaker_update "$fault" dead_ticks integer 0
+  fi
+}
+
+recover_dns_tick() {
+  prepare_breaker_fault dns_dead || return 0
+  local ticks rung cycles now action result
+  ticks="$(breaker_get dns_dead dead_ticks 0)"; ticks=$((ticks + 1))
+  breaker_update dns_dead dead_ticks integer "$ticks"
+  (( ticks >= 2 )) || return 0
+  rung="$(breaker_get dns_dead rung 0)"; cycles="$(breaker_get dns_dead cycles 0)"; now="$(now_epoch)"
+  case "$rung" in
+    0)
+      action=dns-flush; result=failed
+      root_call dns-flush >/dev/null 2>&1 && result=issued
+      breaker_update dns_dead rung integer 1 last_action string "$action" last_action_at integer "$now"
+      action_log dns_dead 1 "$action" "$result" closed
+      ;;
+    1)
+      action=magicdns-off; result=issued
+      [[ -x "$TAILSCALE_CLI" ]] && "$TAILSCALE_CLI" set --accept-dns=false >/dev/null 2>&1 || true
+      if dns_override_supported; then
+        action=dns-override; result=failed
+        root_call dns-override >/dev/null 2>&1 && result=issued
+      else
+        root_call dns-flush >/dev/null 2>&1 || true
+      fi
+      breaker_update dns_dead rung integer 2 last_action string "$action" last_action_at integer "$now"
+      action_log dns_dead 2 "$action" "$result" closed
+      ;;
+    *)
+      # Re-probe point after the top DNS action. Do not restart a VPN from a
+      # DNS fault: once DNS is healthy the existing reconnect loop observes
+      # open internet and owns any needed VPN recovery.
+      action=dns-cycle-complete; result=still-dead
+      cycles=$((cycles + 1))
+      if (( cycles >= MAX_CYCLES )); then
+        breaker_update dns_dead cycles integer "$cycles"
+        open_breaker dns_dead 3 "$action"
+      else
+        breaker_update dns_dead cycles integer "$cycles" rung integer 0 \
+          last_action string "$action" last_action_at integer "$now"
+        action_log dns_dead 3 "$action" "$result" closed
+      fi
+      ;;
+  esac
+}
+
+recover_crd_tick() {
+  prepare_breaker_fault crd_wedged || return 0
+  local ticks cycles now result=failed
+  ticks="$(breaker_get crd_wedged dead_ticks 0)"; ticks=$((ticks + 1))
+  breaker_update crd_wedged dead_ticks integer "$ticks"
+  (( ticks >= 2 )) || return 0
+  cycles="$(breaker_get crd_wedged cycles 0)"; now="$(now_epoch)"
+  root_call restart-crd >/dev/null 2>&1 && result=issued
+  cycles=$((cycles + 1))
+  if (( cycles >= MAX_CYCLES )); then
+    breaker_update crd_wedged cycles integer "$cycles"
+    open_breaker crd_wedged 1 restart-crd
+  else
+    breaker_update crd_wedged cycles integer "$cycles" rung integer 0 \
+      last_action string restart-crd last_action_at integer "$now"
+    action_log crd_wedged 1 restart-crd "$result" closed
+  fi
+}
+
+valid_json_or_null() {
+  local file="$1"
+  if [[ -s "$file" ]] && /usr/bin/plutil -p "$file" >/dev/null 2>&1; then cat "$file"; else printf 'null'; fi
+}
+
+infrastructure_healthy() {
+  [[ -r "$INFRA_STATUS" ]] || return 1
+  /usr/bin/python3 - "$INFRA_STATUS" <<'PY' >/dev/null 2>&1
+import datetime, json, os, sys, time
+path = sys.argv[1]
+d = json.load(open(path))
+if d.get("schema") != 2 or time.time() - os.path.getmtime(path) > 90:
+    raise SystemExit(1)
+children = {row.get("id"): row for row in d.get("children", [])}
+jobs = {row.get("id"): row for row in d.get("scheduledJobs", [])}
+now = datetime.datetime.now(datetime.timezone.utc)
+def job_healthy(row):
+    if row.get("timedOut") is True:
+        return False
+    if row.get("running") is True:
+        return True
+    if row.get("lastExitStatus") != 0 or not row.get("lastRunAt"):
+        return False
+    completed = datetime.datetime.fromisoformat(row["lastRunAt"].replace("Z", "+00:00"))
+    max_age = max(90.0, float(row.get("intervalSeconds", 0)) * 2 + 30)
+    return (now - completed).total_seconds() <= max_age
+ok = d.get("configLoaded") is True
+ok = ok and all(key in children for key in ("darkmesh-healthcheck", "darkmesh-reconnect"))
+ok = ok and all(row.get("running") is True and row.get("responsive") is True
+                for row in children.values())
+ok = ok and "vpn-guard" in jobs and all(job_healthy(row) for row in jobs.values())
+raise SystemExit(0 if ok else 1)
+PY
+}
+
+infrastructure_manages_darkmesh() {
+  [[ -r "$INFRA_STATUS" ]] || return 1
+  /usr/bin/python3 - "$INFRA_STATUS" <<'PY' >/dev/null 2>&1
+import json, sys
+d = json.load(open(sys.argv[1]))
+ids = {row.get("id") for row in d.get("children", [])}
+raise SystemExit(0 if {"darkmesh-healthcheck", "darkmesh-reconnect"} <= ids else 1)
+PY
+}
+
+status_json() {
+  local state="$1" ipok="$2" e2e="$3" dns="$4" ts="$5" crd="$6" crdreq="$7" reason="$8" verdict="$9"
+  shift 9
+  local auto="$1" auto_reason="$2" auto_at="$3" desired services=true reconnect pf breakers='{}'
+  desired="$(desired_state)"
+  local agent unified=vision.salient.InfrastructureAgent
+  if launchctl print "gui/$(id -u)/$unified" >/dev/null 2>&1 && infrastructure_manages_darkmesh; then
+    launchctl print "gui/$(id -u)/$unified" 2>/dev/null | grep -qE 'state = running|pid = [0-9]+' || services=false
+    infrastructure_healthy || services=false
+  else
+    for agent in com.user.darkmesh-healthcheck com.user.darkmesh-reconnect com.user.vpnguard; do
+      launchctl print "gui/$(id -u)/$agent" >/dev/null 2>&1 || services=false
+    done
+  fi
+  reconnect="$(valid_json_or_null "$RECONNECT_SIDECAR")"; pf="$(valid_json_or_null "$PF_SIDECAR")"
+  [[ "$WATCH" == yes ]] && breakers="$(breaker_json)"
+  cat <<EOF
+{
+  "schema": 4,
+  "timestamp": "$(now_iso)",
+  "max_age_seconds": $STATUS_MAX_AGE,
+  "vpn_state": "$(json_escape "$state")",
+  "expressvpn_state": "$(json_escape "$state")",
+  "internet_ok": $e2e,
+  "inet_e2e_ok": $e2e,
+  "inet_ip_ok": $ipok,
+  "dns_ok": $dns,
+  "tailscale_ok": $ts,
+  "crd_required": $crdreq,
+  "crd_ok": $crd,
+  "crd_reason": "$(json_escape "$reason")",
+  "verdict": "$verdict",
+  "desired": "$(json_escape "$desired")",
+  "services_ok": $services,
+  "auto_disconnected": $auto,
+  "auto_disconnect_reason": "$(json_escape "$auto_reason")",
+  "auto_disconnect_at": "$(json_escape "$auto_at")",
+  "dns_override_active": $([[ -r "$DNS_OVERRIDE_JOURNAL" ]] && printf true || printf false),
+  "breakers": $breakers,
+  "reconnect": $reconnect,
+  "pf": $pf
+}
+EOF
+}
+
+write_shared_status() {
+  local content="$1" tmp="${STATUS_FILE}.tmp.$$"
+  printf '%s\n' "$content" > "$tmp" && mv -f "$tmp" "$STATUS_FILE"
+}
+
+CONNECT_OBSERVED_AT=0
+LAST_STATE=""
+LAST_SUMMARY=""
+LAST_HEARTBEAT=0
+LAST_AUTO_DISCONNECT_AT=""
+LAST_AUTO_DISCONNECT_REASON=""
+LAST_AUTO_DISCONNECT_EPOCH=0
+STICKY_TTL=600
+VPN_PATH_FAIL_TICKS=0
+
+probe_and_decide() {
+  local state ipok=false e2e=false dns=false ts=false crd=null crdreq=false verdict=NO-GO
+  local in_grace=no auto=false auto_reason="" auto_at="" now summary output
+
+  [[ "$WATCH" == yes ]] && maybe_restore_override
+  state="$(vpn_state)"; state="${state:-unknown}"
+  CRD_REASON=not-required
+  if crd_required; then
+    crdreq=true; crd=false
+  fi
+
+  # Independent probes run concurrently so one tick is bounded by the slowest
+  # probe rather than the sum of all timeouts.
+  local pdir p_ip p_dns p_e2e p_ts p_crd=""
+  pdir="$(mktemp -d -t darkmesh-probes)"
+  (probe_ip && : > "$pdir/ip") & p_ip=$!
+  (probe_dns && : > "$pdir/dns") & p_dns=$!
+  (probe_e2e && : > "$pdir/e2e") & p_e2e=$!
+  (probe_tailscale && : > "$pdir/ts") & p_ts=$!
+  if [[ "$crdreq" == true ]]; then
+    (CRD_REASON=signaling-unreachable; probe_crd && : > "$pdir/crd"; printf '%s' "$CRD_REASON" > "$pdir/crd-reason") & p_crd=$!
+  fi
+  wait "$p_ip" 2>/dev/null || true; wait "$p_dns" 2>/dev/null || true
+  wait "$p_e2e" 2>/dev/null || true; wait "$p_ts" 2>/dev/null || true
+  [[ -n "$p_crd" ]] && wait "$p_crd" 2>/dev/null || true
+  [[ -f "$pdir/ip" ]] && ipok=true
+  [[ -f "$pdir/dns" ]] && dns=true
+  [[ -f "$pdir/e2e" ]] && e2e=true
+  [[ -f "$pdir/ts" ]] && ts=true
+  if [[ "$crdreq" == true ]]; then
+    [[ -f "$pdir/crd" ]] && crd=true
+    [[ -f "$pdir/crd-reason" ]] && CRD_REASON="$(cat "$pdir/crd-reason")"
+  fi
+  rm -rf "$pdir"
+
+  now="$(now_epoch)"
+  if [[ "$WATCH" == yes ]]; then
+    if [[ "$state" == Connected && "$LAST_STATE" != Connected ]]; then CONNECT_OBSERVED_AT="$now"; fi
+    if [[ "$state" == Connected || "$state" == Connecting || "$state" == Reconnecting ]]; then
+      [[ "$CONNECT_OBSERVED_AT" -eq 0 ]] && CONNECT_OBSERVED_AT="$now"
+      (( now - CONNECT_OBSERVED_AT < GRACE )) && in_grace=yes
+    else
+      CONNECT_OBSERVED_AT=0
+    fi
+  fi
+  LAST_STATE="$state"
+
+  local hold_phase=""
+  plain_hold && hold_phase="$(reconnect_phase)"
+  if [[ "$hold_phase" == captive-standdown || "$hold_phase" == captive-clear-wait ]]; then
+    verdict=CAPTIVE
+    VPN_PATH_FAIL_TICKS=0
+  elif [[ -n "$hold_phase" ]]; then
+    verdict=DEGRADED
+    VPN_PATH_FAIL_TICKS=0
+  elif [[ "$in_grace" == yes ]]; then
+    verdict=PENDING
+    VPN_PATH_FAIL_TICKS=0
+  elif [[ "$state" == Connected && "$e2e" == false && ( "$dns" == false || "$ipok" == false ) ]]; then
+    VPN_PATH_FAIL_TICKS=$((VPN_PATH_FAIL_TICKS + 1))
+    verdict=PENDING
+    if [[ "$WATCH" != yes || "$VPN_PATH_FAIL_TICKS" -ge "$VPN_FAIL_TICKS_REQUIRED" ]]; then verdict=NO-GO; fi
+    if [[ "$WATCH" == yes && "$REVERT" == yes && "$VPN_PATH_FAIL_TICKS" -ge "$VPN_FAIL_TICKS_REQUIRED" ]]; then
+      auto_reason="post-grace VPN-path failure: e2e=$e2e dns=$dns tailscale=$ts"
+      auto_at="$(now_iso)"
+      if restore_plain_network; then
+        auto=true
+        LAST_AUTO_DISCONNECT_AT="$auto_at"; LAST_AUTO_DISCONNECT_REASON="$auto_reason"; LAST_AUTO_DISCONNECT_EPOCH="$now"
+        action_log vpn_path disconnect restore-plain-network issued closed
+        state="$(vpn_state)"; state="${state:-Disconnected}"
+        LAST_STATE="$state"; CONNECT_OBSERVED_AT=0
+      else
+        log "plain-network restore refused because transfer containment was not confirmed"
+        action_log vpn_path disconnect restore-plain-network failed open
+      fi
+    fi
+  elif [[ "$state" == Connected && "$e2e" == false ]]; then
+    VPN_PATH_FAIL_TICKS=0
+    verdict=DEGRADED
+  elif [[ "$dns" == false ]]; then
+    VPN_PATH_FAIL_TICKS=0
+    verdict=NO-GO
+    [[ "$WATCH" == yes ]] && recover_dns_tick
+  elif [[ "$e2e" == false ]]; then
+    VPN_PATH_FAIL_TICKS=0
+    verdict=NO-GO
+  elif [[ "$crdreq" == true && "$crd" == false ]]; then
+    VPN_PATH_FAIL_TICKS=0
+    verdict=NO-GO
+    [[ "$WATCH" == yes ]] && recover_crd_tick
+  elif [[ "$ts" == false && "$PROTECT_TS" == yes ]]; then
+    VPN_PATH_FAIL_TICKS=0
+    verdict=NO-GO
+  elif [[ "$ts" == false ]]; then
+    VPN_PATH_FAIL_TICKS=0
+    verdict=DEGRADED
+  elif [[ "$(desired_state)" != on ]]; then
+    VPN_PATH_FAIL_TICKS=0
+    verdict=OFF
+  elif [[ "$state" == Connected ]]; then
+    VPN_PATH_FAIL_TICKS=0
+    verdict=GO
+  else
+    VPN_PATH_FAIL_TICKS=0
+    verdict=NO-GO
+  fi
+
+  if [[ "$WATCH" == yes && "$dns" == true ]]; then fault_recovered dns_dead; fi
+  if [[ "$WATCH" == yes ]] && { [[ "$crdreq" == false || "$crd" == true ]]; }; then
+    fault_recovered crd_wedged
+  fi
+
+  if [[ -n "$LAST_AUTO_DISCONNECT_AT" ]] && (( now - LAST_AUTO_DISCONNECT_EPOCH < STICKY_TTL )); then
+    auto=true; auto_reason="$LAST_AUTO_DISCONNECT_REASON"; auto_at="$LAST_AUTO_DISCONNECT_AT"
+  fi
+  output="$(status_json "$state" "$ipok" "$e2e" "$dns" "$ts" "$crd" "$crdreq" "$CRD_REASON" "$verdict" "$auto" "$auto_reason" "$auto_at")"
+  if [[ "$WATCH" == yes ]]; then write_shared_status "$output"; else printf '%s\n' "$output"; fi
+
+  summary="state=$state ip=$ipok e2e=$e2e dns=$dns tailscale=$ts crd=$crd verdict=$verdict grace=$in_grace"
+  if [[ "$summary" != "$LAST_SUMMARY" || $((now - LAST_HEARTBEAT)) -ge 600 ]]; then
+    log "$summary"; LAST_SUMMARY="$summary"; LAST_HEARTBEAT="$now"
+  fi
+}
+
+if [[ "$WATCH" == yes ]]; then
+  log "watch start interval=${INTERVAL}s grace=${GRACE}s protect_tailscale=$PROTECT_TS"
+  ticks=0
+  while true; do
+    printf '%s tick-start pid=%s tick=%s\n' "$(now_iso)" "$$" "$((ticks + 1))"
+    probe_and_decide
+    ticks=$((ticks + 1))
+    [[ "$MAX_TICKS" -gt 0 && "$ticks" -ge "$MAX_TICKS" ]] && break
+    sleep "$INTERVAL"
+  done
+else
+  probe_and_decide
+fi

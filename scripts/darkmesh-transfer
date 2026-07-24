@@ -1,0 +1,132 @@
+#!/bin/bash
+# darkmesh-transfer: live, no-restart control + status for the transfer client via
+# its localhost Web UI. Backs the server_monitor transfer panel + Pause/Resume
+# buttons, and is the same lever darkmesh-reconnect's resume-when-green uses.
+#
+#   darkmesh-transfer status [--json]   print state + write /tmp/darkmesh-transfer.json
+#   darkmesh-transfer pause             desired=paused + stop every transfer (no restart)
+#   darkmesh-transfer resume            desired=active + start every transfer (no restart)
+#   darkmesh-transfer toggle            flip paused <-> active
+#
+# Manual intent lives in ~/.config/darkmesh/transfer-desired ("active"|"paused").
+# reconnect's resume-when-green honors it, so a manual pause is never overridden by
+# the network-change auto-resume. Nothing here ever restarts the client.
+set -uo pipefail
+
+# Real transfer-client specifics (app / process / .ini section / API base) load
+# from untracked local config; this public repo ships only neutral fallbacks.
+CLIENT_CONF_FILE="${DARKMESH_CLIENT_CONF:-$HOME/.config/darkmesh/transfer-client.conf}"
+[ -r "$CLIENT_CONF_FILE" ] && . "$CLIENT_CONF_FILE"
+CLIENT_APP="${CLIENT_APP:-TransferClient}"
+CLIENT_CONF="${CLIENT_CONF:-$HOME/.config/$CLIENT_APP/$CLIENT_APP.ini}"
+TAPI="/api/v2/${CLIENT_API_BASE:-transfers}"   # the transfer-list API base
+DESIRED_FILE="${DARKMESH_TRANSFER_DESIRED:-$HOME/.config/darkmesh/transfer-desired}"
+STATUS_JSON="${DARKMESH_TRANSFER_STATUS:-/tmp/darkmesh-transfer.json}"
+
+client_web_port() { grep -E '^WebUI\\Port=' "$CLIENT_CONF" 2>/dev/null | head -1 | cut -d= -f2 | tr -d '[:space:]'; }
+WEB_PORT="$(client_web_port)"; WEB_PORT="${WEB_PORT:-8080}"
+WEB_HOST="${CLIENT_WEB_HOST:-http://127.0.0.1:$WEB_PORT}"
+WEB_USER="${CLIENT_WEB_USER:-admin}"
+WEB_KEYCHAIN="${KEYCHAIN_SERVICE:-vpn-guard-client}"
+WEB_COOKIE="$(mktemp -t darkmesh-xfer 2>/dev/null || echo "/tmp/darkmesh-xfer.$$")"
+trap 'rm -f "$WEB_COOKIE" 2>/dev/null' EXIT
+mkdir -p "$(dirname "$DESIRED_FILE")" 2>/dev/null
+[ -f "$DESIRED_FILE" ] || printf 'active\n' > "$DESIRED_FILE" 2>/dev/null
+read_desired() { [ -f "$DESIRED_FILE" ] && tr -d '[:space:]' < "$DESIRED_FILE" 2>/dev/null; }
+
+client_api() {  # METHOD PATH [curl args...]
+  local m="$1" p="$2"; shift 2
+  curl -fsS --max-time 5 -X "$m" -b "$WEB_COOKIE" -c "$WEB_COOKIE" -H "Referer: $WEB_HOST" "$WEB_HOST$p" "$@" 2>/dev/null
+}
+client_login() {
+  local pw; pw="$(security find-generic-password -s "$WEB_KEYCHAIN" -w 2>/dev/null)" || return 1
+  curl -fsS --max-time 5 -c "$WEB_COOKIE" -H "Referer: $WEB_HOST" \
+    --data-urlencode "username=$WEB_USER" --data-urlencode "password=$pw" \
+    "$WEB_HOST/api/v2/auth/login" >/dev/null 2>&1
+}
+client_reachable() { client_api GET /api/v2/app/version >/dev/null 2>&1 || { client_login && client_api GET /api/v2/app/version >/dev/null 2>&1; }; }
+
+# ExpressVPN tunnel IP (default-route utun), or empty.
+tunnel_ip() {
+  local iface; iface="$(netstat -rn -f inet 2>/dev/null | awk '$1 == "0/1" && $NF ~ /^utun[0-9]+$/ { print $NF; exit }')"
+  [ -n "$iface" ] || return 0
+  ifconfig "$iface" 2>/dev/null | awk '/inet /{print $2; exit}'
+}
+
+set_desired() { printf '%s\n' "$1" > "$DESIRED_FILE"; }
+do_pause()  { set_desired paused; client_api POST "$TAPI/stop"  --data 'hashes=all' >/dev/null 2>&1 || client_api POST "$TAPI/pause"  --data 'hashes=all' >/dev/null 2>&1; }
+do_resume() { set_desired active; client_api POST "$TAPI/start" --data 'hashes=all' >/dev/null 2>&1 || client_api POST "$TAPI/resume" --data 'hashes=all' >/dev/null 2>&1; }
+
+# Build the runtime status JSON (server_monitor reads this) and echo it.
+write_status() {
+  local reachable=false want tip info prefs
+  want="$(read_desired)"; want="${want:-active}"
+  tip="$(tunnel_ip)"
+  client_reachable && reachable=true
+  info="$(client_api GET "$TAPI/info" 2>/dev/null)"
+  prefs="$(client_api GET /api/v2/app/preferences 2>/dev/null)"
+  TRANSFER_REACHABLE="$reachable" TRANSFER_DESIRED="$want" TRANSFER_PORT="$WEB_PORT" \
+  TRANSFER_TUNNEL="$tip" TRANSFER_INFO="$info" TRANSFER_PREFS="$prefs" \
+  python3 - "$STATUS_JSON" <<'PY'
+import json,os,sys
+status_path=sys.argv[1]
+def load(s,d):
+    try: return json.loads(s)
+    except Exception: return d
+info=load(os.environ.get('TRANSFER_INFO',''),[]) or []
+prefs=load(os.environ.get('TRANSFER_PREFS',''),{}) or {}
+from collections import Counter
+states=Counter(t.get('state','') for t in info)
+paused=sum(v for k,v in states.items() if any(x in k.lower() for x in ('paused','stopped')))
+total=len(info)
+bound=prefs.get('current_interface_address','') if isinstance(prefs,dict) else ''
+tunnel=os.environ.get('TRANSFER_TUNNEL','')
+out={
+ "schema":1,
+ "component":"darkmesh-transfer",
+ "reachable": os.environ.get('TRANSFER_REACHABLE')=='true',
+ "desired": os.environ.get('TRANSFER_DESIRED','active'),
+ "web_port": int(os.environ.get('TRANSFER_PORT') or 0),
+ "bound_address": bound,
+ "tunnel_address": tunnel,
+ "on_tunnel": bool(bound) and bound==tunnel,
+ "total": total,
+ "paused": paused,
+ "active": total-paused,
+ "dl_speed": sum(t.get('dlspeed',0) for t in info),
+ "up_speed": sum(t.get('upspeed',0) for t in info),
+ "states": dict(states),
+}
+txt=json.dumps(out,indent=2)
+try:
+    tmp=status_path+".tmp"
+    with open(tmp,'w') as f: f.write(txt+"\n")
+    os.replace(tmp,status_path)
+except Exception:
+    pass
+print(txt)
+PY
+}
+
+cmd="${1:-status}"
+case "$cmd" in
+  status)
+    write_status
+    ;;
+  pause)
+    do_pause; write_status >/dev/null
+    echo "transfer client: PAUSED (desired=paused; auto-resume will stand down until you resume)"
+    ;;
+  resume)
+    do_resume; write_status >/dev/null
+    echo "transfer client: RESUMED (desired=active)"
+    ;;
+  toggle)
+    want="$(read_desired)"
+    if [ "$want" = "paused" ]; then do_resume; echo "transfer client: RESUMED"; else do_pause; echo "transfer client: PAUSED"; fi
+    write_status >/dev/null
+    ;;
+  *)
+    echo "usage: darkmesh-transfer {status [--json]|pause|resume|toggle}" >&2; exit 2
+    ;;
+esac

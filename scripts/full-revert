@@ -1,0 +1,132 @@
+#!/bin/bash
+# full-revert — undo everything darkmesh-vpn-guard did to this machine.
+# Leaves Homebrew casks (ExpressVPN, Tailscale, the transfer client) in place;
+# remove those manually with `brew uninstall --cask <name>` if desired.
+#
+# Idempotent. Each step skips when the state is already reverted.
+# Requires sudo for the resolver file and (via vpn-guard-uninstall.sh) for
+# pfctl + sudoers cleanup.
+
+set -uo pipefail
+
+# Real transfer-client specifics (app / process / .ini section / API base) load
+# from untracked local config; this public repo ships only neutral fallbacks.
+CLIENT_CONF_FILE="${DARKMESH_CLIENT_CONF:-$HOME/.config/darkmesh/transfer-client.conf}"
+[ -r "$CLIENT_CONF_FILE" ] && . "$CLIENT_CONF_FILE"
+
+CLIENT_APP="${CLIENT_APP:-TransferClient}"
+CLIENT_CASK="${CLIENT_CASK:-}"
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+EXPRESSVPN_CTL="/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl"
+TAILSCALE_APP="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+
+PURGE=no
+case "${1:-}" in
+  --purge) PURGE=yes ;;
+  --help|-h)
+    cat <<'EOF'
+Usage: full-revert [--purge]
+
+Undoes all darkmesh-vpn-guard changes to this machine:
+  1. Disable Network Lock (so internet flows when VPN is off)
+  2. Disconnect ExpressVPN
+  3. Remove Tailscale bypass entries from ExpressVPN split-tunnel
+  4. Turn ExpressVPN split-tunnel off
+  5. Turn ExpressVPN autoconnect off (background mode left as-is)
+  6. Remove /etc/resolver/ts.net (Tailscale MagicDNS)
+  7. Restore the most recent transfer-client ini backup if one exists
+  8. Uninstall vpn-guard (LaunchAgent, PF anchor, sudoers, scripts)
+
+With --purge: also wipe vpn-guard's Keychain entry and user config dirs.
+
+Does NOT brew uninstall the casks. Run those manually if desired:
+  brew uninstall --cask expressvpn tailscale "$CLIENT_CASK"
+EOF
+    exit 0
+    ;;
+esac
+
+note() { echo "==> $*"; }
+warn() { echo "WARN: $*" >&2; }
+
+# ---- Step 1: disable Network Lock so the next steps don't trap internet ----
+if [[ -x "$EXPRESSVPN_CTL" ]]; then
+  note "Disabling Network Lock"
+  "$EXPRESSVPN_CTL" set networklock false 2>&1 || warn "could not disable Network Lock"
+
+  note "Disconnecting ExpressVPN (if connected)"
+  state="$("$EXPRESSVPN_CTL" get connectionstate 2>/dev/null | head -n1)"
+  if [[ "$state" != "Disconnected" ]]; then
+    "$EXPRESSVPN_CTL" disconnect 2>&1 || warn "disconnect failed"
+  fi
+
+  # ---- Step 2: clear Tailscale from split-tunnel bypass ----
+  note "Removing Tailscale from split-tunnel bypass"
+  split_apps="$("$EXPRESSVPN_CTL" get split-app 2>/dev/null || true)"
+  while IFS= read -r path; do
+    [[ -z "$path" ]] && continue
+    "$EXPRESSVPN_CTL" set split-app "remove:$path" 2>&1 || warn "could not remove $path"
+  done < <(printf '%s\n' "$split_apps" | grep -iE 'tailscale|io\.tailscale' || true)
+
+  # ---- Step 3: turn split-tunnel off ----
+  note "Disabling split-tunnel"
+  "$EXPRESSVPN_CTL" set splittunnel false 2>&1 || warn "could not disable split-tunnel"
+
+  note "Disabling autoconnect"
+  "$EXPRESSVPN_CTL" set autoconnect false 2>&1 || warn "could not disable autoconnect"
+else
+  warn "$EXPRESSVPN_CTL not found — skipping ExpressVPN reverts"
+fi
+
+# ---- Step 4: remove Tailscale MagicDNS resolver ----
+if [[ -f /etc/resolver/ts.net ]]; then
+  note "Removing /etc/resolver/ts.net"
+  sudo rm -f /etc/resolver/ts.net || warn "could not remove /etc/resolver/ts.net"
+  sudo dscacheutil -flushcache 2>/dev/null || true
+  sudo killall -HUP mDNSResponder 2>/dev/null || true
+else
+  note "/etc/resolver/ts.net already absent"
+fi
+
+# ---- Step 5: restore the transfer client's ini from most recent backup ----
+CLIENT_INI="$HOME/.config/$CLIENT_APP/$CLIENT_APP.ini"
+if compgen -G "${CLIENT_INI}.bak.*" >/dev/null; then
+  backup="$(ls -t ${CLIENT_INI}.bak.* 2>/dev/null | head -n1)"
+  if [[ -n "$backup" ]]; then
+    note "Restoring $CLIENT_INI from $backup"
+    cp "$backup" "$CLIENT_INI" || warn "could not restore client .ini"
+  fi
+else
+  note "No transfer-client .ini backup found — leaving current config alone"
+fi
+
+# ---- Step 6: uninstall vpn-guard ----
+if [[ -x "$ROOT/vpn-guard/vpn-guard-uninstall.sh" ]]; then
+  note "Uninstalling vpn-guard"
+  if [[ "$PURGE" == "yes" ]]; then
+    "$ROOT/vpn-guard/vpn-guard-uninstall.sh" --purge
+  else
+    "$ROOT/vpn-guard/vpn-guard-uninstall.sh"
+  fi
+else
+  note "vpn-guard uninstaller not found at $ROOT/vpn-guard/vpn-guard-uninstall.sh"
+fi
+
+# ---- Step 7: remove user-level helper symlinks/binaries from ~/.local/bin ----
+for helper in darkmesh-expressvpn-tailscale transfer-vpn-doctor; do
+  if [[ -f "$HOME/.local/bin/$helper" ]]; then
+    note "Removing ~/.local/bin/$helper"
+    rm -f "$HOME/.local/bin/$helper"
+  fi
+done
+
+echo
+echo "==> Done."
+echo
+echo "Casks remain installed (run manually to remove):"
+echo "  brew uninstall --cask expressvpn tailscale $CLIENT_CASK"
+echo
+echo "The client's Connection\\InterfaceName key may still point at a stale"
+echo "utunX. Restore-from-backup handled it if a .bak existed; otherwise edit"
+echo "or delete the key manually."

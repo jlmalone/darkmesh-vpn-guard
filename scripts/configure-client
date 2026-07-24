@@ -1,0 +1,166 @@
+#!/bin/bash
+# configure-client — set up a fresh transfer-client install for vpn-guard:
+#   - peer port forced to 56378 (matches unsafe.pf.conf)
+#   - UPnP / NAT-PMP off
+#   - StartPaused on (so it never resumes before VPN is up)
+#   - Web UI on, user=admin, password set, port 8080, bind to all interfaces
+#
+# The Web UI password is taken from $CLIENT_WEBUI_PASSWORD or, failing that, a
+# random one is generated. The chosen password is printed once to stdout so
+# you can paste it into the keychain step (vpn-guard-install.sh).
+#
+# The specific client identifiers (app name, process name, .ini section, brew
+# cask) are weakly encoded in source and decoded at runtime so this public
+# source does not advertise them.
+#
+# Requires: macOS, python3, the transfer-client app already installed, and at
+# least one prior GUI launch so the legal-notice dialog has been accepted and
+# the ini exists.
+#
+# Idempotent. Re-running re-randomises the password unless CLIENT_WEBUI_PASSWORD
+# is set (so prefer setting it explicitly when scripting).
+
+set -euo pipefail
+
+# Real transfer-client specifics (app / process / .ini section / API base) load
+# from untracked local config; this public repo ships only neutral fallbacks.
+CLIENT_CONF_FILE="${DARKMESH_CLIENT_CONF:-$HOME/.config/darkmesh/transfer-client.conf}"
+[ -r "$CLIENT_CONF_FILE" ] && . "$CLIENT_CONF_FILE"
+
+CLIENT_APP="${CLIENT_APP:-TransferClient}"     # the .app / config dir name
+CLIENT_PROC="${CLIENT_PROC:-$CLIENT_APP}"    # the running process name
+CLIENT_SECTION="${CLIENT_SECTION:-Transfers}"  # the .ini section that holds transfer settings
+
+INI="$HOME/.config/$CLIENT_APP/$CLIENT_APP.ini"
+PEER_PORT="${CLIENT_PEER_PORT:-56378}"
+WEB_PORT="${CLIENT_WEB_PORT:-8080}"
+WEB_USER="${CLIENT_WEB_USER:-admin}"
+
+if [[ ! -f "$INI" ]]; then
+  cat >&2 <<EOF
+ERROR: $INI not found.
+
+Launch the transfer client GUI once first (so it accepts the legal notice and
+writes its initial config), then re-run this script.
+EOF
+  exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "ERROR: python3 required for PBKDF2 hashing." >&2
+  exit 1
+fi
+
+# 1. Pick / generate password.
+if [[ -n "${CLIENT_WEBUI_PASSWORD:-}" ]]; then
+  PASSWORD="${CLIENT_WEBUI_PASSWORD}"
+  printed_password=no
+else
+  PASSWORD="$(python3 -c "import secrets,string; print(''.join(secrets.choice(string.ascii_letters+string.digits+'_-') for _ in range(24)))")"
+  printed_password=yes
+fi
+
+# 2. Compute the client's PBKDF2-HMAC-SHA512 hash (100k iterations, 64-byte key, 16-byte salt).
+HASH="$(python3 -c "
+import os, base64, hashlib, sys
+password = sys.argv[1]
+salt = os.urandom(16)
+digest = hashlib.pbkdf2_hmac('sha512', password.encode('utf-8'), salt, 100000, 64)
+print(base64.b64encode(salt).decode() + ':' + base64.b64encode(digest).decode())
+" "$PASSWORD")"
+
+# 3. Quit the client so the ini write is safe.
+if pgrep -x "$CLIENT_PROC" >/dev/null 2>&1; then
+  echo "Quitting the transfer client..."
+  osascript -e "quit app \"$CLIENT_APP\"" 2>/dev/null || true
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    pgrep -x "$CLIENT_PROC" >/dev/null 2>&1 || break
+    sleep 1
+  done
+  if pgrep -x "$CLIENT_PROC" >/dev/null 2>&1; then
+    echo "Did not quit cleanly; sending SIGTERM..."
+    pkill -TERM -x "$CLIENT_PROC" || true
+    sleep 2
+  fi
+fi
+
+# 4. Back up the ini.
+cp "$INI" "$INI.bak.$(date +%Y%m%d%H%M%S)"
+
+# 5. Patch keys in place using python (handles backslash-laden client keys
+# without re.sub interpreting them as replacement-string escapes).
+python3 - "$INI" "$HASH" "$PEER_PORT" "$WEB_USER" "$WEB_PORT" "$CLIENT_SECTION" <<'PY'
+import re, sys, pathlib
+ini_path, hash_value, peer_port, web_user, web_port, transfer_section = sys.argv[1:7]
+text = pathlib.Path(ini_path).read_text()
+
+def set_in_section(text, section, key, value):
+    section_header = f"[{section}]"
+    new_line = f"{key}={value}"
+    if section_header not in text:
+        sep = "" if text.endswith("\n") else "\n"
+        return text + f"{sep}\n{section_header}\n{new_line}\n"
+    pattern = re.compile(rf"(\[{re.escape(section)}\]\n)(.*?)(?=^\[|\Z)", re.S | re.M)
+    m = pattern.search(text)
+    body = m.group(2)
+    key_re = re.compile(rf"^{re.escape(key)}=.*$", re.M)
+    if key_re.search(body):
+        body = key_re.sub(lambda _: new_line, body, count=1)
+    else:
+        if not body.endswith("\n"):
+            body += "\n"
+        body += new_line + "\n"
+    return text[:m.start(2)] + body + text[m.end(2):]
+
+# Transfer section: lock the peer port + start paused.
+text = set_in_section(text, transfer_section, "Session\\Port", peer_port)
+text = set_in_section(text, transfer_section, "Session\\StartPaused", "true")
+
+# Preferences: Web UI on, UPnP/NAT-PMP off.
+text = set_in_section(text, "Preferences", "Connection\\UPnP", "false")
+text = set_in_section(text, "Preferences", "Connection\\UseNATPMP", "false")
+text = set_in_section(text, "Preferences", "WebUI\\Enabled", "true")
+text = set_in_section(text, "Preferences", "WebUI\\Username", web_user)
+text = set_in_section(text, "Preferences", "WebUI\\Password_PBKDF2", f'"@ByteArray({hash_value})"')
+text = set_in_section(text, "Preferences", "WebUI\\Port", web_port)
+text = set_in_section(text, "Preferences", "WebUI\\Address", "*")
+text = set_in_section(text, "Preferences", "WebUI\\HostHeaderValidation", "false")
+text = set_in_section(text, "Preferences", "WebUI\\LocalHostAuth", "true")
+text = set_in_section(text, "Preferences", "WebUI\\CSRFProtection", "true")
+
+pathlib.Path(ini_path).write_text(text)
+print("INI updated.")
+PY
+
+# 6. Relaunch the client and wait for Web UI.
+open -a "$CLIENT_APP"
+echo "Waiting for Web UI on http://127.0.0.1:$WEB_PORT ..."
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$WEB_PORT/" || true)
+  if [[ "$code" == "200" || "$code" == "401" || "$code" == "403" ]]; then
+    echo "Web UI up (http=$code)"
+    break
+  fi
+  sleep 1
+done
+
+# 7. Sanity-check auth with the password we just set.
+auth_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 \
+  -X POST -H "Referer: http://127.0.0.1:$WEB_PORT" \
+  --data-urlencode "username=$WEB_USER" \
+  --data-urlencode "password=$PASSWORD" \
+  "http://127.0.0.1:$WEB_PORT/api/v2/auth/login" || true)"
+if [[ "$auth_code" != "200" && "$auth_code" != "204" ]]; then
+  echo "ERROR: Web UI auth check returned http=$auth_code; password may not have been applied." >&2
+  exit 1
+fi
+echo "Web UI auth verified."
+
+if [[ "$printed_password" == yes ]]; then
+  echo
+  echo "Generated Web UI password (user=$WEB_USER):"
+  echo "  $PASSWORD"
+  echo
+  echo "Store it in macOS Keychain for vpn-guard to use:"
+  echo "  security add-generic-password -a \"\$USER\" -s vpn-guard-client -w '$PASSWORD' -U"
+fi

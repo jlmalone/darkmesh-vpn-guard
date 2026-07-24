@@ -1,0 +1,285 @@
+#!/bin/bash
+# Configure Tailscale to coexist with ExpressVPN without disabling Network Lock.
+
+set -uo pipefail
+
+EXPRESSVPN_CTL="${EXPRESSVPN_CTL:-/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl}"
+TAILSCALE_APP="${TAILSCALE_APP:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
+DARKMESH_UP="${DARKMESH_UP:-$(command -v darkmesh-up 2>/dev/null || true)}"
+SYSTEM_SETTINGS_URL="x-apple.systempreferences:com.apple.LoginItems-Settings.extension"
+
+# Real transfer-client specifics (app / process / .ini section / API base) load
+# from untracked local config; this public repo ships only neutral fallbacks.
+CLIENT_CONF_FILE="${DARKMESH_CLIENT_CONF:-$HOME/.config/darkmesh/transfer-client.conf}"
+[ -r "$CLIENT_CONF_FILE" ] && . "$CLIENT_CONF_FILE"
+CLIENT_PROC="${CLIENT_PROC:-TransferClient}"
+
+usage() {
+  cat <<'EOF'
+Usage: darkmesh-expressvpn-tailscale <status|apply [--strict]|verify>
+
+status  Print ExpressVPN, split-tunnel, system-extension, and Tailscale state.
+apply   Enable ExpressVPN split tunneling and bypass Tailscale only. Darkmesh owns connect.
+        Network Lock is left OFF by default (relaxed). Pass --strict to force it ON.
+verify  Run status plus Tailscale netcheck and transfer-client binding diagnostics.
+        Network Lock is treated as advisory; warns instead of failing when OFF.
+
+This tool must never add the transfer client to ExpressVPN split-tunnel bypass rules.
+
+Relaxed mode (default) rationale: Network Lock ON has trapped general internet
+during ExpressVPN tunnel hiccups. The transfer-client invariant is still
+fail-closed because the client is socket-bound to the ExpressVPN utun; vpn-guard
+also pauses it and loads PF anchor rules when the tunnel drops.
+EOF
+}
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+need_file() {
+  [[ -e "$1" ]] || die "missing: $1"
+}
+
+find_tailscale_extensions() {
+  # Print every Tailscale extension executable path on disk, one per line.
+  # macOS keeps stale extension dirs in /Library/SystemExtensions after
+  # upgrades; bypass all of them so the active one is always covered.
+  local installed bundled
+  installed="$(find /Library/SystemExtensions \
+    -path '*io.tailscale.ipn.macsys.network-extension.systemextension/Contents/MacOS/io.tailscale.ipn.macsys.network-extension' \
+    -type f 2>/dev/null)"
+  if [[ -n "$installed" ]]; then
+    printf '%s\n' "$installed"
+    return 0
+  fi
+  bundled="$(find /Applications/Tailscale.app/Contents/Library/SystemExtensions \
+    -path '*io.tailscale.ipn.macsys.network-extension.systemextension/Contents/MacOS/io.tailscale.ipn.macsys.network-extension' \
+    -type f 2>/dev/null)"
+  printf '%s\n' "$bundled"
+}
+
+find_crd_binaries() {
+  # Print every Chrome Remote Desktop host executable on disk, one per line.
+  # Bypassing the main process broker isn't enough — the per-session host and
+  # the Chrome native messaging bridge each open their own sockets. All four
+  # need to bypass the VPN or remote-desktop access dies whenever VPN is on.
+  local root="/Library/PrivilegedHelperTools/ChromeRemoteDesktopHost.app"
+  [[ -d "$root" ]] || return 0
+  find "$root" \
+    -type f \
+    \( -name remoting_me2me_host \
+       -o -name remoting_me2me_host_service \
+       -o -name remoting_agent_process_broker \
+       -o -name native_messaging_host \
+       -o -name remote_assistance_host \) \
+    2>/dev/null
+}
+
+prune_stale_bypass_entries() {
+  # Remove bypass:<path> entries whose target no longer exists on disk.
+  # macOS leaves stale System Extension dirs around after upgrades — the
+  # bypass entry for the old version dangles until reboot's uninstall completes,
+  # and then permanently after that.
+  local current path target
+  current="$("$EXPRESSVPN_CTL" get split-app 2>/dev/null)" || return 0
+  while IFS= read -r path; do
+    [[ "$path" == bypass:* ]] || continue
+    target="${path#bypass:}"
+    if [[ ! -e "$target" ]]; then
+      echo "  Removing stale bypass entry (target missing): $target"
+      "$EXPRESSVPN_CTL" set split-app "remove:$target" >/dev/null 2>&1 || true
+    fi
+  done <<<"$current"
+}
+
+express_get() {
+  "$EXPRESSVPN_CTL" get "$1" 2>/dev/null | head -n 1
+}
+
+show_status() {
+  echo "ExpressVPN:"
+  "$EXPRESSVPN_CTL" status 2>/dev/null || true
+  echo
+  echo "networklock:  $(express_get networklock)"
+  echo "splittunnel:  $(express_get splittunnel)"
+  echo "autoconnect:  $(express_get autoconnect)"
+  echo
+  echo "split-app:"
+  "$EXPRESSVPN_CTL" get split-app 2>/dev/null || true
+  echo
+  echo "System extensions:"
+  systemextensionsctl list 2>/dev/null | grep -E 'expressvpn|tailscale|SplitTunnel|Tailscale' || true
+  echo
+  echo "Tailscale status:"
+  "$TAILSCALE_APP" status 2>/dev/null || true
+}
+
+apply_setup() {
+  local ts_ext split_apps strict=no
+  case "${1:-}" in
+    --strict) strict=yes ;;
+    "" ) ;;
+    * ) die "unknown apply argument: $1 (expected --strict or none)" ;;
+  esac
+
+  need_file "$EXPRESSVPN_CTL"
+  need_file "$TAILSCALE_APP"
+
+  local ts_extensions
+  ts_extensions="$(find_tailscale_extensions)"
+  [[ -n "$ts_extensions" ]] || die "could not find any Tailscale network extension executable"
+
+  if [[ "$strict" == "yes" ]]; then
+    echo "Enabling ExpressVPN Network Lock (--strict), background mode, and split tunneling..."
+    "$EXPRESSVPN_CTL" set networklock true || die "failed to enable Network Lock"
+  else
+    echo "Leaving Network Lock OFF (relaxed). Enabling background mode and split tunneling..."
+    "$EXPRESSVPN_CTL" set networklock false 2>/dev/null || true
+  fi
+  "$EXPRESSVPN_CTL" background enable || die "failed to enable ExpressVPN background mode"
+  "$EXPRESSVPN_CTL" set autoconnect false || die "failed to disable ExpressVPN autoconnect"
+
+  # Set bypass entries BEFORE enabling split tunneling.
+  # Enabling split tunnel immediately activates the SplitTunnelProxyExtension,
+  # which on some machines replaces the Wi-Fi/Ethernet address with a virtual
+  # DHCP address and breaks internet before the bypass commands can run. Pre-loading
+  # bypasses while split tunnel is off avoids this race.
+  echo "Bypassing Tailscale app:"
+  echo "  $TAILSCALE_APP"
+  "$EXPRESSVPN_CTL" set split-app "bypass:$TAILSCALE_APP" || die "failed to bypass Tailscale app"
+
+  echo "Bypassing Tailscale network extensions:"
+  while IFS= read -r ts_ext; do
+    [[ -z "$ts_ext" ]] && continue
+    echo "  $ts_ext"
+    "$EXPRESSVPN_CTL" set split-app "bypass:$ts_ext" || die "failed to bypass Tailscale network extension: $ts_ext"
+  done <<<"$ts_extensions"
+
+  local crd_bins
+  crd_bins="$(find_crd_binaries)"
+  if [[ -n "$crd_bins" ]]; then
+    echo "Bypassing Chrome Remote Desktop host binaries:"
+    while IFS= read -r crd_bin; do
+      [[ -z "$crd_bin" ]] && continue
+      echo "  $crd_bin"
+      "$EXPRESSVPN_CTL" set split-app "bypass:$crd_bin" || die "failed to bypass CRD binary: $crd_bin"
+    done <<<"$crd_bins"
+  else
+    echo "Chrome Remote Desktop host not installed; skipping CRD bypass entries."
+  fi
+
+  echo "Pruning stale bypass entries (targets missing on disk):"
+  prune_stale_bypass_entries
+
+  "$EXPRESSVPN_CTL" set splittunnel true || die "failed to enable split tunneling"
+
+  split_apps="$("$EXPRESSVPN_CTL" get split-app 2>/dev/null)"
+  local blocked_proc
+  blocked_proc="$CLIENT_PROC"
+  if printf '%s\n' "$split_apps" | grep -qi "$blocked_proc"; then
+    die "transfer client is present in split-tunnel rules; remove it before continuing"
+  fi
+
+  # Pre-connect safety: every active Tailscale extension MUST be in the bypass
+  # list, or connecting will route Tailscale through ExpressVPN and kill SSH.
+  # Determine active versions from systemextensionsctl, then map back to a
+  # bundle path on disk by matching CFBundleShortVersionString.
+  local active_versions extension_root version match
+  active_versions="$(systemextensionsctl list 2>/dev/null \
+    | awk '/io\.tailscale\.ipn\.macsys\.network-extension/ && /activated enabled/ { match($0, /\([^)]+\)/); ver=substr($0, RSTART+1, RLENGTH-2); split(ver, a, "/"); print a[1] }')"
+  while IFS= read -r v; do
+    [[ -z "$v" ]] && continue
+    match=""
+    while IFS= read -r path; do
+      [[ -z "$path" ]] && continue
+      extension_root="${path%/Contents/MacOS/io.tailscale.ipn.macsys.network-extension}"
+      version="$(defaults read "$extension_root/Contents/Info" CFBundleShortVersionString 2>/dev/null || true)"
+      if [[ "$version" == "$v" ]]; then
+        match="$path"
+        break
+      fi
+    done <<<"$ts_extensions"
+    if [[ -z "$match" ]]; then
+      die "active Tailscale extension v$v is not on disk; cannot connect safely"
+    fi
+    if ! printf '%s\n' "$split_apps" | grep -qF "bypass:$match"; then
+      die "active Tailscale extension v$v ($match) is NOT in bypass list; aborting before connect"
+    fi
+    echo "Verified bypass for active Tailscale extension v$v"
+  done <<<"$active_versions"
+
+  # MagicDNS must be OFF while ExpressVPN is connected. With accept-dns=true,
+  # Tailscale hijacks resolution to MagicDNS (100.100.100.100), whose upstream can
+  # be an ExpressVPN resolver inside 100.64.0.0/10, but the Tailscale extension is bypassed
+  # AROUND ExpressVPN, so it cannot reach that resolver and every lookup times out.
+  # accept-dns=false only removes Tailscale as a resolver source. It does not
+  # select ExpressVPN's resolver; DHCP or a Darkmesh-owned override still
+  # determines the global resolver set. Verified live
+  # 2026-06-02: apply with accept-dns=true -> DNS dead; accept-dns=false -> DNS OK
+  # with the VPN still up. Off-tunnel, the healthcheck keeps system/DHCP DNS in
+  # control and can temporarily promote working DHCP servers if another VPN
+  # leaves a dead resolver ahead of them.
+  if [[ -x "$TAILSCALE_APP" ]]; then
+    echo "Disabling Tailscale MagicDNS (accept-dns=false) so DNS works while ExpressVPN is up..."
+    "$TAILSCALE_APP" set --accept-dns=false 2>&1 | head -2 || true
+  fi
+
+  if [[ -n "$DARKMESH_UP" && -x "$DARKMESH_UP" ]]; then
+    "$DARKMESH_UP"
+  else
+    die "darkmesh-up not found; configuration applied but VPN intent was not armed"
+  fi
+
+  if systemextensionsctl list 2>/dev/null | grep -q 'com.expressvpn.vpn.splittunnel.*waiting for user'; then
+    echo
+    echo "macOS still needs user approval for ExpressVPN SplitTunnelProxyExtension."
+    echo "Opening System Settings. Approve it under General > Login Items & Extensions > Network Extensions."
+    open "$SYSTEM_SETTINGS_URL" >/dev/null 2>&1 || true
+  fi
+}
+
+verify_setup() {
+  local networklock splittunnel split_apps autoconnect
+  show_status
+  echo
+  echo "Tailscale netcheck:"
+  "$TAILSCALE_APP" netcheck || true
+  echo
+  if command -v transfer-vpn-doctor >/dev/null 2>&1; then
+    transfer-vpn-doctor
+  elif [[ -x "$HOME/.local/bin/transfer-vpn-doctor" ]]; then
+    "$HOME/.local/bin/transfer-vpn-doctor"
+  fi
+
+  networklock="$(express_get networklock)"
+  autoconnect="$(express_get autoconnect)"
+  splittunnel="$(express_get splittunnel)"
+  split_apps="$("$EXPRESSVPN_CTL" get split-app 2>/dev/null)"
+
+  if [[ "$networklock" != "true" ]]; then
+    echo "NOTE: Network Lock is not true (relaxed mode). Fail-closed is enforced by client binding + PF + vpn-guard." >&2
+  fi
+  [[ "$splittunnel" == "true" ]] || die "Split Tunnel is not true"
+  [[ "$autoconnect" == "false" ]] || die "ExpressVPN autoconnect is not false; Darkmesh must own connection ordering"
+  printf '%s\n' "$split_apps" | grep -q 'bypass:.*Tailscale.app' || die "Tailscale app is not in bypass list"
+  printf '%s\n' "$split_apps" | grep -q 'bypass:.*io.tailscale.ipn.macsys.network-extension' || die "Tailscale network extension is not in bypass list"
+  if [[ -d /Library/PrivilegedHelperTools/ChromeRemoteDesktopHost.app ]]; then
+    printf '%s\n' "$split_apps" | grep -q 'bypass:.*remoting_me2me_host' \
+      || die "Chrome Remote Desktop is installed but its host is not in the bypass list — remote access will break when VPN connects"
+  fi
+  local blocked_proc
+  blocked_proc="$CLIENT_PROC"
+  ! printf '%s\n' "$split_apps" | grep -qi "$blocked_proc" || die "transfer client is in bypass list"
+}
+
+cmd="${1:-}"
+shift || true
+case "$cmd" in
+  status) show_status ;;
+  apply) apply_setup "$@" ;;
+  verify) verify_setup ;;
+  -h|--help|"") usage ;;
+  *) echo "ERROR: unknown command: $cmd" >&2; usage; exit 2 ;;
+esac

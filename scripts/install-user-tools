@@ -1,0 +1,35 @@
+#!/bin/bash
+# Development-tree bootstrap. Copies the tracked payload to ~/.local, then hands
+# all configuration, privilege, registration, and migration work to darkmesh-setup.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BIN_DIR="${DARKMESH_BIN_DIR:-$HOME/.local/bin}"
+SHARE_DIR="${DARKMESH_SHARE_DIR:-$HOME/.local/share/darkmesh}"
+
+mkdir -p "$BIN_DIR" "$SHARE_DIR"
+tools=(
+  darkmesh darkmesh-setup darkmesh-audit darkmesh-healthcheck darkmesh-breaker
+  darkmesh-root-helper darkmesh-reconnect darkmesh-repair darkmesh-restore-plain-network darkmesh-up darkmesh-panic
+  darkmesh-captive darkmesh-diag darkmesh-protocol-trial darkmesh-transfer darkmesh-fleet
+  darkmesh-transfer-daemon
+  darkmesh-expressvpn-tailscale darkmesh-migrate-agent install-root-helper.sh
+  transfer-vpn-doctor configure-client relax-network-lock emergency-restore-internet
+  verify-end-state full-revert bootstrap-prerequisites
+)
+for tool in "${tools[@]}"; do
+  [[ -f "$ROOT/scripts/$tool" ]] && install -m 0755 "$ROOT/scripts/$tool" "$BIN_DIR/$tool"
+done
+install -m 0755 "$ROOT/vpn-guard/vpn-guard.sh" "$BIN_DIR/vpn-guard.sh"
+# This retired helper encoded the wrong DNS recovery direction. Never leave a
+# stale copy shadowing the current fixed root helper after an upgrade.
+rm -f "$BIN_DIR/darkmesh-dns-recover"
+for payload in \
+  com.user.darkmesh-healthcheck.plist com.user.darkmesh-reconnect.plist \
+  com.user.darkmesh-netchange.plist com.user.vpnguard.plist \
+  unsafe.pf.conf sudoers.d-vpn-guard; do
+  install -m 0644 "$ROOT/vpn-guard/$payload" "$SHARE_DIR/$payload"
+done
+
+echo "Installed development payload to $BIN_DIR"
+exec "$BIN_DIR/darkmesh-setup" "$@"

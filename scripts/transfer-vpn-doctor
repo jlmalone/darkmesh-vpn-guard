@@ -1,0 +1,321 @@
+#!/bin/bash
+# Diagnose and refresh the transfer client's ExpressVPN tunnel binding.
+
+set -uo pipefail
+
+EXPRESSVPN_CTL="/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl"
+TAILSCALE_CLI="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+
+# Real transfer-client specifics (app / process / .ini section / API base) load
+# from untracked local config; this public repo ships only neutral fallbacks.
+CLIENT_CONF_FILE="${DARKMESH_CLIENT_CONF:-$HOME/.config/darkmesh/transfer-client.conf}"
+[ -r "$CLIENT_CONF_FILE" ] && . "$CLIENT_CONF_FILE"
+
+CLIENT_APP="${CLIENT_APP:-TransferClient}"
+CLIENT_PROC="${CLIENT_PROC:-$CLIENT_APP}"
+CLIENT_SECTION="${CLIENT_SECTION:-Transfers}"
+CLIENT_CONF="${CLIENT_CONF:-$HOME/.config/$CLIENT_APP/$CLIENT_APP.ini}"
+
+FIX=no
+QUIT_CLIENT=no
+RELAUNCH=no
+CHECK=no
+
+usage() {
+  cat <<'EOF'
+Usage: transfer-vpn-doctor [--check] [--fix] [--quit] [--relaunch]
+
+Without flags, prints why the transfer client can or cannot use the current
+ExpressVPN tunnel.
+
+  --check     Exit-code mode for tooling: 0 = binding current, 3 = stale binding,
+              4 = VPN down / tunnel unknown. Prints the same diagnostic.
+  --fix       Update the client config to the current ExpressVPN tunnel binding.
+              Refuses to edit while the client is running.
+  --quit      With --fix, quit the client first, wait for it to exit, then edit.
+  --relaunch  With --fix, relaunch the client after editing so vpn-guard can
+              resume it (resume is a no-op when the client isn't running).
+
+The actual client identifiers are decoded at runtime so this public source does
+not advertise them.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --fix) FIX=yes ;;
+    --quit) QUIT_CLIENT=yes ;;
+    --relaunch) RELAUNCH=yes ;;
+    --check) CHECK=yes ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "ERROR: unknown argument: $1" >&2; usage; exit 2 ;;
+  esac
+  shift
+done
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+need_file() {
+  [[ -e "$1" ]] || die "missing: $1"
+}
+
+express_get() {
+  "$EXPRESSVPN_CTL" get "$1" 2>/dev/null | head -n 1
+}
+
+express_iface() {
+  netstat -rn -f inet 2>/dev/null | awk '$1 == "0/1" && $NF ~ /^utun[0-9]+$/ { print $NF; exit }'
+}
+
+iface_ip() {
+  local iface="$1"
+  ifconfig "$iface" 2>/dev/null | awk '/inet / { print $2; exit }'
+}
+
+tailscale_iface() {
+  local ts_ip
+  [[ -x "$TAILSCALE_CLI" ]] || return 0
+  ts_ip="$("$TAILSCALE_CLI" ip -4 2>/dev/null | head -n 1)"
+  [[ "$ts_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 0
+  ifconfig 2>/dev/null | awk -v search_ip="inet $ts_ip " '
+    /^[a-z0-9]+:/ { iface=$1; gsub(":", "", iface) }
+    $0 ~ search_ip { print iface; exit }
+  '
+}
+
+conf_get() {
+  local key="$1" line
+  line="$(grep -F -m 1 "$key=" "$CLIENT_CONF" 2>/dev/null || true)"
+  [[ -n "$line" ]] && printf '%s\n' "${line#"$key="}"
+}
+
+client_running() {
+  osascript -e "application \"$CLIENT_APP\" is running" 2>/dev/null | grep -q true
+}
+
+wait_for_client_exit() {
+  local i
+  for i in {1..20}; do
+    client_running || return 0
+    sleep 1
+  done
+  return 1
+}
+
+set_conf_key() {
+  local key="$1" val="$2" section="$3" tmp line
+  local in_target=no seen_section=no done=no
+  tmp="$(mktemp "${CLIENT_CONF}.tmp.XXXX")" || return 1
+  {
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" == "$key="* ]]; then
+        printf '%s=%s\n' "$key" "$val"
+        done=yes
+        continue
+      fi
+
+      if [[ "$line" == "[$section]" ]]; then
+        in_target=yes
+        seen_section=yes
+        printf '%s\n' "$line"
+        continue
+      fi
+
+      if [[ "$in_target" == yes && "$line" == \[* ]]; then
+        if [[ "$done" == no ]]; then
+          printf '%s=%s\n' "$key" "$val"
+          done=yes
+        fi
+        in_target=no
+      fi
+
+      printf '%s\n' "$line"
+    done < "$CLIENT_CONF"
+
+    if [[ "$done" == no ]]; then
+      if [[ "$seen_section" == no ]]; then
+        printf '\n[%s]\n' "$section"
+      fi
+      printf '%s=%s\n' "$key" "$val"
+    fi
+  } > "$tmp" || {
+    rm -f "$tmp"
+    return 1
+  }
+  mv "$tmp" "$CLIENT_CONF"
+}
+
+need_file "$EXPRESSVPN_CTL"
+need_file "$CLIENT_CONF"
+
+connection_state="$(express_get connectionstate)"
+network_lock="$(express_get networklock)"
+split_tunnel="$(express_get splittunnel)"
+split_apps="$("$EXPRESSVPN_CTL" get split-app 2>/dev/null)"
+vpn_iface="$(express_iface)"
+vpn_addr=""
+[[ -n "$vpn_iface" ]] && vpn_addr="$(iface_ip "$vpn_iface")"
+ts_iface="$(tailscale_iface)"
+
+# Current transfer-client builds bind listen sockets on Session\Interface /
+# Session\InterfaceAddress (the keys the WebUI's current_network_interface
+# writes), NOT the legacy Connection\* keys. Read those so --check reflects the
+# REAL binding.
+client_iface="$(conf_get 'Session\Interface')"
+client_addr="$(conf_get 'Session\InterfaceAddress')"
+client_upnp="$(conf_get 'Connection\UPnP')"
+client_start_paused="$(conf_get 'Session\StartPaused')"
+
+echo "ExpressVPN:"
+echo "  connectionstate: ${connection_state:-unknown}"
+echo "  networklock:     ${network_lock:-unknown}"
+echo "  splittunnel:     ${split_tunnel:-unknown}"
+echo "  tunnel:          ${vpn_iface:-unknown} ${vpn_addr:-unknown}"
+echo
+echo "Tailscale:"
+echo "  interface:       ${ts_iface:-unknown}"
+echo
+echo "Transfer client config:"
+echo "  InterfaceName:   ${client_iface:-unset}"
+echo "  InterfaceAddress:${client_addr:-unset}"
+echo "  StartPaused:     ${client_start_paused:-unset}"
+echo "  UPnP:            ${client_upnp:-unset}"
+echo
+
+status=OK
+
+if [[ "$connection_state" != "Connected" ]]; then
+  echo "NO-GO: ExpressVPN is not connected; the transfer client should stay stopped or paused."
+  status=NO_GO
+fi
+
+if [[ "$network_lock" != "true" ]]; then
+  # Relaxed mode (canonical policy): Network Lock is OFF by design. Fail-closed
+  # comes from the socket-bind + PF + vpn-guard, NOT Network Lock, so this is
+  # informational only and must NOT drive the verdict — otherwise every relaxed
+  # node reports NO-GO and `--check` returns "VPN down" while perfectly healthy.
+  echo "INFO: ExpressVPN Network Lock is off (relaxed mode; fail-closed via binding + PF + vpn-guard)."
+fi
+
+if [[ -z "$vpn_iface" || -z "$vpn_addr" ]]; then
+  echo "NO-GO: could not identify the active ExpressVPN tunnel from the route table."
+  status=NO_GO
+fi
+
+if [[ -n "$ts_iface" && -n "$vpn_iface" && "$ts_iface" == "$vpn_iface" ]]; then
+  echo "NO-GO: ExpressVPN and Tailscale resolved to the same interface; refusing to trust binding."
+  status=NO_GO
+fi
+
+if printf '%s\n' "$split_apps" | grep -qi "$CLIENT_PROC"; then
+  echo "NO-GO: transfer client appears in ExpressVPN split-tunnel rules. Remove it."
+  status=NO_GO
+fi
+
+if [[ -n "$vpn_iface" && -n "$vpn_addr" ]]; then
+  if [[ "$client_iface" != "$vpn_iface" || "$client_addr" != "$vpn_addr" ]]; then
+    echo "STALE-BINDING: client is bound to ${client_iface:-unset}/${client_addr:-unset}, but ExpressVPN is ${vpn_iface}/${vpn_addr}."
+    echo "  Result: the client may look stuck. This is fail-closed, not a leak."
+    status=STALE_BINDING
+  else
+    echo "OK: client binding matches the current ExpressVPN tunnel."
+  fi
+fi
+
+if [[ "$client_upnp" != "false" ]]; then
+  echo "WARN: client UPnP/NAT-PMP is not disabled."
+fi
+
+if [[ "$client_start_paused" == "true" ]]; then
+  echo "WARN: client is set to START PAUSED — a paused session never announces or"
+  echo "      rechecks and nothing resumes it on a headless transfer node (this parked m4"
+  echo "      for days). Run --fix to clear it; fail-closed is the socket-bind, not a pause."
+fi
+
+if [[ "$CHECK" == "yes" ]]; then
+  case "$status" in
+    OK)            exit 0 ;;
+    STALE_BINDING) exit 3 ;;
+    *)             exit 4 ;;   # NO_GO: VPN down / tunnel unknown / iface collision / client in bypass
+  esac
+fi
+
+if [[ "$FIX" != "yes" ]]; then
+  if [[ "$status" == "STALE_BINDING" ]]; then
+    echo
+    echo "Fix: quit the transfer client and run: transfer-vpn-doctor --fix"
+    echo "Or let this tool quit it: transfer-vpn-doctor --fix --quit"
+  fi
+  exit 0
+fi
+
+[[ "$connection_state" == "Connected" ]] || die "refusing --fix because ExpressVPN is not connected"
+[[ -n "$vpn_iface" && -n "$vpn_addr" ]] || die "refusing --fix because ExpressVPN tunnel is unknown"
+[[ -z "$ts_iface" || "$ts_iface" != "$vpn_iface" ]] || die "refusing --fix because ExpressVPN tunnel matches Tailscale interface"
+
+# Network Lock is informational only in this project. Our fail-closed safety
+# comes from: (1) the client's socket-bind to the VPN utun (no fallback path
+# without a tunnel), (2) vpn-guard PF rules blocking the transfer ports when
+# VPN is down, (3) vpn-guard pausing the client via Web API on unsafe
+# transitions. Network Lock has its own failure mode (trapping general internet
+# on tunnel hiccups) which is why it's left off. Don't refuse --fix on it.
+if [[ "$network_lock" != "true" ]]; then
+  echo "  NOTE: proceeding with --fix in relaxed mode (Network Lock off); fail-closed safety still enforced by binding + PF + vpn-guard." >&2
+fi
+
+if client_running; then
+  if [[ "$QUIT_CLIENT" == "yes" ]]; then
+    echo "Quitting transfer client..."
+    osascript -e "quit app \"$CLIENT_APP\"" >/dev/null 2>&1 || die "failed to ask client to quit"
+    wait_for_client_exit || die "client did not quit within 20 seconds; not editing config"
+  else
+    die "client is running. Quit it first, or run transfer-vpn-doctor --fix --quit"
+  fi
+fi
+
+backup="${CLIENT_CONF}.bak.$(date +%Y%m%d%H%M%S)"
+cp "$CLIENT_CONF" "$backup" || die "failed to create backup: $backup"
+# Keep only the 3 newest backups so they don't accumulate one per tunnel rotation.
+ls -t "${CLIENT_CONF}".bak.* 2>/dev/null | tail -n +4 | while IFS= read -r old; do rm -f "$old"; done
+
+set_conf_key 'Connection\InterfaceName' "$vpn_iface" "Preferences" || die "failed to update InterfaceName (legacy)"
+set_conf_key 'Connection\InterfaceAddress' "$vpn_addr" "Preferences" || die "failed to update InterfaceAddress (legacy)"
+set_conf_key 'Connection\UPnP' "false" "Preferences" || die "failed to update UPnP"
+# Modern transfer-client builds (current generation) read listen-binding from
+# the [$CLIENT_SECTION] Session\InterfaceName / Session\InterfaceAddress keys,
+# not [Preferences] Connection. The legacy keys above are kept for older
+# builds; these are what actually restrict listen sockets to the VPN today.
+set_conf_key 'Session\Interface'        "$vpn_iface" "$CLIENT_SECTION" || die "failed to update Session\\Interface"
+set_conf_key 'Session\InterfaceName'    "$vpn_iface" "$CLIENT_SECTION" || die "failed to update Session\\InterfaceName"
+set_conf_key 'Session\InterfaceAddress' "$vpn_addr"  "$CLIENT_SECTION" || die "failed to update Session\\InterfaceAddress"
+# Disable Local Service Discovery — it broadcasts on the local network and
+# would leak the client's presence even with binding restricted.
+set_conf_key 'Session\LSD' "false" "$CLIENT_SECTION" || die "failed to update Session\\LSD"
+# Transfer-node posture: do NOT start the session paused. A paused transfer engine
+# dispatches NO jobs (no announce, no recheck) and nothing resumes it on a headless
+# box — that parked m4 for days. Fail-closed is the socket-bind (a stale/dead bind
+# can't send), not a global pause; so start UNPAUSED and rely on the binding.
+set_conf_key 'Session\StartPaused' "false" "$CLIENT_SECTION" || die "failed to update StartPaused"
+
+# macOS App Nap suspends the client's transfer-engine worker threads → announces and
+# disk-checks silently stop while the WebUI looks fine. Disable it (persists; takes
+# effect next launch). Bundle id read from the app so this public source stays name-free.
+appnap_bid="$(defaults read "/Applications/$CLIENT_APP.app/Contents/Info" CFBundleIdentifier 2>/dev/null)"
+if [[ -n "$appnap_bid" ]]; then
+  defaults write "$appnap_bid" NSAppSleepDisabled -bool YES 2>/dev/null \
+    && echo "  App Nap: disabled ($appnap_bid)" || echo "  WARN: could not disable App Nap"
+fi
+
+echo
+echo "Updated client binding:"
+echo "  Interface:        $vpn_iface"
+echo "  InterfaceAddress: $vpn_addr"
+echo "  Backup:           $backup"
+
+if [[ "$RELAUNCH" == "yes" ]]; then
+  echo "Relaunching the transfer client..."
+  open -a "$CLIENT_APP" 2>/dev/null && echo "  relaunched" || echo "  WARN: relaunch failed"
+fi

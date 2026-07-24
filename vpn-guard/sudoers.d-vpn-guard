@@ -1,0 +1,18 @@
+# Install at: /etc/sudoers.d/vpn-guard
+# Permissions: 0440, owned by root:wheel
+# Validate before installing with: visudo -cf this-file
+#
+# Allows the LaunchAgent (running as the user) to manage the PF kill-switch
+# without a password prompt. The anchor is nested under com.apple/ so the main
+# ruleset's "com.apple/*" wildcard actually evaluates it.
+# Replace USERNAME below with the macOS short username.
+
+USERNAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple/vpn-guard -f /usr/local/etc/vpn-guard/unsafe.pf.conf
+USERNAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple/vpn-guard -F all
+USERNAME ALL=(root) NOPASSWD: /sbin/pfctl -s info
+USERNAME ALL=(root) NOPASSWD: /sbin/pfctl -E
+# SSID read-back: modern macOS hides the SSID from unprivileged processes
+# (Location Services gating; networksetup reports "not associated" while
+# connected). wdutil still reveals it to root. Optional: without it the guard
+# falls back to SSID-free hotspot signals (randomized gateway MAC, subnet).
+USERNAME ALL=(root) NOPASSWD: /usr/bin/wdutil info

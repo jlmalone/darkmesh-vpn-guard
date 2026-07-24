@@ -1,0 +1,95 @@
+#!/bin/bash
+# Run a headless transfer session bound only to the live ExpressVPN address.
+#
+# The wrapper exits when the VPN tunnel changes. A launch supervisor with
+# KeepAlive then restarts it, at which point the new tunnel address is resolved.
+
+set -uo pipefail
+
+EXPRESSVPN_CTL="${EXPRESSVPN_CTL:-/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl}"
+NETSTAT_BIN="${NETSTAT_BIN:-/usr/sbin/netstat}"
+IFCONFIG_BIN="${IFCONFIG_BIN:-/sbin/ifconfig}"
+NICE_BIN="${NICE_BIN:-/usr/bin/nice}"
+TRANSFER_DAEMON_BIN="${TRANSFER_DAEMON_BIN:-}"
+TRANSFER_CONFIG_DIR="${TRANSFER_CONFIG_DIR:-$HOME/Library/Application Support/darkmesh-transfer}"
+TRANSFER_DOWNLOAD_DIR="${TRANSFER_DOWNLOAD_DIR:-$HOME/Downloads}"
+TRANSFER_LOG_FILE="${TRANSFER_LOG_FILE:-$TRANSFER_CONFIG_DIR/transfer.log}"
+TRANSFER_RPC_PORT="${TRANSFER_RPC_PORT:-9091}"
+TRANSFER_PEER_PORT="${TRANSFER_PEER_PORT:-56378}"
+TRANSFER_POLL_SECONDS="${TRANSFER_POLL_SECONDS:-5}"
+
+vpn_state() {
+  "$EXPRESSVPN_CTL" get connectionstate 2>/dev/null | head -n 1
+}
+
+vpn_iface() {
+  "$NETSTAT_BIN" -rn -f inet 2>/dev/null |
+    awk '$1 == "0/1" && $NF ~ /^utun[0-9]+$/ { print $NF; exit }'
+}
+
+iface_ip() {
+  "$IFCONFIG_BIN" "$1" 2>/dev/null | awk '/inet / { print $2; exit }'
+}
+
+stop_child() {
+  [[ -n "${child_pid:-}" ]] || return 0
+  kill -TERM "$child_pid" 2>/dev/null || true
+  wait "$child_pid" 2>/dev/null || true
+}
+
+trap stop_child EXIT INT TERM
+
+[[ -x "$EXPRESSVPN_CTL" ]] || {
+  echo "darkmesh-transfer-daemon: ExpressVPN control tool unavailable" >&2
+  exit 69
+}
+[[ -n "$TRANSFER_DAEMON_BIN" && -x "$TRANSFER_DAEMON_BIN" ]] || {
+  echo "darkmesh-transfer-daemon: configured daemon unavailable" >&2
+  exit 69
+}
+
+state="$(vpn_state)"
+iface="$(vpn_iface)"
+addr=""
+[[ -n "$iface" ]] && addr="$(iface_ip "$iface")"
+if [[ "$state" != "Connected" || -z "$iface" || -z "$addr" ]]; then
+  echo "darkmesh-transfer-daemon: VPN tunnel unavailable; transfer daemon remains stopped" >&2
+  exit 75
+fi
+
+mkdir -p "$TRANSFER_CONFIG_DIR"
+
+"$NICE_BIN" -n 19 "$TRANSFER_DAEMON_BIN" \
+  --foreground \
+  --config-dir "$TRANSFER_CONFIG_DIR" \
+  --log-level=info \
+  --logfile "$TRANSFER_LOG_FILE" \
+  --port "$TRANSFER_RPC_PORT" \
+  --no-auth \
+  --allowed "127.0.0.1,::1" \
+  --rpc-bind-address 127.0.0.1 \
+  --download-dir "$TRANSFER_DOWNLOAD_DIR" \
+  --no-dht \
+  --no-lpd \
+  --no-portmap \
+  --bind-address-ipv4 "$addr" \
+  --bind-address-ipv6 ::1 \
+  --peerport "$TRANSFER_PEER_PORT" \
+  --no-global-seedratio &
+child_pid=$!
+
+while kill -0 "$child_pid" 2>/dev/null; do
+  sleep "$TRANSFER_POLL_SECONDS"
+  next_state="$(vpn_state)"
+  next_iface="$(vpn_iface)"
+  next_addr=""
+  [[ -n "$next_iface" ]] && next_addr="$(iface_ip "$next_iface")"
+  if [[ "$next_state" != "Connected" || "$next_iface" != "$iface" || "$next_addr" != "$addr" ]]; then
+    echo "darkmesh-transfer-daemon: VPN tunnel changed; restarting fail-closed" >&2
+    stop_child
+    child_pid=""
+    exit 75
+  fi
+done
+
+wait "$child_pid"

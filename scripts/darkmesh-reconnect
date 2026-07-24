@@ -1,0 +1,602 @@
+#!/bin/bash
+# darkmesh-reconnect — keep ExpressVPN up when we WANT it up, WITHOUT ever
+# fighting connectivity. Captive-safe, with wedge recovery and transfer-client
+# rebind. See docs/availability-recovery-plan.md (Phases 1/2/4/5).
+#
+# Governing invariant (§1): internet connectivity is paramount. Captive and
+# offline networks stand down; filtered networks get bounded VPN attempts and
+# otherwise fall back to an ordinary, restored network path.
+#
+# Behavior:
+#   - desired=on & Connected: idle; if the tunnel IP changed, rebind the
+#     transfer client to the live tunnel (transfer-vpn-doctor) then let vpn-guard
+#     resume it.
+#   - desired=on & down & open internet: reconnect with exponential backoff;
+#     after WEDGE_FAILS failed attempts, restart a hung ExpressVPN app; give up
+#     and alert after GIVEUP_WINDOW.
+#   - desired=on & down & filtered internet: make bounded VPN attempts.
+#   - desired=on & down & captive/offline: restore plain networking and stand
+#     down so portal sign-in and ordinary internet remain available.
+#   - desired=off (darkmesh-panic): stand down.
+#   - healthcheck auto-disconnected recently: stand down (don't fight safety).
+# Recovery state is written to a sidecar that darkmesh-healthcheck merges into
+# /tmp/darkmesh-status.json (single status writer).
+#
+# Desired state: ~/.config/darkmesh/vpn-desired ("on" | "off"). Default "on".
+set -uo pipefail
+
+# --once: notify the sole long-running owner that network state changed. The
+# owner coalesces event bursts and preserves absolute reconnect deadlines.
+ONESHOT=no
+[ "${1:-}" = "--once" ] && ONESHOT=yes
+NETWORK_WAKE=0
+NETWORK_SIGNAL_AT=0
+SLEEP_KIND=idle
+
+on_network_change() {
+  NETWORK_WAKE=1
+  NETWORK_SIGNAL_AT="$(date +%s)"
+}
+trap on_network_change USR1
+
+CTL="${CTL:-/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl}"
+STATUS_FILE="${DARKMESH_STATUS_FILE:-/tmp/darkmesh-status.json}"
+SIDECAR="${DARKMESH_RECONNECT_SIDECAR:-/tmp/darkmesh-reconnect.json}"
+DESIRED_FILE="${DARKMESH_VPN_DESIRED:-$HOME/.config/darkmesh/vpn-desired}"
+RECONNECT_REQUEST="${DARKMESH_RECONNECT_REQUEST:-$HOME/.config/darkmesh/reconnect-request.json}"
+RECOVERY_STATE="${DARKMESH_RECONNECT_STATE:-$HOME/.config/darkmesh/reconnect-state}"
+PID_FILE="${DARKMESH_RECONNECT_PID_FILE:-$HOME/.config/darkmesh/reconnect.pid}"
+LOG_DIR="$HOME/Library/Logs/darkmesh"; LOG="$LOG_DIR/reconnect.log"
+ACTION_LOG="$LOG_DIR/actions.log"
+DOCTOR="${DARKMESH_DOCTOR:-$(command -v transfer-vpn-doctor 2>/dev/null || echo "$HOME/.local/bin/transfer-vpn-doctor")}"
+PLAIN_RESTORE="${DARKMESH_PLAIN_RESTORE:-$(command -v darkmesh-restore-plain-network 2>/dev/null || echo "$HOME/.local/bin/darkmesh-restore-plain-network")}"
+
+INTERVAL_OK="${INTERVAL_OK:-30}"            # poll cadence when healthy / idle
+INTERVAL_RECOVER="${INTERVAL_RECOVER:-10}"  # poll cadence while recovering
+MAX_BACKOFF="${MAX_BACKOFF:-300}"           # cap reconnect backoff
+SAFETY_WINDOW="${SAFETY_WINDOW:-180}"       # respect a healthcheck auto-disconnect this long
+WEDGE_FAILS="${WEDGE_FAILS:-3}"             # failed connects before declaring the app wedged
+MAX_APP_RESTARTS="${MAX_APP_RESTARTS:-3}"   # app restarts allowed per RESTART_WINDOW
+RESTART_WINDOW="${RESTART_WINDOW:-3600}"
+GIVEUP_WINDOW="${GIVEUP_WINDOW:-1800}"      # alert + slow down after this long failing
+GIVEUP_COOLDOWN="${GIVEUP_COOLDOWN:-1200}"  # then one bounded half-open window
+HALF_OPEN_WINDOW="${HALF_OPEN_WINDOW:-120}"
+CAPTIVE_PROBE="${DARKMESH_CAPTIVE_PROBE:-http://captive.apple.com/hotspot-detect.html}"
+CONNECTIVITY_PROBE="${DARKMESH_CONNECTIVITY_PROBE:-https://www.gstatic.com/generate_204}"
+PROBE_NAME="${DARKMESH_PROBE_NAME:-example.com}"
+CLEAR_TICKS_REQUIRED="${DARKMESH_CLEAR_TICKS_REQUIRED:-3}"
+NETWORK_DEBOUNCE="${DARKMESH_NETWORK_DEBOUNCE:-5}"
+NETWORK_SETTLE_MAX="${DARKMESH_NETWORK_SETTLE_MAX:-15}"
+RESTRICTED_FIRST_DELAY="${DARKMESH_RESTRICTED_FIRST_DELAY:-15}"
+RESTRICTED_ATTEMPT_WINDOW="${DARKMESH_RESTRICTED_ATTEMPT_WINDOW:-600}"
+RESTRICTED_MAX_ATTEMPTS="${DARKMESH_RESTRICTED_MAX_ATTEMPTS:-2}"
+RESTRICTED_COOLDOWN="${DARKMESH_RESTRICTED_COOLDOWN:-900}"
+RESTRICTED_MIN_SPACING="${DARKMESH_RESTRICTED_MIN_SPACING:-60}"
+CONNECT_OBSERVE="${DARKMESH_CONNECT_OBSERVE:-60}"
+APP_QUIT_WAIT="${DARKMESH_APP_QUIT_WAIT:-2}"
+APP_START_WAIT="${DARKMESH_APP_START_WAIT:-8}"
+MAX_TICKS="${DARKMESH_MAX_TICKS:-0}"         # deterministic tests; 0 = unlimited
+
+mkdir -p "$LOG_DIR" "$(dirname "$DESIRED_FILE")"
+[ -f "$DESIRED_FILE" ] || printf 'on\n' > "$DESIRED_FILE"
+log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOG" >&2; }
+action_log() { printf '%s fault=vpn verb=%s result=%s\n' "$(date -u +%FT%TZ)" "$1" "$2" >> "$ACTION_LOG"; }
+notify() { osascript -e "display notification \"$1\" with title \"darkmesh\"" >/dev/null 2>&1 || true; }
+
+vpn_state()   { "$CTL" --timeout 4 get connectionstate 2>/dev/null | head -1; }
+desired()     { tr -d '[:space:]' < "$DESIRED_FILE" 2>/dev/null; }
+# Classify plain connectivity without treating blocked global probes as proof of
+# a captive portal. Output: open, captive, restricted, or offline.
+classify_plain_network() {
+  local iface gateway dir headers body apple_code google_code curl_rc=0
+  iface="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
+  gateway="$(route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}')"
+  [[ -n "$iface" && -n "$gateway" ]] || { printf 'offline'; return 0; }
+
+  dir="$(mktemp -d -t darkmesh-plain)" || { printf 'restricted'; return 0; }
+  headers="$dir/headers"; body="$dir/body"
+  apple_code="$(curl -sS --max-time 5 --max-redirs 0 -D "$headers" -o "$body" \
+    -w '%{http_code}' "$CAPTIVE_PROBE" 2>/dev/null)" || curl_rc=$?
+  google_code="$(curl -sS --max-time 5 --max-redirs 0 -o /dev/null \
+    -w '%{http_code}' "$CONNECTIVITY_PROBE" 2>/dev/null)" || true
+
+  if [[ "$curl_rc" -eq 0 ]]; then
+    if [[ "$apple_code" == 3* || "$apple_code" == 511 ]]; then
+      rm -rf "$dir"; printf 'captive'; return 0
+    fi
+    if [[ "$apple_code" == 200 ]] && ! grep -qi 'Success' "$body" 2>/dev/null \
+        && grep -qiE '<form|log[ -]?in|sign[ -]?in|captive|hotspot|wi-?fi' "$body" 2>/dev/null; then
+      rm -rf "$dir"; printf 'captive'; return 0
+    fi
+  fi
+  if [[ "$apple_code" == 200 ]] && grep -qi 'Success' "$body" 2>/dev/null \
+      && [[ "$google_code" == 204 ]]; then
+    rm -rf "$dir"; printf 'open'; return 0
+  fi
+  rm -rf "$dir"
+  printf 'restricted'
+}
+
+network_fingerprint() {
+  local iface gateway address server
+  iface="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
+  gateway="$(route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}')"
+  # A route can disappear briefly while Wi-Fi or the VPN is settling. Do not
+  # turn that transient "no physical network" sample into a new fingerprint:
+  # doing so resets the bounded recovery budget during the same incident.
+  [[ -n "$iface" && -n "$gateway" ]] || return 0
+  address="$(ipconfig getifaddr "$iface" 2>/dev/null || true)"
+  server="$(ipconfig getpacket "$iface" 2>/dev/null | awk '/server_identifier/{gsub(/[{}]/, ""); print $NF; exit}')"
+  printf '%s|%s|%s|%s' "$iface" "$gateway" "$address" "$server"
+}
+
+restore_plain_network() {
+  if [[ -x "$PLAIN_RESTORE" ]]; then
+    "$PLAIN_RESTORE" --quiet >>"$LOG" 2>&1 || log "plain-network restore returned non-zero"
+  else
+    log "plain-network restore helper missing: $PLAIN_RESTORE"
+  fi
+}
+
+# IP of the default-route utun (the ExpressVPN tunnel), or empty.
+tunnel_ip() {
+  local iface
+  iface="$(netstat -rn -f inet 2>/dev/null | awk '$1 == "0/1" && $NF ~ /^utun[0-9]+$/ { print $NF; exit }')"
+  [ -n "$iface" ] || return 0
+  ifconfig "$iface" 2>/dev/null | awk '/inet /{print $2; exit}'
+}
+
+# ExpressVPN tunnel interface name (default-route utun), or empty.
+tunnel_iface() {
+  netstat -rn -f inet 2>/dev/null | awk '$1 == "0/1" && $NF ~ /^utun[0-9]+$/ { print $NF; exit }'
+}
+
+# --- transfer-client WebUI (localhost) self-heal ----------------------------
+# The transfer client (current builds) binds its listen sockets from the
+# Session\Interface preference, which is set ONLY by the WebUI's
+# current_network_interface key — NOT the legacy ini Connection\* keys the doctor
+# used to write. So we re-pin the RUNNING session through the API: correct key,
+# applied LIVE, no restart, no clobber race. (Transfer nodes run WebUI
+# LocalHostAuth=off, so localhost needs no login; we attempt a keychain login if a
+# node requires auth.)
+# Real transfer-client specifics (app / process / .ini section / API base) load
+# from untracked local config; this public repo ships only neutral fallbacks.
+CLIENT_CONF_FILE="${DARKMESH_CLIENT_CONF:-$HOME/.config/darkmesh/transfer-client.conf}"
+[ -r "$CLIENT_CONF_FILE" ] && . "$CLIENT_CONF_FILE"
+CLIENT_APP="${CLIENT_APP:-TransferClient}"
+CLIENT_CONF="${CLIENT_CONF:-$HOME/.config/$CLIENT_APP/$CLIENT_APP.ini}"
+TAPI="/api/v2/${CLIENT_API_BASE:-transfers}"   # the transfer-list API base
+# Read the Web UI port from the client config so the watchdog always targets the
+# live port and can never silently drift onto another local service's port again.
+client_web_port() { grep -E '^WebUI\\Port=' "$CLIENT_CONF" 2>/dev/null | head -1 | cut -d= -f2 | tr -d '[:space:]'; }
+WEB_PORT="$(client_web_port)"; WEB_PORT="${WEB_PORT:-8080}"
+WEB_HOST="${CLIENT_WEB_HOST:-http://127.0.0.1:$WEB_PORT}"
+# Manual-override intent for the transfer client: "active" (default) or "paused".
+# The server_monitor Pause/Resume buttons and darkmesh-transfer write this; the
+# resume-when-green path below honors it so a manual pause is never overridden.
+TRANSFER_DESIRED_FILE="${DARKMESH_TRANSFER_DESIRED:-$HOME/.config/darkmesh/transfer-desired}"
+[ -f "$TRANSFER_DESIRED_FILE" ] || printf 'active\n' > "$TRANSFER_DESIRED_FILE" 2>/dev/null
+WEB_USER="${CLIENT_WEB_USER:-admin}"
+WEB_KEYCHAIN="${KEYCHAIN_SERVICE:-vpn-guard-client}"
+WEB_COOKIE="$(mktemp -t darkmesh-client 2>/dev/null || echo "/tmp/darkmesh-client.$$")"
+
+client_api() {  # METHOD PATH [curl args...]
+  local m="$1" p="$2"; shift 2
+  curl -fsS --max-time 5 -X "$m" -b "$WEB_COOKIE" -c "$WEB_COOKIE" -H "Referer: $WEB_HOST" "$WEB_HOST$p" "$@" 2>/dev/null
+}
+client_login() {
+  local pw; pw="$(security find-generic-password -s "$WEB_KEYCHAIN" -w 2>/dev/null)" || return 1
+  curl -fsS --max-time 5 -c "$WEB_COOKIE" -H "Referer: $WEB_HOST" \
+    --data-urlencode "username=$WEB_USER" --data-urlencode "password=$pw" \
+    "$WEB_HOST/api/v2/auth/login" >/dev/null 2>&1
+}
+client_reachable() { client_api GET /api/v2/app/version >/dev/null 2>&1 || { client_login && client_api GET /api/v2/app/version >/dev/null 2>&1; }; }
+client_bound_addr() { client_api GET /api/v2/app/preferences | python3 -c "import json,sys;print(json.load(sys.stdin).get('current_interface_address',''))" 2>/dev/null; }
+client_repin() {  # <iface> <addr>
+  client_api POST /api/v2/app/setPreferences --data-urlencode "json={\"current_network_interface\":\"$1\",\"current_interface_address\":\"$2\"}" >/dev/null 2>&1
+}
+# Count transfers the engine treats as paused/stopped (4.x "paused*", 5.x "stopped*").
+client_paused_count() {
+  client_api GET "$TAPI/info" 2>/dev/null | python3 -c "import json,sys
+data=json.load(sys.stdin)
+print(sum(1 for t in data if any(k in t.get('state','').lower() for k in ('paused','stopped'))))" 2>/dev/null
+}
+# Resume every transfer, live, no restart (5.x /start, 4.x /resume alias).
+client_resume_all() {
+  client_api POST "$TAPI/start" --data 'hashes=all' >/dev/null 2>&1 \
+    || client_api POST "$TAPI/resume" --data 'hashes=all' >/dev/null 2>&1
+}
+
+# Re-pin the transfer client's listen binding to the live tunnel via the Web UI
+# (live, no restart). No-op when already correct; falls back to the doctor only
+# when the Web UI is unreachable. <iface> <addr>
+repin_only() {
+  local tif="$1" ip="$2" cur
+  if client_reachable; then
+    cur="$(client_bound_addr)"
+    [ "$cur" = "$ip" ] && return 0
+    if client_repin "$tif" "$ip"; then
+      log "  re-pinned transfer client to ${tif:-?}/$ip via Web UI (was ${cur:-unset})"
+    else
+      log "  Web UI re-pin failed, falling back to transfer-vpn-doctor"; rebind_client
+    fi
+  else
+    rebind_client   # client/Web UI not up; doctor check (no-op if current)
+  fi
+}
+# Resume-when-green: tunnel is up and we are bound to it, so un-pause whatever a
+# VPN-down or tunnel flap left paused. Respects a manual pause: if the operator set
+# transfer-desired=paused (e.g. via the server_monitor Pause button) we stand down.
+# Idempotent: a no-op when nothing is paused. <reason>
+resume_when_green() {
+  local n want
+  want="active"; [ -f "$TRANSFER_DESIRED_FILE" ] && want="$(tr -d '[:space:]' < "$TRANSFER_DESIRED_FILE" 2>/dev/null)"; want="${want:-active}"
+  if [ "$want" != "active" ]; then
+    log "  transfer desired=$want (manual override): not auto-resuming"; return 0
+  fi
+  client_reachable || return 0
+  n="$(client_paused_count)"; [ -n "$n" ] || return 0
+  [ "$n" -gt 0 ] || return 0
+  if client_resume_all; then log "  resumed $n paused transfer(s) [$1]"; fi
+}
+
+recently_auto_disconnected() {
+  local at epoch now
+  at="$(grep -oE '"auto_disconnect_at"[[:space:]]*:[[:space:]]*"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z"' "$STATUS_FILE" 2>/dev/null | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z')"
+  [ -n "$at" ] || return 1
+  epoch="$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%SZ" "$at" +%s 2>/dev/null)" || return 1
+  now="$(date +%s)"
+  [ $(( now - epoch )) -lt "$SAFETY_WINDOW" ]
+}
+
+# Re-point the transfer client at the live tunnel ONLY when its binding is stale.
+rebind_client() {
+  local d="$DOCTOR" rc
+  [ -x "$d" ] || d="$(command -v transfer-vpn-doctor 2>/dev/null || true)"
+  [ -n "$d" ] && [ -x "$d" ] || { log "  rebind: transfer-vpn-doctor not found — skipping"; return 0; }
+  "$d" --check >/dev/null 2>&1; rc=$?
+  if [ "$rc" -eq 3 ]; then
+    log "  transfer-client binding stale — rebinding (--fix --quit --relaunch)"
+    "$d" --fix --quit --relaunch >>"$LOG" 2>&1 || log "  rebind returned non-zero"
+  fi
+}
+
+# Restart a wedged ExpressVPN app. Tailscale is status-only here; it is never a
+# prerequisite for VPN recovery. Restarts remain capped per window.
+app_restarts=0; restart_window_start=0
+try_restart_app() {
+  local now; now="$(date +%s)"
+  if [ $(( now - restart_window_start )) -ge "$RESTART_WINDOW" ]; then restart_window_start="$now"; app_restarts=0; fi
+  if [ "$app_restarts" -ge "$MAX_APP_RESTARTS" ]; then
+    log "  app-restart cap reached ($MAX_APP_RESTARTS/${RESTART_WINDOW}s) — not restarting"; return 1
+  fi
+  log "  ExpressVPN appears wedged — restarting the app"
+  osascript -e 'quit app "ExpressVPN"' >/dev/null 2>&1 || true
+  pkill -f 'MacOS/ExpressVPN --clear-cache' 2>/dev/null || true
+  deadline_wait "$APP_QUIT_WAIT" observe
+  open -a ExpressVPN >/dev/null 2>&1 || true
+  deadline_wait "$APP_START_WAIT" observe
+  "$CTL" background enable >/dev/null 2>&1 || true
+  app_restarts=$(( app_restarts + 1 ))
+  return 0
+}
+
+# The long-running reconnect loop is the sole executor of app restarts. Other
+# components request one through an atomic file; they never launch a second
+# reconnect process. Invalid or desired-off requests are consumed and refused.
+consume_reconnect_request() {
+  [ -s "$RECONNECT_REQUEST" ] || return 0
+  local processing="${RECONNECT_REQUEST}.processing.$$" request_action want result=refused now
+  mv -f "$RECONNECT_REQUEST" "$processing" 2>/dev/null || return 0
+  request_action="$(grep -oE '"action"[[:space:]]*:[[:space:]]*"[A-Za-z0-9._-]+"' "$processing" \
+    | head -1 | sed -E 's/.*"([A-Za-z0-9._-]+)"$/\1/')"
+  want="$(desired)"; want="${want:-on}"
+  now="$(date +%s)"
+  local network_class
+  network_class="$(classify_plain_network)"
+  if [ "$request_action" = "restart-wedged" ] && [ "$want" = "on" ] \
+      && (( next_attempt_at <= now )) \
+      && { [ "$network_class" = open ] || [ "$network_class" = restricted ]; }; then
+    result=failed
+    try_restart_app && result=issued
+  fi
+  action_log "${request_action:-invalid}" "$result"
+  rm -f "$processing"
+}
+
+# Persistent reconnect breaker state. This is owned only by the long-running
+# reconnect loop; --once never reads or writes it.
+consecutive_fails=0
+failing_since=0
+last_tunnel_ip=""
+gave_up=false
+gave_up_at=0
+captive_ticks=0
+clear_ticks=0
+plain_class=unknown
+last_network_key=""
+network_started_at=0
+restricted_window_started=0
+restricted_attempts=0
+next_attempt_at=0
+last_restore_marker=""
+
+state_value() { sed -n "s/^$1=//p" "$RECOVERY_STATE" 2>/dev/null | head -1; }
+load_recovery_state() {
+  [ -f "$RECOVERY_STATE" ] || return 0
+  local v
+  v="$(state_value consecutive_fails)"; [[ "$v" =~ ^[0-9]+$ ]] && consecutive_fails="$v"
+  v="$(state_value failing_since)"; [[ "$v" =~ ^[0-9]+$ ]] && failing_since="$v"
+  v="$(state_value app_restarts)"; [[ "$v" =~ ^[0-9]+$ ]] && app_restarts="$v"
+  v="$(state_value restart_window_start)"; [[ "$v" =~ ^[0-9]+$ ]] && restart_window_start="$v"
+  v="$(state_value gave_up)"; [[ "$v" == true || "$v" == false ]] && gave_up="$v"
+  v="$(state_value gave_up_at)"; [[ "$v" =~ ^[0-9]+$ ]] && gave_up_at="$v"
+  v="$(state_value network_started_at)"; [[ "$v" =~ ^[0-9]+$ ]] && network_started_at="$v"
+  v="$(state_value restricted_window_started)"; [[ "$v" =~ ^[0-9]+$ ]] && restricted_window_started="$v"
+  v="$(state_value restricted_attempts)"; [[ "$v" =~ ^[0-9]+$ ]] && restricted_attempts="$v"
+  v="$(state_value next_attempt_at)"; [[ "$v" =~ ^[0-9]+$ ]] && next_attempt_at="$v"
+  last_network_key="$(state_value last_network_key)"
+  last_restore_marker="$(state_value last_restore_marker)"
+}
+persist_recovery_state() {
+  local tmp="${RECOVERY_STATE}.tmp.$$"
+  {
+    printf 'consecutive_fails=%s\n' "$consecutive_fails"
+    printf 'failing_since=%s\n' "$failing_since"
+    printf 'app_restarts=%s\n' "$app_restarts"
+    printf 'restart_window_start=%s\n' "$restart_window_start"
+    printf 'gave_up=%s\n' "$gave_up"
+    printf 'gave_up_at=%s\n' "$gave_up_at"
+    printf 'last_network_key=%s\n' "$last_network_key"
+    printf 'network_started_at=%s\n' "$network_started_at"
+    printf 'restricted_window_started=%s\n' "$restricted_window_started"
+    printf 'restricted_attempts=%s\n' "$restricted_attempts"
+    printf 'next_attempt_at=%s\n' "$next_attempt_at"
+    printf 'last_restore_marker=%s\n' "$last_restore_marker"
+  } > "$tmp" && chmod 0600 "$tmp" && mv -f "$tmp" "$RECOVERY_STATE"
+}
+load_recovery_state
+
+write_sidecar() {  # <phase> <vpn_state>
+  local tmp="${SIDECAR}.tmp.$$"
+  {
+    printf '{\n'
+    printf '  "schema": 1,\n'
+    printf '  "component": "darkmesh-reconnect",\n'
+    printf '  "updated_at": "%s",\n' "$(date -u +%FT%TZ)"
+    printf '  "desired": "%s",\n' "$(desired)"
+    printf '  "vpn_state": "%s",\n' "$2"
+    printf '  "phase": "%s",\n' "$1"
+    printf '  "plain_class": "%s",\n' "$plain_class"
+    printf '  "consecutive_fails": %s,\n' "$consecutive_fails"
+    printf '  "app_restarts": %s,\n' "$app_restarts"
+    printf '  "gave_up": %s,\n' "$gave_up"
+    printf '  "next_attempt_at": %s,\n' "$next_attempt_at"
+    printf '  "restricted_attempts": %s,\n' "$restricted_attempts"
+    printf '  "tunnel_ip": "%s"\n' "$last_tunnel_ip"
+    printf '}\n'
+  } > "$tmp" 2>/dev/null && mv -f "$tmp" "$SIDECAR" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  persist_recovery_state
+}
+
+# --- one-shot compatibility trigger: signal the sole long-running owner -------
+if [ "$ONESHOT" = "yes" ]; then
+  pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    kill -USR1 "$pid" 2>/dev/null || true
+  fi
+  exit 0
+fi
+
+printf '%s\n' "$$" > "$PID_FILE"
+cleanup() {
+  rm -f "$WEB_COOKIE" 2>/dev/null
+  [[ "$(cat "$PID_FILE" 2>/dev/null || true)" == "$$" ]] && rm -f "$PID_FILE" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 0' INT TERM
+
+log "reconnect watchdog start (interval ok=${INTERVAL_OK}s recover=${INTERVAL_RECOVER}s, desired-file=$DESIRED_FILE)"
+backoff="$INTERVAL_RECOVER"
+loop_ticks=0
+
+deadline_wait() { # <seconds> <idle|backoff|observe>
+  local seconds="$1" kind="$2" deadline now
+  deadline=$(( $(date +%s) + seconds ))
+  SLEEP_KIND="$kind"
+  while true; do
+    now="$(date +%s)"; (( now >= deadline )) && break
+    sleep 1 2>/dev/null || true
+    if [[ "$kind" == idle && "$NETWORK_WAKE" == 1 ]]; then break; fi
+  done
+  SLEEP_KIND=idle
+}
+
+VPN_RESULT=Disconnected
+wait_for_vpn_result() { # <seconds>; sets VPN_RESULT
+  local seconds="$1" started deadline now observed
+  started="$(date +%s)"; deadline=$((started + seconds))
+  observed="$(vpn_state)"; observed="${observed:-Disconnected}"
+  while [[ "$observed" != Connected ]]; do
+    now="$(date +%s)"
+    (( now >= deadline )) && break
+    if [[ "$observed" == Disconnected ]] && (( now - started >= 5 )); then break; fi
+    sleep 1 2>/dev/null || true
+    observed="$(vpn_state)"; observed="${observed:-Disconnected}"
+  done
+  VPN_RESULT="$observed"
+}
+
+debounce_network_change() {
+  local started now quiet_for elapsed
+  started="$(date +%s)"
+  [[ "$NETWORK_SIGNAL_AT" -gt 0 ]] || NETWORK_SIGNAL_AT="$started"
+  while true; do
+    now="$(date +%s)"; quiet_for=$(( now - NETWORK_SIGNAL_AT )); elapsed=$(( now - started ))
+    (( quiet_for >= NETWORK_DEBOUNCE || elapsed >= NETWORK_SETTLE_MAX )) && break
+    sleep 1 2>/dev/null || true
+  done
+  NETWORK_WAKE=0
+  log "network-change signals coalesced; reconciling once"
+}
+
+loop_sleep() { # <seconds> <idle|backoff>
+  loop_ticks=$((loop_ticks + 1))
+  if [ "$MAX_TICKS" -gt 0 ] && [ "$loop_ticks" -ge "$MAX_TICKS" ]; then return 1; fi
+  deadline_wait "$1" "${2:-idle}"
+  [[ "$NETWORK_WAKE" == 1 ]] && debounce_network_change
+  return 0
+}
+
+enter_plain_state() { # <phase> <vpn-state>
+  local phase="$1" state="$2" marker
+  marker="${last_network_key}:${phase}"
+  if [[ "$marker" != "$last_restore_marker" || "$state" =~ ^(Connected|Connecting|Reconnecting|Disconnecting)$ ]]; then
+    log "entering $phase: restoring ordinary network"
+    restore_plain_network
+    last_restore_marker="$marker"
+  fi
+}
+
+while true; do
+  s="$(vpn_state)"; d="$(desired)"; d="${d:-on}"
+  now="$(date +%s)"
+
+  key="$(network_fingerprint)"
+  if [[ -z "$last_network_key" ]]; then
+    last_network_key="$key"; network_started_at="$now"
+  elif [[ -n "$key" && "$key" != "$last_network_key" ]]; then
+    log "physical network changed; resetting per-network recovery budget"
+    last_network_key="$key"; network_started_at="$now"
+    restricted_window_started=0; restricted_attempts=0; next_attempt_at=0
+    consecutive_fails=0; failing_since=0; captive_ticks=0; clear_ticks=0
+    backoff="$INTERVAL_RECOVER"; last_restore_marker=""
+    enter_plain_state settling "$s"
+    s="$(vpn_state)"; s="${s:-Disconnected}"
+  fi
+
+  consume_reconnect_request
+
+  # --- desired=off: stand down (e.g. after darkmesh-panic) ---
+  if [ "$d" != "on" ]; then
+    consecutive_fails=0; failing_since=0; gave_up=false; gave_up_at=0; captive_ticks=0; clear_ticks=0; backoff="$INTERVAL_RECOVER"
+    next_attempt_at=0; plain_class=unknown
+    enter_plain_state desired-off "$s"
+    write_sidecar "desired-off" "$s"; loop_sleep "$INTERVAL_OK" idle || break; continue
+  fi
+
+  # --- healthy: keep the binding live; resume on a green (re)appearance ---
+  if [ "$s" = "Connected" ]; then
+    tif="$(tunnel_iface)"; ip=""
+    [ -n "$tif" ] && ip="$(ifconfig "$tif" 2>/dev/null | awk '/inet /{print $2; exit}')"
+    if [ -n "$ip" ]; then
+      repin_only "$tif" "$ip"
+      if [ "$ip" != "$last_tunnel_ip" ]; then
+        log "tunnel up/changed (${last_tunnel_ip:-none} -> $ip on $tif)"; last_tunnel_ip="$ip"
+        resume_when_green "tunnel-change"
+      fi
+    fi
+    consecutive_fails=0; failing_since=0; gave_up=false; gave_up_at=0; captive_ticks=0; clear_ticks=0; backoff="$INTERVAL_RECOVER"
+    next_attempt_at=0; restricted_attempts=0; last_restore_marker=""; plain_class=vpn
+    write_sidecar "connected" "$s"; loop_sleep "$INTERVAL_OK" idle || break; continue
+  fi
+
+  # --- not connected: reasons to STAND DOWN (never fight) ---
+  if recently_auto_disconnected; then
+    clear_ticks=0
+    log "healthcheck auto-disconnected recently — standing down (safety)"
+    plain_class=restricted
+    enter_plain_state safety-standdown "$s"
+    write_sidecar "safety-standdown" "$s"; loop_sleep "$INTERVAL_RECOVER" backoff || break; continue
+  fi
+  plain_class="$(classify_plain_network)"
+  case "$plain_class" in
+    offline)
+      clear_ticks=0; consecutive_fails=0; failing_since=0
+      enter_plain_state offline "$s"
+      write_sidecar "offline" "$s"; loop_sleep "$INTERVAL_RECOVER" idle || break; continue
+      ;;
+    captive)
+      captive_ticks=$((captive_ticks + 1)); clear_ticks=0; consecutive_fails=0; failing_since=0
+      enter_plain_state captive-standdown "$s"
+      write_sidecar "captive-standdown" "$s"; loop_sleep "$INTERVAL_RECOVER" idle || break; continue
+      ;;
+    open)
+      captive_ticks=0; clear_ticks=$((clear_ticks + 1))
+      if [ "$clear_ticks" -lt "$CLEAR_TICKS_REQUIRED" ]; then
+        log "open-internet probe passed ($clear_ticks/$CLEAR_TICKS_REQUIRED): waiting for stable clear"
+        write_sidecar "captive-clear-wait" "$s"; loop_sleep "$INTERVAL_RECOVER" idle || break; continue
+      fi
+      ;;
+    restricted)
+      captive_ticks=0; clear_ticks=0
+      if (( now - network_started_at < RESTRICTED_FIRST_DELAY )); then
+        enter_plain_state restricted-plain "$s"
+        write_sidecar "restricted-wait" "$s"; loop_sleep "$INTERVAL_RECOVER" idle || break; continue
+      fi
+      if (( restricted_window_started == 0 || now - restricted_window_started >= RESTRICTED_ATTEMPT_WINDOW )); then
+        restricted_window_started="$now"; restricted_attempts=0
+      fi
+      if (( restricted_attempts >= RESTRICTED_MAX_ATTEMPTS )); then
+        (( next_attempt_at < now + RESTRICTED_COOLDOWN )) && next_attempt_at=$((now + RESTRICTED_COOLDOWN))
+        enter_plain_state plain-cooldown "$s"
+        write_sidecar "plain-cooldown" "$s"; loop_sleep "$INTERVAL_OK" backoff || break; continue
+      fi
+      ;;
+  esac
+
+  now="$(date +%s)"
+  if (( next_attempt_at > now )); then
+    write_sidecar "retry-wait" "$s"
+    loop_sleep "$((next_attempt_at - now))" backoff || break
+    continue
+  fi
+
+  # --- open internet, desired=on, but not Connected → recover ---
+  [ "$failing_since" -eq 0 ] && failing_since="$now"
+  if [ "$gave_up" = true ]; then
+    if [ "$gave_up_at" -gt 0 ] && [ $(( now - gave_up_at )) -ge "$GIVEUP_COOLDOWN" ]; then
+      log "reconnect breaker half-open: one ${HALF_OPEN_WINDOW}s recovery window"
+      gave_up=false
+      failing_since=$(( now - GIVEUP_WINDOW + HALF_OPEN_WINDOW ))
+      consecutive_fails=0
+    else
+      enter_plain_state plain-cooldown "$s"
+      write_sidecar "gave-up" "$s"; loop_sleep "$INTERVAL_OK" backoff || break; continue
+    fi
+  fi
+  if [ $(( now - failing_since )) -ge "$GIVEUP_WINDOW" ]; then
+    if [ "$gave_up" != true ]; then
+      log "GIVE UP: ${GIVEUP_WINDOW}s of failed recovery — alerting, slowing down"
+      notify "VPN reconnect failing on $(scutil --get LocalHostName 2>/dev/null || hostname)"
+      gave_up=true
+      gave_up_at="$now"
+    fi
+    enter_plain_state plain-cooldown "$s"
+    write_sidecar "gave-up" "$s"; loop_sleep "$INTERVAL_OK" backoff || break; continue
+  fi
+
+  log "recovering: state=$s, attempt $(( consecutive_fails + 1 ))"
+  [[ "$plain_class" == restricted ]] && restricted_attempts=$((restricted_attempts + 1))
+  write_sidecar "connecting" "$s"
+  "$CTL" --timeout 30 connect >/dev/null 2>&1 || true
+  wait_for_vpn_result "$CONNECT_OBSERVE"
+  s2="$VPN_RESULT"
+  if [ "$s2" = "Connected" ]; then
+    log "  reconnected"
+    consecutive_fails=0; failing_since=0; backoff="$INTERVAL_RECOVER"; next_attempt_at=0
+    write_sidecar "reconnected" "$s2"; loop_sleep "$INTERVAL_RECOVER" idle || break; continue
+  fi
+
+  consecutive_fails=$(( consecutive_fails + 1 ))
+  if [ "$consecutive_fails" -ge "$WEDGE_FAILS" ]; then
+    try_restart_app && consecutive_fails=0
+  fi
+  wait_for="$backoff"
+  if [[ "$plain_class" == restricted && "$wait_for" -lt "$RESTRICTED_MIN_SPACING" ]]; then wait_for="$RESTRICTED_MIN_SPACING"; fi
+  next_attempt_at=$(( $(date +%s) + wait_for ))
+  backoff=$(( backoff * 2 )); [ "$backoff" -gt "$MAX_BACKOFF" ] && backoff="$MAX_BACKOFF"
+  log "  still $s2; next attempt not before ${next_attempt_at} (${wait_for}s)"
+  enter_plain_state plain-cooldown "$s2"
+  write_sidecar "retrying" "$s2"; loop_sleep "$wait_for" backoff || break
+done

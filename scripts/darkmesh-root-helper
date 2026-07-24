@@ -1,0 +1,172 @@
+#!/bin/bash
+# Fixed privileged recovery actions for darkmesh. Installed root-owned under
+# /Library/darkmesh/bin and invoked only through an exact-argument sudoers rule.
+set -euo pipefail
+
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+STATE_DIR=/Library/darkmesh/state
+CONFIG_DIR=/Library/darkmesh/config
+JOURNAL="$STATE_DIR/dns-override.state"
+CRD_TARGET_FILE="$CONFIG_DIR/crd-launchd-target"
+LOG=/var/log/darkmesh-root-helper.log
+
+[[ "$(id -u)" -eq 0 ]] || { echo "darkmesh-root-helper: must run as root" >&2; exit 3; }
+[[ $# -eq 1 ]] || { echo "darkmesh-root-helper: exactly one verb required" >&2; exit 2; }
+
+install -d -o root -g wheel -m 0755 "$STATE_DIR" "$CONFIG_DIR"
+
+log() {
+  printf '%s caller_uid=%s verb=%s %s\n' \
+    "$(date -u +%FT%TZ)" "${SUDO_UID:-0}" "$1" "${2:-}" >> "$LOG"
+}
+
+flush_dns() {
+  dscacheutil -flushcache 2>/dev/null || true
+  killall -HUP mDNSResponder 2>/dev/null || true
+}
+
+default_interface() {
+  route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}'
+}
+
+default_gateway() {
+  route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}'
+}
+
+service_for_interface() {
+  local wanted="$1"
+  networksetup -listnetworkserviceorder 2>/dev/null | awk -v wanted="$wanted" '
+    /^\([0-9]+\)/ {
+      service=$0
+      sub(/^\([0-9]+\)[[:space:]]*/, "", service)
+      sub(/^\*/, "", service)
+    }
+    index($0, "Device: " wanted ")") { print service; exit }
+  '
+}
+
+dhcp_dns_for_interface() {
+  local iface="$1"
+  ipconfig getpacket "$iface" 2>/dev/null | awk '
+    /domain_name_server/ {
+      line=$0
+      sub(/^[^{]*\{/, "", line)
+      sub(/\}.*/, "", line)
+      gsub(/,/, " ", line)
+      n=split(line, a, /[[:space:]]+/)
+      for (i=1; i<=n; i++) if (a[i] != "") { printf "%s%s", sep, a[i]; sep=" " }
+      print ""
+      exit
+    }
+  '
+}
+
+valid_dns_list() {
+  local list="$1" item count=0 oldifs="$IFS"
+  IFS=' '
+  for item in $list; do
+    [[ "$item" =~ ^[0-9A-Fa-f:.%]+$ ]] || { IFS="$oldifs"; return 1; }
+    count=$((count + 1))
+  done
+  IFS="$oldifs"
+  [[ $count -gt 0 ]]
+}
+
+journal_value() {
+  local key="$1"
+  sed -n "s/^${key}=//p" "$JOURNAL" 2>/dev/null | head -1
+}
+
+restore_dns() {
+  [[ -f "$JOURNAL" ]] || return 0
+  local service mode values
+  service="$(journal_value SERVICE)"
+  mode="$(journal_value MODE)"
+  values="$(journal_value VALUES)"
+  [[ -n "$service" ]] || { log dns-restore "invalid journal: service missing"; return 1; }
+
+  if [[ "$mode" == "dhcp" ]]; then
+    networksetup -setdnsservers "$service" Empty
+  elif [[ "$mode" == "static" ]] && valid_dns_list "$values"; then
+    # values are validated address tokens; intentional splitting supplies argv.
+    # shellcheck disable=SC2086
+    networksetup -setdnsservers "$service" $values
+  else
+    log dns-restore "invalid journal: mode/values"
+    return 1
+  fi
+  flush_dns
+  rm -f "$JOURNAL"
+  log dns-restore "service=$service mode=$mode"
+}
+
+override_dns() {
+  local iface gateway service dhcp current mode values tmp existing_iface existing_service
+  iface="$(default_interface)"
+  [[ -n "$iface" ]] || { log dns-override "refused: no default interface"; return 1; }
+  gateway="$(default_gateway)"
+  [[ -n "$gateway" ]] || { log dns-override "refused: no default gateway"; return 1; }
+  service="$(service_for_interface "$iface")"
+  [[ -n "$service" ]] || { log dns-override "refused: no service for $iface"; return 1; }
+  dhcp="$(dhcp_dns_for_interface "$iface")"
+  valid_dns_list "$dhcp" || { log dns-override "refused: no valid DHCP DNS for $iface"; return 1; }
+
+  if [[ -f "$JOURNAL" ]]; then
+    existing_iface="$(journal_value INTERFACE)"
+    existing_service="$(journal_value SERVICE)"
+    if [[ "$existing_iface" != "$iface" || "$existing_service" != "$service" ]]; then
+      restore_dns
+    fi
+  fi
+
+  if [[ ! -f "$JOURNAL" ]]; then
+    current="$(networksetup -getdnsservers "$service" 2>&1 || true)"
+    if printf '%s' "$current" | grep -q "aren't any DNS Servers set"; then
+      mode=dhcp
+      values=
+    else
+      values="$(printf '%s\n' "$current" | awk '/^[0-9A-Fa-f:.%]+$/{printf "%s%s", sep, $0; sep=" "}')"
+      valid_dns_list "$values" || { log dns-override "refused: cannot snapshot prior DNS"; return 1; }
+      mode=static
+    fi
+    tmp="${JOURNAL}.tmp.$$"
+    {
+      printf 'VERSION=1\n'
+      printf 'INTERFACE=%s\n' "$iface"
+      printf 'SERVICE=%s\n' "$service"
+      printf 'GATEWAY=%s\n' "$gateway"
+      printf 'MODE=%s\n' "$mode"
+      printf 'VALUES=%s\n' "$values"
+      printf 'OVERRIDE_DNS=%s\n' "$dhcp"
+      printf 'CREATED_AT=%s\n' "$(date -u +%FT%TZ)"
+      printf 'CREATED_EPOCH=%s\n' "$(date +%s)"
+    } > "$tmp"
+    chown root:wheel "$tmp"
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "$JOURNAL"
+  fi
+
+  # dhcp contains validated address tokens; intentional splitting supplies argv.
+  # shellcheck disable=SC2086
+  networksetup -setdnsservers "$service" $dhcp
+  flush_dns
+  log dns-override "service=$service interface=$iface dns=$dhcp"
+}
+
+restart_crd() {
+  [[ -r "$CRD_TARGET_FILE" ]] || { log restart-crd "refused: target not configured"; return 1; }
+  local target
+  target="$(head -1 "$CRD_TARGET_FILE")"
+  [[ "$target" =~ ^(system|gui/[0-9]+)/[A-Za-z0-9._-]+$ ]] \
+    || { log restart-crd "refused: invalid target"; return 1; }
+  launchctl kickstart -k "$target"
+  log restart-crd "target=$target"
+}
+
+case "$1" in
+  dns-flush)    flush_dns;   log dns-flush "ok" ;;
+  dns-override) override_dns ;;
+  dns-restore)  restore_dns ;;
+  restart-crd)  restart_crd ;;
+  *) echo "darkmesh-root-helper: unknown verb" >&2; exit 2 ;;
+esac

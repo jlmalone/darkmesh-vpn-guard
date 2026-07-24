@@ -1,0 +1,71 @@
+#!/bin/bash
+# Sourced persistent circuit-breaker helpers. The launchd watch healthcheck is
+# the only permitted writer. One-shot probes must not call breaker_update.
+
+BREAKER_FILE="${DARKMESH_BREAKER_FILE:-$HOME/.config/darkmesh/breakers.json}"
+BREAKER_PLUTIL="${DARKMESH_PLUTIL:-/usr/bin/plutil}"
+
+breaker_init() {
+  [[ -f "$BREAKER_FILE" ]] && return 0
+  mkdir -p "$(dirname "$BREAKER_FILE")"
+  local tmp="${BREAKER_FILE}.tmp.$$"
+  printf '%s\n' '{
+  "schema": 1,
+  "breakers": {
+    "dns_dead": {
+      "state": "closed", "rung": 0, "cycles": 0, "dead_ticks": 0,
+      "window_started_at": 0, "opened_at": 0, "alerted_at": 0,
+      "gave_up": false, "recover_refail_count": 0,
+      "last_action": "", "last_action_at": 0
+    },
+    "crd_wedged": {
+      "state": "closed", "rung": 0, "cycles": 0, "dead_ticks": 0,
+      "window_started_at": 0, "opened_at": 0, "alerted_at": 0,
+      "gave_up": false, "recover_refail_count": 0,
+      "last_action": "", "last_action_at": 0
+    }
+  }
+}' > "$tmp"
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "$BREAKER_FILE"
+}
+
+breaker_get() {
+  local fault="$1" field="$2" fallback="${3:-}"
+  local value
+  value="$($BREAKER_PLUTIL -extract "breakers.$fault.$field" raw -o - "$BREAKER_FILE" 2>/dev/null)" \
+    || value="$fallback"
+  printf '%s' "$value"
+}
+
+# breaker_update FAULT FIELD TYPE VALUE [FIELD TYPE VALUE ...]
+# TYPE is string, integer, or bool. Writes through one atomic replacement.
+breaker_update() {
+  local fault="$1" field type value tmp
+  shift
+  tmp="${BREAKER_FILE}.tmp.$$"
+  cp "$BREAKER_FILE" "$tmp"
+  while [[ $# -ge 3 ]]; do
+    field="$1"; type="$2"; value="$3"; shift 3
+    case "$type" in
+      string)  "$BREAKER_PLUTIL" -replace "breakers.$fault.$field" -string "$value" "$tmp" ;;
+      integer) "$BREAKER_PLUTIL" -replace "breakers.$fault.$field" -integer "$value" "$tmp" ;;
+      bool)    "$BREAKER_PLUTIL" -replace "breakers.$fault.$field" -bool "$value" "$tmp" ;;
+      *) rm -f "$tmp"; return 2 ;;
+    esac
+  done
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "$BREAKER_FILE"
+}
+
+breaker_reset_fault() {
+  local fault="$1"
+  breaker_update "$fault" \
+    state string closed rung integer 0 cycles integer 0 dead_ticks integer 0 \
+    window_started_at integer 0 opened_at integer 0 alerted_at integer 0 \
+    gave_up bool false last_action string "" last_action_at integer 0
+}
+
+breaker_json() {
+  "$BREAKER_PLUTIL" -extract breakers json -o - "$BREAKER_FILE" 2>/dev/null || printf '{}'
+}

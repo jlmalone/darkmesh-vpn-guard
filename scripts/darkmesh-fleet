@@ -1,0 +1,108 @@
+#!/bin/bash
+# Allowlist-driven fleet rollout. Remote commands always run at nice 19.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+INVENTORY="${DARKMESH_FLEET_FILE:-$HOME/.config/darkmesh/fleet-nodes}"
+CANARY=no
+WITH_ADMIN=no
+
+usage() {
+  cat <<'EOF'
+Usage: darkmesh-fleet [--inventory FILE] [--canary] [--with-admin]
+
+Targets come only from the untracked allowlist. Without --with-admin, nodes
+whose fixed root helper is missing or drifted are reported SKIPPED and are not
+partially upgraded. --with-admin prompts once per such node through ssh -t.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --inventory) INVENTORY="$2"; shift 2 ;;
+    --canary) CANARY=yes; shift ;;
+    --with-admin) WITH_ADMIN=yes; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
+[[ -f "$INVENTORY" ]] || { echo "fleet allowlist missing: $INVENTORY" >&2; exit 1; }
+EXPECTED_HELPER_HASH="$(shasum -a 256 "$ROOT/scripts/darkmesh-root-helper" | awk '{print $1}')"
+fail=0; processed=0; passed=0
+
+while IFS= read -r node; do
+  node="$(printf '%s' "$node" | sed 's/[[:space:]]*#.*$//; s/^[[:space:]]*//; s/[[:space:]]*$//')"
+  [[ -n "$node" ]] || continue
+  if [[ ! "$node" =~ ^[A-Za-z0-9._@-]+$ || "$node" == -* ]]; then
+    printf 'FAIL    %-24s invalid allowlist target\n' "$node"; fail=1; continue
+  fi
+  if [[ "$CANARY" == yes && "$processed" -ge 1 ]]; then
+    printf 'SKIPPED %-24s canary mode\n' "$node"
+    continue
+  fi
+  processed=$((processed + 1))
+
+  if ! ssh -o BatchMode=yes -o ConnectTimeout=7 "$node" 'nice -n 19 true' >/dev/null 2>&1; then
+    printf 'SKIPPED %-24s offline/unreachable\n' "$node"
+    continue
+  fi
+
+  remote_hash_line="$(ssh "$node" 'nice -n 19 shasum -a 256 /Library/darkmesh/bin/darkmesh-root-helper' 2>/dev/null)"
+  remote_hash="$(printf '%s' "$remote_hash_line" | awk '{print $1}')"
+  if [[ "$remote_hash" != "$EXPECTED_HELPER_HASH" && "$WITH_ADMIN" != yes ]]; then
+    printf 'SKIPPED %-24s needs one-time admin helper install\n' "$node"
+    continue
+  fi
+
+  remote_tmp="$(ssh "$node" 'nice -n 19 mktemp -d /tmp/darkmesh-rollout.XXXXXX' 2>/dev/null)"
+  if [[ ! "$remote_tmp" =~ ^/tmp/darkmesh-rollout\.[A-Za-z0-9]+$ ]]; then
+    printf 'FAIL    %-24s could not create remote staging dir\n' "$node"; fail=1; continue
+  fi
+
+  if ! tar -czf - scripts vpn-guard swiftbar newsyslog \
+      | ssh "$node" "nice -n 19 tar -xzf - -C '$remote_tmp'"; then
+    printf 'FAIL    %-24s copy failed\n' "$node"; fail=1
+    ssh "$node" "nice -n 19 rm -rf '$remote_tmp'" >/dev/null 2>&1 || true
+    continue
+  fi
+
+  if [[ "$remote_hash" != "$EXPECTED_HELPER_HASH" ]]; then
+    remote_user="$(ssh "$node" 'nice -n 19 id -un' 2>/dev/null)"
+    if [[ ! "$remote_user" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      printf 'FAIL    %-24s invalid remote username\n' "$node"; fail=1
+      ssh "$node" "nice -n 19 rm -rf '$remote_tmp'" >/dev/null 2>&1 || true
+      continue
+    fi
+    if ! ssh -t "$node" "nice -n 19 sudo nice -n 19 '$remote_tmp/scripts/install-root-helper.sh' '$remote_user'"; then
+      printf 'FAIL    %-24s privileged install failed\n' "$node"; fail=1
+      ssh "$node" "nice -n 19 rm -rf '$remote_tmp'" >/dev/null 2>&1 || true
+      continue
+    fi
+  fi
+
+  if ! ssh "$node" "nice -n 19 '$remote_tmp/scripts/install-user-tools'"; then
+    printf 'FAIL    %-24s user install failed\n' "$node"; fail=1
+    ssh "$node" "nice -n 19 rm -rf '$remote_tmp'" >/dev/null 2>&1 || true
+    continue
+  fi
+
+  audit=""; audit_rc=1
+  for attempt in 1 2 3; do
+    audit="$(ssh "$node" 'nice -n 19 "$HOME/.local/bin/darkmesh-audit" --json' 2>/dev/null)"; audit_rc=$?
+    [[ "$audit_rc" -eq 0 ]] && break
+    [[ "$attempt" -lt 3 ]] && ssh "$node" 'nice -n 19 sleep 10' >/dev/null 2>&1
+  done
+  ssh "$node" "nice -n 19 rm -rf '$remote_tmp'" >/dev/null 2>&1 || true
+  if [[ "$audit_rc" -eq 0 ]] && printf '%s' "$audit" | /usr/bin/plutil -extract ok raw -o - - 2>/dev/null | grep -q true; then
+    printf 'PASS    %-24s helper=%s\n' "$node" "${EXPECTED_HELPER_HASH:0:12}"
+    passed=$((passed + 1))
+  else
+    printf 'FAIL    %-24s audit failed: %s\n' "$node" "$(printf '%s' "$audit" | tr '\n' ' ' | cut -c1-180)"
+    fail=1
+  fi
+done < "$INVENTORY"
+
+[[ "$processed" -gt 0 ]] || { echo "no targets in $INVENTORY" >&2; exit 1; }
+[[ "$passed" -gt 0 ]] || { echo "no fleet node reached PASS" >&2; exit 2; }
+exit "$fail"

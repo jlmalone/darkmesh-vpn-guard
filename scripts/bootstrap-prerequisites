@@ -1,0 +1,76 @@
+#!/bin/bash
+# bootstrap-prerequisites — install the GUI apps darkmesh-vpn-guard depends on,
+# then print the manual checklist for everything that can't be scripted.
+#
+# Idempotent: re-running skips already-installed casks.
+
+set -euo pipefail
+
+if ! command -v brew >/dev/null 2>&1; then
+  cat >&2 <<'EOF'
+ERROR: Homebrew is not installed.
+Install it first: https://brew.sh
+Then re-run this script.
+EOF
+  exit 1
+fi
+
+# Real transfer-client specifics (app / process / .ini section / API base) load
+# from untracked local config; this public repo ships only neutral fallbacks.
+CLIENT_CONF_FILE="${DARKMESH_CLIENT_CONF:-$HOME/.config/darkmesh/transfer-client.conf}"
+[ -r "$CLIENT_CONF_FILE" ] && . "$CLIENT_CONF_FILE"
+
+CLIENT_CASK="${CLIENT_CASK:-}"
+CASKS=(expressvpn tailscale "$CLIENT_CASK")
+
+echo "==> Checking Homebrew casks: ${CASKS[*]}"
+for cask in "${CASKS[@]}"; do
+  if brew list --cask "$cask" >/dev/null 2>&1; then
+    echo "    [ok]      $cask already installed"
+  else
+    echo "    [install] $cask"
+    brew install --cask "$cask"
+  fi
+done
+
+cat <<'EOF'
+
+==> Casks ready.
+
+Manual gates (do these in order — each requires the GUI):
+
+  1. Open ExpressVPN, sign in, connect to your region.
+       /Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl status
+     should show:  Connected to <region>
+
+  2. Open Tailscale, sign in, accept the tailnet invite.
+       /Applications/Tailscale.app/Contents/MacOS/Tailscale status
+     should list your tailnet peers.
+
+  3. Approve the Network Extensions when macOS prompts (or proactively):
+       System Settings → General → Login Items & Extensions → Network Extensions
+     Approve ExpressVPN's SplitTunnelProxyExtension and Tailscale's network
+     extension. Without these, split-tunnel and Tailscale don't activate.
+
+  4. Launch the transfer-client app once so it accepts the legal notice and
+     writes its initial config, then quit it. The next script does the rest.
+
+==> Continue the install (after the 4 manual steps above):
+
+       ./scripts/configure-client
+           # writes WebUI password, peer port 56378, StartPaused, UPnP off.
+           # Prints the password it generated — save it for the keychain step.
+
+       ./scripts/install-user-tools
+       cd vpn-guard && ./vpn-guard-install.sh
+           # Pre-stash the password first to avoid the interactive prompt:
+           #   security add-generic-password -a "$USER" -s vpn-guard-client \
+           #     -w '<the-password>' -U
+
+       darkmesh-expressvpn-tailscale apply            # relaxed (Network Lock OFF)
+       # or: darkmesh-expressvpn-tailscale apply --strict   (Network Lock ON)
+
+       transfer-vpn-doctor --fix --quit
+       ./scripts/verify-end-state
+
+EOF

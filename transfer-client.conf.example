@@ -1,0 +1,47 @@
+# transfer-client.conf.example
+#
+# Copy this to ~/.config/darkmesh/transfer-client.conf and fill in your own values:
+#     cp transfer-client.conf.example ~/.config/darkmesh/transfer-client.conf
+#     $EDITOR ~/.config/darkmesh/transfer-client.conf
+#
+# WHY THIS FILE IS NOT YOUR REAL CONFIG (and why the repo ships only placeholders):
+# darkmesh works with any WebUI-controllable transfer client, but which client you
+# run, and its app/process/API specifics, are particular to your machine. To keep
+# this project generic (and to keep one operator's setup out of a public repo), the
+# tracked scripts hard-code only neutral fallbacks and load the real values from the
+# untracked file above. Nothing here is a secret (these are app and identifier names,
+# not credentials, which stay in the macOS Keychain), but they are environment
+# specific, so they live OUT of version control. Never commit your filled-in copy.
+#
+# Every value below is an illustrative placeholder. Replace each with the truth for
+# your setup. If you leave this file absent entirely, the scripts still run against
+# the neutral defaults shown in parentheses (they just will not find a real client).
+
+# The .app bundle name: used for `open -a`, the Info.plist lookup, the config dir.
+# (neutral default: TransferClient)
+CLIENT_APP="MyTransferClient"
+
+# The Homebrew cask id, used by bootstrap / full-revert (brew install --cask <id>).
+# (neutral default: empty)
+CLIENT_CASK="my-transfer-client"
+
+# The running process name, used to match and pause the process.
+# (neutral default: same as CLIENT_APP)
+CLIENT_PROC="mytransferclient"
+
+# The .ini section that holds the bind-interface / network settings.
+# (neutral default: Transfers)
+CLIENT_SECTION="Network"
+
+# The WebUI API base segment for the transfer list, joined as /api/v2/<base>.
+# (neutral default: transfers)
+CLIENT_API_BASE="items"
+
+# A legacy macOS Keychain service name, only if you migrated from an older one.
+# (neutral default: vpn-guard-legacy). The live WebUI password is read from the
+# Keychain service "vpn-guard-client" and is never stored in this file.
+LEGACY_KEYCHAIN_SERVICE="vpn-guard-legacy"
+
+# Optional WebUI overrides (defaults already match a typical local setup):
+# CLIENT_WEB_HOST="http://127.0.0.1:8080"
+# CLIENT_WEB_USER="admin"

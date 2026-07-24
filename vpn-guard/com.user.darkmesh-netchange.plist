@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.darkmesh-netchange</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__RECONNECT_BIN__</string>
+        <string>--once</string>
+    </array>
+    <!-- Event-driven listener. launchd watches these paths in the kernel and fires
+         one reconcile pass (re-pin the transfer client to the live tunnel, then
+         resume-when-green) whenever the network config changes: VPN up/down, DNS
+         swap, interface add/remove. Costs nothing while idle; this is NOT a poller.
+         The reconnect watchdog's slow poll remains as the backstop. -->
+    <key>WatchPaths</key>
+    <array>
+        <string>/etc/resolv.conf</string>
+        <string>/var/run/resolv.conf</string>
+        <string>/Library/Preferences/SystemConfiguration</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>15</integer>
+    <key>StandardOutPath</key>
+    <string>/tmp/darkmesh-netchange.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/darkmesh-netchange.stderr.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

@@ -1,0 +1,96 @@
+# Network resilience state machine
+
+This document is the current ordering contract for laptop wake, network change,
+captive access, filtered networks, and VPN failure. The older availability plan
+still defines the safety hierarchy, but its global-probe gate and ExpressVPN
+autoconnect guidance are superseded here.
+
+## Policy order
+
+1. Ordinary internet must recover automatically.
+2. ExpressVPN is the preferred default route.
+3. Tailscale is optional. Its health and DNS integration never gate internet or
+   VPN recovery on a laptop.
+4. The transfer client is the only strict fail-closed component.
+5. ExpressVPN Network Lock and built-in autoconnect stay off by default.
+
+## States
+
+| Phase | Entry action | Transition |
+|---|---|---|
+| `settling` | Coalesce network notifications and restore plain networking once for a new physical-network fingerprint. | Classify the plain path. |
+| `desired-off` | Force transfer containment and restore plain networking. | `darkmesh-up` sets desired on. |
+| `offline` | Leave VPN down. | A default interface and gateway appear. |
+| `captive-standdown` | Leave VPN down and DHCP DNS in control. | Exact open-internet evidence appears. |
+| `captive-clear-wait` | Require stable exact success before a normal-region VPN attempt. | Required clear samples pass. |
+| `restricted-wait` | No positive portal evidence, but the normal probes are blocked or unavailable. | The initial plain-network window expires. |
+| `retrying` | One serialized VPN attempt failed. Restore plain networking and preserve the absolute retry deadline. | Deadline expires. |
+| `plain-cooldown` | Per-network restricted-attempt budget is exhausted. | Cooldown expires or the physical network changes. |
+| `connected` | Re-pin the transfer client to the live tunnel and resume only after containment is safe. | VPN or physical network changes. |
+
+## Classification
+
+A network is captive only when the Apple HTTP probe supplies positive evidence:
+a redirect, HTTP 511, or an unexpected portal body. Failure to reach Apple,
+Google, or a named global host is not captive evidence.
+
+Two exact probe successes classify an ordinary open network. An active default
+interface and gateway without positive captive evidence classify a restricted
+network. This permits bounded VPN attempts where the VPN is needed to reach the
+global probe hosts.
+
+Restricted defaults:
+
+- 15 seconds of restored plain networking before the first attempt;
+- no more than two attempts per physical network in ten minutes;
+- at least 60 seconds between attempts;
+- 15 minutes of plain-network cooldown after the budget is exhausted.
+
+The fingerprint contains the physical default interface, gateway, DHCP address,
+and DHCP server identifier. VPN tunnel interfaces and DNS contents are excluded,
+so VPN-generated path notifications cannot reset the attempt budget. A transient
+sample with no physical default interface or gateway is ignored rather than
+treated as a new network; this preserves the recovery budget while Wi-Fi or the
+VPN route table is settling.
+
+## Plain-network restoration
+
+`darkmesh-restore-plain-network` is the one shared recovery primitive. It first
+forces `vpn-guard` unsafe, which pauses the transfer client and loads only its
+peer-port PF rules. It then disables ExpressVPN autoconnect and Network Lock,
+disconnects ExpressVPN, restores any helper-owned DNS snapshot, disables
+Tailscale DNS acceptance, and flushes DNS. If system DNS is still dead, the
+existing journaled DHCP override is evaluated.
+
+If transfer containment cannot be confirmed, the helper refuses to disconnect
+the VPN or modify DNS. This preserves the transfer client's strict fail-closed
+contract even when the installation itself is damaged.
+
+The helper never changes `vpn-desired`, stops Tailscale, deletes tailnet routes,
+or installs a machine-wide PF policy. Automatic recovery calls it without
+changing intent. Manual captive, panic, and emergency commands set desired off
+before calling it.
+
+## Event and retry ownership
+
+The long-running reconnect process is the only component allowed to issue VPN
+connection attempts or restart ExpressVPN. A network-change signal sets a dirty
+flag. Signals are coalesced before one reconcile pass and cannot interrupt an
+absolute retry deadline, a connection observation window, or restart wait.
+
+The legacy `--once` path only forwards a signal to the long-running process.
+ExpressVPN built-in autoconnect is disabled, and the configuration command hands
+desired-on intent to `darkmesh-up` instead of connecting directly.
+
+## Healthcheck relationship
+
+The healthcheck remains the safety observer and status writer. A single global
+probe failure reports degradation. Plain-network restoration requires two
+consecutive post-grace failures where end-to-end access is down together with
+DNS or raw IP access. Tailscale remains visible in status but does not trigger
+VPN teardown on a laptop.
+
+Observer liveness is a separate state dimension. Each tick writes a progress
+heartbeat before any probe or recovery action. The supervisor marks the child
+unresponsive after 90 seconds of silence, force-recycles it, and restarts it.
+Status older than its published 60-second maximum is `STALE`, never GO or NO-GO.

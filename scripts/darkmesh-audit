@@ -1,0 +1,197 @@
+#!/bin/bash
+# Verify one node's installed darkmesh stack. Read-only; --json is intended for
+# server_monitor and fleet collection.
+set -uo pipefail
+
+BIN_DIR="${BIN_DIR:-$(cd "$(dirname "$0")" 2>/dev/null && pwd)}"
+STATUS_FILE="${DARKMESH_STATUS_FILE:-/tmp/darkmesh-status.json}"
+BREAKER_FILE="${DARKMESH_BREAKER_FILE:-$HOME/.config/darkmesh/breakers.json}"
+PF_SIDECAR="${DARKMESH_PF_SIDECAR:-/tmp/darkmesh-pf.json}"
+INFRA_STATUS="${DARKMESH_INFRA_STATUS:-$HOME/Library/Application Support/ServerMonitor/infrastructure-agent-status.json}"
+ROOT_HELPER=/Library/darkmesh/bin/darkmesh-root-helper
+EXPRESSVPN_CTL="${EXPRESSVPN_CTL:-/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl}"
+CRD_TARGET_FILE=/Library/darkmesh/config/crd-launchd-target
+NEWSYSLOG=/etc/newsyslog.d/darkmesh.conf
+JSON=no
+[[ "${1:-}" == --json ]] && JSON=yes
+uid="$(id -u)"
+fail=0
+RESULTS="$(mktemp -t darkmesh-audit)"
+trap 'rm -f "$RESULTS"' EXIT
+
+escape_json() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/[[:cntrl:]]/ /g'; }
+record() {
+  local id="$1" ok="$2" detail="$3"
+  printf '%s\t%s\t%s\n' "$id" "$ok" "$detail" >> "$RESULTS"
+  [[ "$ok" == true ]] || fail=1
+  if [[ "$JSON" != yes ]]; then
+    [[ "$ok" == true ]] && printf '  PASS  %s\n' "$detail" || printf '  FAIL  %s\n' "$detail"
+  fi
+}
+have_tool() { command -v "$1" >/dev/null 2>&1 || [[ -x "$BIN_DIR/$1" ]]; }
+agent_loaded() { launchctl print "gui/$uid/$1" >/dev/null 2>&1; }
+agent_running() { launchctl print "gui/$uid/$1" 2>/dev/null | grep -qE 'state = running|pid = [0-9]+'; }
+infrastructure_manages_darkmesh() {
+  [[ -r "$INFRA_STATUS" ]] && /usr/bin/python3 - "$INFRA_STATUS" <<'PY' >/dev/null 2>&1
+import json, sys
+d = json.load(open(sys.argv[1]))
+ids = {row.get("id") for row in d.get("children", [])}
+raise SystemExit(0 if {"darkmesh-healthcheck", "darkmesh-reconnect"} <= ids else 1)
+PY
+}
+
+[[ "$JSON" == yes ]] || echo "darkmesh-audit @ $(scutil --get LocalHostName 2>/dev/null || hostname) $(date -u +%FT%TZ)"
+
+for tool in darkmesh-healthcheck darkmesh-breaker darkmesh-reconnect darkmesh-restore-plain-network transfer-vpn-doctor darkmesh-panic darkmesh-repair darkmesh-up; do
+  have_tool "$tool" && record "binary.$tool" true "binary $tool" || record "binary.$tool" false "binary $tool missing"
+done
+
+if [[ -x "$EXPRESSVPN_CTL" ]]; then
+  networklock="$("$EXPRESSVPN_CTL" get networklock 2>/dev/null | head -1)"
+  autoconnect="$("$EXPRESSVPN_CTL" get autoconnect 2>/dev/null | head -1)"
+  [[ "$networklock" == false ]] \
+    && record expressvpn.networklock true "ExpressVPN Network Lock off" \
+    || record expressvpn.networklock false "ExpressVPN Network Lock is ${networklock:-unknown}"
+  [[ "$autoconnect" == false ]] \
+    && record expressvpn.autoconnect true "ExpressVPN autoconnect off; Darkmesh owns ordering" \
+    || record expressvpn.autoconnect false "ExpressVPN autoconnect is ${autoconnect:-unknown}"
+else
+  record expressvpn.present false "ExpressVPN control tool missing"
+fi
+
+if agent_loaded vision.salient.InfrastructureAgent && infrastructure_manages_darkmesh; then
+  agent_running vision.salient.InfrastructureAgent \
+    && record agent.infrastructure true "unified infrastructure agent loaded+running" \
+    || record agent.infrastructure false "unified infrastructure agent loaded but not running"
+  if [[ -f "$INFRA_STATUS" ]] && /usr/bin/python3 - "$INFRA_STATUS" <<'PY' >/dev/null 2>&1
+import datetime, json, os, sys, time
+path = sys.argv[1]
+d = json.load(open(path))
+if d.get("schema") != 2 or time.time() - os.path.getmtime(path) > 90:
+    raise SystemExit(1)
+children = {row.get("id"): row for row in d.get("children", [])}
+jobs = {row.get("id"): row for row in d.get("scheduledJobs", [])}
+required_children = ("darkmesh-healthcheck", "darkmesh-reconnect")
+required_jobs = ("vpn-guard",)
+now = datetime.datetime.now(datetime.timezone.utc)
+def job_healthy(row):
+    if row.get("timedOut") is True:
+        return False
+    if row.get("running") is True:
+        return True
+    if row.get("lastExitStatus") != 0 or not row.get("lastRunAt"):
+        return False
+    completed = datetime.datetime.fromisoformat(row["lastRunAt"].replace("Z", "+00:00"))
+    max_age = max(90.0, float(row.get("intervalSeconds", 0)) * 2 + 30)
+    return (now - completed).total_seconds() <= max_age
+ok = d.get("configLoaded") is True
+ok = ok and all(key in children for key in required_children)
+ok = ok and all(row.get("running") is True and row.get("responsive") is True
+                for row in children.values())
+ok = ok and all(key in jobs for key in required_jobs)
+ok = ok and all(job_healthy(row) for row in jobs.values())
+raise SystemExit(0 if ok else 1)
+PY
+  then
+    record agent.children true "unified agent children/jobs healthy"
+  else
+    record agent.children false "unified agent status missing, stale, or unhealthy"
+  fi
+else
+  for agent in com.user.darkmesh-healthcheck com.user.darkmesh-reconnect; do
+    if agent_loaded "$agent" && agent_running "$agent"; then
+      record "agent.$agent" true "$agent loaded+running"
+    elif agent_loaded "$agent"; then
+      record "agent.$agent" false "$agent loaded but not running"
+    else
+      record "agent.$agent" false "$agent not loaded"
+    fi
+  done
+  agent_loaded com.user.vpnguard \
+    && record agent.com.user.vpnguard true "com.user.vpnguard loaded" \
+    || record agent.com.user.vpnguard false "com.user.vpnguard not loaded"
+fi
+
+if [[ -x "$ROOT_HELPER" ]]; then
+  record root_helper.present true "root helper present"
+  if [[ -f "$BIN_DIR/darkmesh-root-helper" ]] \
+      && [[ "$(shasum -a 256 "$ROOT_HELPER" | awk '{print $1}')" == "$(shasum -a 256 "$BIN_DIR/darkmesh-root-helper" | awk '{print $1}')" ]]; then
+    record root_helper.hash true "root helper hash matches deployed user tools"
+  else
+    record root_helper.hash false "root helper hash mismatch"
+  fi
+  sudo -n -l "$ROOT_HELPER" dns-flush >/dev/null 2>&1 \
+    && record root_helper.sudo true "passwordless dns-flush authorized" \
+    || record root_helper.sudo false "passwordless dns-flush not authorized"
+  if [[ -d /Library/PrivilegedHelperTools/ChromeRemoteDesktopHost.app ]]; then
+    if [[ -s "$CRD_TARGET_FILE" ]] && sudo -n -l "$ROOT_HELPER" restart-crd >/dev/null 2>&1; then
+      record root_helper.crd true "remote-access restart target authorized"
+    else
+      record root_helper.crd false "remote-access installed but restart target unavailable"
+    fi
+  fi
+else
+  record root_helper.present false "root helper missing"
+fi
+
+[[ -f "$NEWSYSLOG" ]] \
+  && record newsyslog true "newsyslog rotation installed" \
+  || record newsyslog false "newsyslog rotation missing"
+
+if [[ -f "$BREAKER_FILE" ]] && /usr/bin/plutil -p "$BREAKER_FILE" >/dev/null 2>&1; then
+  record breaker true "breaker state valid"
+  breaker_failed=no
+  for fault in dns_dead crd_wedged; do
+    gave_up="$(/usr/bin/plutil -extract "breakers.$fault.gave_up" raw -o - "$BREAKER_FILE" 2>/dev/null || echo false)"
+    if [[ "$gave_up" == true ]]; then
+      record "breaker.$fault" false "recovery gave up for $fault"
+      breaker_failed=yes
+    fi
+  done
+  [[ "$breaker_failed" == yes ]] || record breaker.recovery true "no recovery breaker is open"
+else
+  record breaker false "breaker state missing or invalid"
+fi
+
+if [[ -f "$STATUS_FILE" ]]; then
+  freshness="$(/usr/bin/python3 - "$STATUS_FILE" <<'PY' 2>/dev/null || true
+import datetime, json, os, sys, time
+d=json.load(open(sys.argv[1]))
+authored=datetime.datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00")).timestamp()
+age=max(0, time.time()-authored, time.time()-os.path.getmtime(sys.argv[1]))
+limit=int(d.get("max_age_seconds", 60))
+print(f"{int(age)} {limit} {'fresh' if age <= limit else 'stale'}")
+PY
+)"
+  read -r age limit freshness_state <<< "$freshness"
+  if [[ "$freshness_state" == fresh ]]; then
+    record status true "status fresh (${age}s; limit ${limit}s)"
+  else
+    record status false "status stale or invalid (${age:-unknown}s; limit ${limit:-unknown}s)"
+  fi
+  grep -q '"schema"[[:space:]]*:[[:space:]]*4' "$STATUS_FILE" \
+    && record status.schema true "status schema 4" \
+    || record status.schema false "status schema is not 4"
+else
+  record status false "status missing"
+fi
+
+if [[ -f "$PF_SIDECAR" ]] && grep -qE '"pf_anchor_evaluated"[[:space:]]*:[[:space:]]*true' "$PF_SIDECAR"; then
+  record pf true "PF kill-switch wired"
+else
+  record pf false "PF kill-switch not confirmed wired"
+fi
+
+if [[ "$JSON" == yes ]]; then
+  printf '{"schema":1,"ok":%s,"checked_at":"%s","checks":[' "$([[ "$fail" == 0 ]] && printf true || printf false)" "$(date -u +%FT%TZ)"
+  first=yes
+  while IFS=$'\t' read -r id ok detail; do
+    [[ "$first" == yes ]] || printf ','
+    first=no
+    printf '{"id":"%s","ok":%s,"detail":"%s"}' "$(escape_json "$id")" "$ok" "$(escape_json "$detail")"
+  done < "$RESULTS"
+  printf ']}\n'
+else
+  [[ "$fail" == 0 ]] && echo "RESULT: PASS" || echo "RESULT: FAIL"
+fi
+exit "$fail"

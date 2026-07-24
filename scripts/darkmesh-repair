@@ -1,0 +1,54 @@
+#!/bin/bash
+# Explicit operator repair entrypoint. Re-arms user-level watchdogs and closes
+# their breakers once per invocation; Server Monitor's polling remains read-only.
+set -euo pipefail
+
+[[ $# -eq 0 ]] || { echo "darkmesh-repair takes no arguments" >&2; exit 2; }
+BIN_DIR="${BIN_DIR:-$(cd "$(dirname "$0")" && pwd)}"
+BREAKER_LIB="${DARKMESH_BREAKER_LIB:-$BIN_DIR/darkmesh-breaker}"
+if [[ ! -r "$BREAKER_LIB" ]]; then
+  BREAKER_LIB="$(command -v darkmesh-breaker 2>/dev/null || true)"
+fi
+DNS_RESTORE_FAILURE_MARKER="${DARKMESH_DNS_RESTORE_FAILURE_MARKER:-$HOME/.config/darkmesh/dns-restore-failed}"
+uid="$(id -u)"
+INFRA_STATUS="${DARKMESH_INFRA_STATUS:-$HOME/Library/Application Support/ServerMonitor/infrastructure-agent-status.json}"
+UNIFIED_LABEL=vision.salient.InfrastructureAgent
+
+if [[ -r "$BREAKER_LIB" ]]; then
+  # shellcheck source=scripts/darkmesh-breaker
+  source "$BREAKER_LIB"
+  breaker_init
+  breaker_reset_fault dns_dead
+  breaker_reset_fault crd_wedged
+fi
+rm -f "$DNS_RESTORE_FAILURE_MARKER"
+
+infrastructure_manages_darkmesh() {
+  [[ -r "$INFRA_STATUS" ]] && /usr/bin/python3 - "$INFRA_STATUS" <<'PY' >/dev/null 2>&1
+import json, sys
+d = json.load(open(sys.argv[1]))
+ids = {row.get("id") for row in d.get("children", [])}
+raise SystemExit(0 if {"darkmesh-healthcheck", "darkmesh-reconnect"} <= ids else 1)
+PY
+}
+
+if launchctl print "gui/$uid/$UNIFIED_LABEL" >/dev/null 2>&1 \
+    && infrastructure_manages_darkmesh; then
+  # The signed agent handles SIGUSR2 by recycling persistent children only;
+  # scheduled work such as an active queue drain is deliberately untouched.
+  launchctl kill SIGUSR2 "gui/$uid/$UNIFIED_LABEL"
+else
+  for label in com.user.darkmesh-healthcheck com.user.darkmesh-reconnect; do
+    launchctl kickstart -k "gui/$uid/$label"
+  done
+fi
+
+VPN_GUARD="${DARKMESH_VPN_GUARD:-$BIN_DIR/vpn-guard.sh}"
+if [[ ! -x "$VPN_GUARD" ]]; then
+  VPN_GUARD="$(command -v vpn-guard.sh 2>/dev/null || true)"
+fi
+if [[ -n "$VPN_GUARD" && -x "$VPN_GUARD" ]]; then
+  "$VPN_GUARD" >/dev/null
+fi
+
+echo "darkmesh recovery re-armed"
