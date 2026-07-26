@@ -2,13 +2,35 @@
 # One-time privileged install for the fixed darkmesh recovery helper.
 set -euo pipefail
 
+resolve_script_dir() {
+  local source="${BASH_SOURCE[0]}"
+  local directory target
+
+  while [[ -L "$source" ]]; do
+    directory="$(cd -P "$(dirname "$source")" && pwd)"
+    target="$(readlink "$source")"
+    if [[ "$target" = /* ]]; then
+      source="$target"
+    else
+      source="$directory/$target"
+    fi
+  done
+
+  cd -P "$(dirname "$source")" && pwd
+}
+
+SRC_DIR="$(resolve_script_dir)"
+if [[ "${1:-}" == "--print-source-dir" ]]; then
+  printf '%s\n' "$SRC_DIR"
+  exit 0
+fi
+
 [[ "$(id -u)" -eq 0 ]] || { echo "Run with sudo: sudo $0 [username]" >&2; exit 1; }
 
 TARGET_USER="${1:-${SUDO_USER:-$(stat -f%Su /dev/console)}}"
 TARGET_UID="$(id -u "$TARGET_USER")"
 TARGET_GROUP="$(id -gn "$TARGET_USER")"
 TARGET_HOME="$(dscl . -read "/Users/$TARGET_USER" NFSHomeDirectory | awk '{print $2}')"
-SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SRC_DIR/.." && pwd)"
 NEWSYSLOG_TEMPLATE=""
 for candidate in "$ROOT/newsyslog/darkmesh.conf" "$SRC_DIR/newsyslog/darkmesh.conf"; do
