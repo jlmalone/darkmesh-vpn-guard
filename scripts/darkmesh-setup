@@ -57,6 +57,7 @@ warn() { printf 'WARN: %s\n' "$*" >&2; }
 ROOT_HELPER=/Library/darkmesh/bin/darkmesh-root-helper
 ROOT_PF_CONF=/usr/local/etc/vpn-guard/unsafe.pf.conf
 ROOT_NEWSYSLOG=/etc/newsyslog.d/darkmesh.conf
+EXPRESSVPN_CTL=/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl
 
 # --- locate the installed tools + data files ----------------------------------
 # Derive the install dir from THIS script's own location, so it's correct even when
@@ -128,6 +129,16 @@ elif [ -x "$BIN/install-root-helper.sh" ]; then
 else
   warn "install-root-helper.sh missing; refusing to arm an incomplete recovery stack"
   exit 1
+fi
+
+# Darkmesh owns reconnection ordering. ExpressVPN must not race the watchdog or
+# reinstate the whole-machine network lock during setup or after a reboot.
+if [[ -x "$EXPRESSVPN_CTL" ]]; then
+  log "configuring ExpressVPN recovery ownership"
+  "$EXPRESSVPN_CTL" set autoconnect false \
+    || { warn "failed to disable ExpressVPN autoconnect"; exit 1; }
+  "$EXPRESSVPN_CTL" set networklock false \
+    || { warn "failed to disable ExpressVPN Network Lock"; exit 1; }
 fi
 
 # --- background supervisor ----------------------------------------------------

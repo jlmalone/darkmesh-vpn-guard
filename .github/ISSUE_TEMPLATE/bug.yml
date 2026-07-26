@@ -11,7 +11,7 @@ body:
     id: version
     attributes:
       label: Darkmesh version
-      placeholder: "0.1.12"
+      placeholder: "0.1.13"
     validations:
       required: true
   - type: dropdown
