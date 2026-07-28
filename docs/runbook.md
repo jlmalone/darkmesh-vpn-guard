@@ -74,8 +74,8 @@ ExpressVPN:
 - Connected to a nearby region (best-effort).
 - Network Lock: off (relaxed).
 - Split Tunnel: enabled.
-- Autoconnect: enabled (startup only; the captive-aware reconnect watchdog is the
-  on-network connector).
+- Autoconnect: off; Darkmesh owns connection ordering through its captive-aware
+  reconnect watchdog.
 - Split Tunnel bypass list:
   - `/Applications/Tailscale.app/Contents/MacOS/Tailscale`
   - `/Library/SystemExtensions/.../io.tailscale.ipn.macsys.network-extension.systemextension/Contents/MacOS/io.tailscale.ipn.macsys.network-extension`
@@ -101,6 +101,30 @@ Representative setup:
 - Tailscale IP: `<tailnet-address>`
 - ExpressVPN interface: `<vpn-utun>`
 - ExpressVPN tunnel-side IP: `<vpn-address>`
+
+## ExpressVPN system-extension approval
+
+Darkmesh and `expressvpnctl` can prepare split-tunnel bypasses and request the
+ExpressVPN system extension, but they cannot approve it on an unmanaged Mac.
+Treat this state as a human gate:
+
+```text
+com.expressvpn.vpn.splittunnel ... [activated waiting for user]
+```
+
+Leave ExpressVPN disconnected. At the machine's physical console, open:
+
+System Settings > General > Login Items & Extensions > Network Extensions
+
+Enable ExpressVPN and confirm `systemextensionsctl list` changes to `activated
+enabled` before any reconnect test. Repeated CLI or GUI toggles do not bypass
+approval and may simply revert Split Tunnel to off.
+
+Chrome Remote Desktop may display the approval sheet with blank or redacted
+rows. Do not attempt blind clicks, protected-database edits, reduced-security
+boot settings, or device-management enrollment as workarounds. A managed fleet
+may use a user-approved device-management policy; an unmanaged installation
+requires local approval.
 
 The concrete client config path and section name are derived by
 `transfer-vpn-doctor` at runtime from weakly encoded identifiers.

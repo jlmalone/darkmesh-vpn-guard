@@ -188,6 +188,19 @@ If macOS asks for Network Extension approval, approve ExpressVPN's
 
 System Settings > General > Login Items & Extensions > Network Extensions
 
+Darkmesh and `expressvpnctl` can configure the bypass list and request
+activation, but they cannot approve a pending system extension on an unmanaged
+Mac. `systemextensionsctl list` reports this gate as `activated waiting for
+user`. Repeatedly enabling Split Tunnel does not bypass the gate; ExpressVPN may
+turn the setting off again until approval succeeds.
+
+Chrome Remote Desktop may show the approval sheet with blank or redacted rows.
+If that happens, complete the approval from the Mac's physical keyboard and
+display. Silent approval requires a user-approved device-management policy and
+is not a Darkmesh setup shortcut. Keep ExpressVPN disconnected until the
+extension reports `activated enabled`, then perform the reconnect test with a
+known plain-network rollback path.
+
 Then verify:
 
 ```bash
