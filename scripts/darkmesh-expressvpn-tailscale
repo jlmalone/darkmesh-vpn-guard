@@ -6,6 +6,10 @@ set -uo pipefail
 EXPRESSVPN_CTL="${EXPRESSVPN_CTL:-/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl}"
 TAILSCALE_APP="${TAILSCALE_APP:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
 DARKMESH_UP="${DARKMESH_UP:-$(command -v darkmesh-up 2>/dev/null || true)}"
+if [[ -z "$DARKMESH_UP" ]]; then
+  SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+  [[ -x "$SCRIPT_DIR/darkmesh-up" ]] && DARKMESH_UP="$SCRIPT_DIR/darkmesh-up"
+fi
 SYSTEM_SETTINGS_URL="x-apple.systempreferences:com.apple.LoginItems-Settings.extension"
 
 # Real transfer-client specifics (app / process / .ini section / API base) load
