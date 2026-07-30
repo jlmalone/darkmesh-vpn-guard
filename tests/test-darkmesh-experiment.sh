@@ -208,12 +208,13 @@ grep -q '"event":"convergence-reset"' "$flap_run/observations.jsonl"
 echo "9. signal interruption runs exact restoration"
 signal="$(new_fixture signal)"
 if run_experiment "$signal" env DARKMESH_EXPERIMENT_TEST_SIGNAL_AFTER_SNAPSHOT=yes \
-  TEST_DELAYED_SPLIT_READ=yes \
+  TEST_DELAYED_SPLIT_READ=yes TEST_RESTORE_COMMAND_WARNING=yes \
   "$ROOT/scripts/darkmesh-experiment" run --profile staged >"$signal/out" 2>&1; then
   fail "signal fixture unexpectedly passed"
 fi
 signal_run="$(ls -1d "$signal/runs"/*)"
 grep -q '"event":"signal"' "$signal_run/observations.jsonl"
+grep -q '"event":"restoration-command".*restore protocol returned nonzero' "$signal_run/observations.jsonl"
 grep -q '"restoration_verified": true' "$signal_run/summary.json"
 [[ ! -f "$signal/state/split-read-pending" ]]
 

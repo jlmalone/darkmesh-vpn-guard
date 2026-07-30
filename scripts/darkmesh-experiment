@@ -630,14 +630,16 @@ restore_split_rules() {
   current="$("$EXPRESSVPN_CTL" --timeout 8 get split-app 2>/dev/null || true)"
   while IFS= read -r entry; do
     [[ "$entry" == bypass:* ]] || continue
-    "$EXPRESSVPN_CTL" --timeout 8 set split-app "remove:${entry#bypass:}" >/dev/null 2>&1 || return 1
+    "$EXPRESSVPN_CTL" --timeout 8 set split-app "remove:${entry#bypass:}" >/dev/null 2>&1 \
+      || observe restoration-command "${CURRENT_CASE:-campaign}" recovery "remove split rule returned nonzero"
   done <<<"$current"
   while IFS= read -r entry; do
     [[ "$entry" == bypass:* ]] || continue
-    "$EXPRESSVPN_CTL" --timeout 8 set split-app "$entry" >/dev/null 2>&1 || return 1
+    "$EXPRESSVPN_CTL" --timeout 8 set split-app "$entry" >/dev/null 2>&1 \
+      || observe restoration-command "${CURRENT_CASE:-campaign}" recovery "add split rule returned nonzero"
   done <<<"$original"
   "$EXPRESSVPN_CTL" --timeout 8 set splittunnel "$original_split" >/dev/null 2>&1 \
-    || return 1
+    || observe restoration-command "${CURRENT_CASE:-campaign}" recovery "restore split mode returned nonzero"
   start="$(now_epoch)"
   while :; do
     if [[ "$("$EXPRESSVPN_CTL" --timeout 8 get split-app 2>/dev/null || true)" == "$original" &&
@@ -649,9 +651,19 @@ restore_split_rules() {
     "$SLEEP" 2
   done
 }
+restore_attempt() {
+  local label="$1"
+  shift
+  "$@" >/dev/null 2>&1 && return 0
+  observe restoration-command "${CURRENT_CASE:-campaign}" recovery "$label returned nonzero"
+  return 0
+}
 tailscale_up_existing() {
   local before output after
   before="$(read_initial state_ts_id)"
+  if tailscale_control_ok && [[ "$(tailscale_identity)" == "$before" ]]; then
+    return 0
+  fi
   if ! output="$("$TAILSCALE_CLI" up 2>&1)"; then
     observe tailscale-up "${CURRENT_CASE:-campaign}" precondition "$output"
     return 1
@@ -662,6 +674,20 @@ tailscale_up_existing() {
   fi
   after="$(tailscale_identity)"
   [[ -n "$before" && "$after" == "$before" ]]
+}
+restoration_exact_now() {
+  [[ "$(vpn_state || true)" == Disconnected ]] &&
+    [[ "$(vpn_protocol)" == "$(read_initial state_protocol)" ]] &&
+    [[ "$(vpn_get region || true)" == "$(read_initial state_region)" ]] &&
+    [[ "$(vpn_get splittunnel || true)" == "$(read_initial state_split)" ]] &&
+    [[ "$("$EXPRESSVPN_CTL" --timeout 8 get split-app 2>/dev/null || true)" == "$(read_initial state_rules)" ]] &&
+    [[ "$(vpn_get networklock || true)" == "$(read_initial state_lock)" ]] &&
+    [[ "$(vpn_get autoconnect || true)" == "$(read_initial state_autoconnect)" ]] &&
+    [[ "$(tailscale_identity)" == "$(read_initial state_ts_id)" ]] &&
+    [[ "$("$TAILSCALE_CLI" debug prefs 2>/dev/null || true)" == "$(read_initial state_ts_prefs)" ]] &&
+    [[ "$("$SYSTEMEXTENSIONSCTL" list 2>/dev/null | grep -Ei 'expressvpn|tailscale' || true)" == "$(read_initial state_extensions)" ]] &&
+    [[ "$(file_value "$VPN_INTENT")" == "$(read_initial state_vpn_intent)" ]] &&
+    [[ "$(file_value "$TRANSFER_INTENT")" == "$(read_initial state_transfer_intent)" ]]
 }
 
 fingerprint() {
@@ -856,21 +882,27 @@ stop_case_deadman() {
 }
 
 restore_campaign() {
-  local ok=yes accept_dns
+  local healthy=no accept_dns
   observe restoration-start campaign recovery "restoring exact initial state"
-  "$DARKMESH_CLI" panic >/dev/null 2>&1 || ok=no
+  restore_attempt "panic" "$DARKMESH_CLI" panic
   "$EXPRESSVPN_CTL" --timeout 10 disconnect >/dev/null 2>&1 || true
-  "$EXPRESSVPN_CTL" --timeout 8 set protocol "$(read_initial state_protocol)" >/dev/null 2>&1 || ok=no
-  "$EXPRESSVPN_CTL" --timeout 8 set region "$(read_initial state_region)" >/dev/null 2>&1 || ok=no
-  restore_split_rules || ok=no
-  "$EXPRESSVPN_CTL" --timeout 8 set networklock "$(read_initial state_lock)" >/dev/null 2>&1 || ok=no
-  "$EXPRESSVPN_CTL" --timeout 8 set autoconnect "$(read_initial state_autoconnect)" >/dev/null 2>&1 || ok=no
+  restore_attempt "restore protocol" "$EXPRESSVPN_CTL" --timeout 8 set protocol "$(read_initial state_protocol)"
+  restore_attempt "restore region" "$EXPRESSVPN_CTL" --timeout 8 set region "$(read_initial state_region)"
+  restore_split_rules \
+    || observe restoration-command campaign recovery "split-rule convergence timed out"
+  restore_attempt "restore Network Lock" "$EXPRESSVPN_CTL" --timeout 8 set networklock "$(read_initial state_lock)"
+  restore_attempt "restore autoconnect" "$EXPRESSVPN_CTL" --timeout 8 set autoconnect "$(read_initial state_autoconnect)"
   accept_dns="$(initial_accept_dns)"
-  [[ "$accept_dns" == unknown ]] || set_tailscale_dns "$accept_dns" || ok=no
-  tailscale_up_existing || ok=no
-  restore_file_value "$VPN_INTENT" "$(read_initial state_vpn_intent)" || ok=no
-  restore_file_value "$TRANSFER_INTENT" "$(read_initial state_transfer_intent)" || ok=no
-  if ! wait_convergence recovery "$RECOVERY_MAX" "$RECOVERY_QUIET" 3 baseline_healthy; then ok=no; fi
+  [[ "$accept_dns" == unknown ]] || set_tailscale_dns "$accept_dns" \
+    || observe restoration-command campaign recovery "restore Tailscale DNS returned nonzero"
+  tailscale_up_existing \
+    || observe restoration-command campaign recovery "restore Tailscale running state returned nonzero"
+  restore_file_value "$VPN_INTENT" "$(read_initial state_vpn_intent)" \
+    || observe restoration-command campaign recovery "restore VPN intent returned nonzero"
+  restore_file_value "$TRANSFER_INTENT" "$(read_initial state_transfer_intent)" \
+    || observe restoration-command campaign recovery "restore transfer intent returned nonzero"
+  wait_convergence recovery "$RECOVERY_MAX" "$RECOVERY_QUIET" 3 baseline_healthy \
+    && healthy=yes
   capture_state "$FINAL"
   FINAL_MATCH=no
   /usr/bin/python3 - "$INITIAL" "$FINAL" <<'PY' >/dev/null 2>&1 && FINAL_MATCH=yes || true
@@ -882,10 +914,13 @@ keys=("state_protocol","state_region","state_split","state_rules","state_lock",
 raise SystemExit(0 if all(a.get(k)==b.get(k) for k in keys)
                  and b.get("state_vpn")=="Disconnected" else 1)
 PY
-  [[ "$FINAL_MATCH" == yes ]] || ok=no
-  RESTORATION_STATUS="$ok"
-  observe restoration-finish campaign recovery "exact_match=$FINAL_MATCH healthy=$ok"
-  [[ "$ok" == yes ]]
+  if [[ "$FINAL_MATCH" == yes && "$healthy" == yes ]]; then
+    RESTORATION_STATUS=yes
+  else
+    RESTORATION_STATUS=no
+  fi
+  observe restoration-finish campaign recovery "exact_match=$FINAL_MATCH healthy=$healthy"
+  [[ "$RESTORATION_STATUS" == yes ]]
 }
 
 CAMPAIGN_RC=1
@@ -1054,22 +1089,31 @@ PY
 recover_case() {
   local accept_dns
   stop_case_deadman
-  "$DARKMESH_CLI" panic >/dev/null 2>&1 || return 1
+  observe restoration-start "$CURRENT_CASE" recovery "restoring exact initial state"
+  restore_attempt "panic" "$DARKMESH_CLI" panic
   "$EXPRESSVPN_CTL" --timeout 10 disconnect >/dev/null 2>&1 || true
-  "$EXPRESSVPN_CTL" --timeout 8 set protocol "$(read_initial state_protocol)" >/dev/null 2>&1 || return 1
-  "$EXPRESSVPN_CTL" --timeout 8 set region "$(read_initial state_region)" >/dev/null 2>&1 || return 1
-  restore_split_rules || return 1
-  "$EXPRESSVPN_CTL" --timeout 8 set networklock "$(read_initial state_lock)" >/dev/null 2>&1 || return 1
-  "$EXPRESSVPN_CTL" --timeout 8 set autoconnect "$(read_initial state_autoconnect)" >/dev/null 2>&1 || return 1
+  restore_attempt "restore protocol" "$EXPRESSVPN_CTL" --timeout 8 set protocol "$(read_initial state_protocol)"
+  restore_attempt "restore region" "$EXPRESSVPN_CTL" --timeout 8 set region "$(read_initial state_region)"
+  restore_split_rules \
+    || observe restoration-command "$CURRENT_CASE" recovery "split-rule convergence timed out"
+  restore_attempt "restore Network Lock" "$EXPRESSVPN_CTL" --timeout 8 set networklock "$(read_initial state_lock)"
+  restore_attempt "restore autoconnect" "$EXPRESSVPN_CTL" --timeout 8 set autoconnect "$(read_initial state_autoconnect)"
   accept_dns="$(initial_accept_dns)"
-  [[ "$accept_dns" == unknown ]] || set_tailscale_dns "$accept_dns" || return 1
-  tailscale_up_existing || return 1
-  wait_convergence recovery "$RECOVERY_MAX" "$RECOVERY_QUIET" 3 baseline_healthy || return 1
-  [[ "$(vpn_protocol)" == "$(read_initial state_protocol)" ]] &&
-    [[ "$(vpn_get region || true)" == "$(read_initial state_region)" ]] &&
-    [[ "$(vpn_get networklock || true)" == "$(read_initial state_lock)" ]] &&
-    [[ "$(vpn_get autoconnect || true)" == "$(read_initial state_autoconnect)" ]] &&
-    [[ "$(tailscale_identity)" == "$(read_initial state_ts_id)" ]]
+  [[ "$accept_dns" == unknown ]] || set_tailscale_dns "$accept_dns" \
+    || observe restoration-command "$CURRENT_CASE" recovery "restore Tailscale DNS returned nonzero"
+  tailscale_up_existing \
+    || observe restoration-command "$CURRENT_CASE" recovery "restore Tailscale running state returned nonzero"
+  restore_file_value "$VPN_INTENT" "$(read_initial state_vpn_intent)" \
+    || observe restoration-command "$CURRENT_CASE" recovery "restore VPN intent returned nonzero"
+  restore_file_value "$TRANSFER_INTENT" "$(read_initial state_transfer_intent)" \
+    || observe restoration-command "$CURRENT_CASE" recovery "restore transfer intent returned nonzero"
+  if wait_convergence recovery "$RECOVERY_MAX" "$RECOVERY_QUIET" 3 baseline_healthy &&
+     restoration_exact_now; then
+    observe restoration-finish "$CURRENT_CASE" recovery "exact_match=yes healthy=yes"
+    return 0
+  fi
+  observe restoration-finish "$CURRENT_CASE" recovery "exact_match=no-or-unhealthy"
+  return 1
 }
 
 run_case() {
