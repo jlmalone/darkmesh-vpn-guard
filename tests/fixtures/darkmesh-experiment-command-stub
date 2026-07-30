@@ -45,10 +45,14 @@ case "$name" in
         fi
         ;;
       "set region") write_state region "${3:?}" ;;
-      "set splittunnel") write_state splittunnel "${3:?}" ;;
+      "set splittunnel")
+        [[ "${TEST_ROOT_GATED_SPLIT:-no}" != yes ]] || exit 127
+        write_state splittunnel "${3:?}"
+        ;;
       "set networklock") write_state networklock "${3:?}" ;;
       "set autoconnect") write_state autoconnect "${3:?}" ;;
       "set split-app")
+        [[ "${TEST_ROOT_GATED_SPLIT:-no}" != yes ]] || exit 127
         value="${3:?}"
         if [[ "$value" == remove:* ]]; then
           target="bypass:${value#remove:}"
@@ -116,7 +120,10 @@ case "$name" in
       panic|captive)
         write_state vpn-intent off
         write_state vpn-state Disconnected
-        [[ "${TEST_RESTORE_FAILURE:-no}" != yes ]] || write_state protocol wireguard
+        if [[ "${TEST_RESTORE_FAILURE:-no}" == yes ||
+              "${TEST_RESTORE_COMMAND_WARNING:-no}" == yes ]]; then
+          write_state protocol wireguard
+        fi
         touch "$state/panic-called"
         ;;
     esac

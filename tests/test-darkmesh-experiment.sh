@@ -146,7 +146,8 @@ test -f "$captive_run/cases/captive-resume.json"
 
 echo "6. full adaptive campaign records all dimensions and exact restoration"
 full="$(new_fixture full)"
-run_experiment "$full" env TEST_UNSUPPORTED_PROTOCOLS=lightwaytcp,lightwayudp \
+run_experiment "$full" env TEST_ROOT_GATED_SPLIT=yes \
+  TEST_UNSUPPORTED_PROTOCOLS=lightwaytcp,lightwayudp \
   "$ROOT/scripts/darkmesh-experiment" run --profile staged >"$full/out"
 run_dir="$(ls -1d "$full/runs"/*)"
 test -f "$run_dir/cases/screen-wireguard-3.json"
@@ -161,10 +162,15 @@ test -f "$run_dir/cases/startup-wireguard-restart.json"
 test -f "$run_dir/cases/repeat-wireguard.json"
 test -f "$run_dir/cases/production-wireguard-reconnect.json"
 test -f "$run_dir/cases/production-wireguard-disconnect.json"
-/usr/bin/python3 - "$run_dir/summary.json" "$run_dir/initial-state.json" "$run_dir/final-restoration.json" <<'PY'
+/usr/bin/python3 - "$run_dir/summary.json" "$run_dir/initial-state.json" \
+  "$run_dir/final-restoration.json" "$run_dir/cases/screen-wireguard-3.json" \
+  "$run_dir/cases/split-wireguard-extension-only.json" <<'PY'
 import json,sys
-s,i,f=map(lambda p:json.load(open(p)),sys.argv[1:])
+s,i,f,screen,split=map(lambda p:json.load(open(p)),sys.argv[1:])
 assert s["restoration_verified"] is True
+assert screen["outcome"] == "PASS"
+assert split["outcome"] == "PRECONDITION"
+assert split["classification"] == "split-routing"
 for key in ("state_protocol","state_region","state_split","state_rules","state_lock",
             "state_autoconnect","state_ts_id","state_ts_prefs","state_extensions",
             "state_vpn_intent","state_transfer_intent"):

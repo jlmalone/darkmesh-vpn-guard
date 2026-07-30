@@ -628,6 +628,10 @@ restore_split_rules() {
   original="$(read_initial state_rules)"
   original_split="$(read_initial state_split)"
   current="$("$EXPRESSVPN_CTL" --timeout 8 get split-app 2>/dev/null || true)"
+  if [[ "$current" == "$original" &&
+        "$("$EXPRESSVPN_CTL" --timeout 8 get splittunnel 2>/dev/null || true)" == "$original_split" ]]; then
+    return 0
+  fi
   while IFS= read -r entry; do
     [[ "$entry" == bypass:* ]] || continue
     "$EXPRESSVPN_CTL" --timeout 8 set split-app "remove:${entry#bypass:}" >/dev/null 2>&1 \
@@ -657,6 +661,11 @@ restore_attempt() {
   "$@" >/dev/null 2>&1 && return 0
   observe restoration-command "${CURRENT_CASE:-campaign}" recovery "$label returned nonzero"
   return 0
+}
+set_vpn_setting_if_needed() {
+  local setting="$1" expected="$2"
+  [[ "$(vpn_get "$setting" || true)" == "$expected" ]] && return 0
+  "$EXPRESSVPN_CTL" --timeout 8 set "$setting" "$expected" >/dev/null 2>&1
 }
 tailscale_up_existing() {
   local before output after
@@ -792,9 +801,21 @@ remove_all_tailscale_rules() {
   done <<<"$current"
 }
 set_split_mode() {
-  local mode="$1" original app="" extension="" entry
+  local mode="$1" original current app="" extension="" entry
+  local has_app=no has_extension=no expected_split=true
   original="$(read_initial state_rules)"
-  remove_all_tailscale_rules
+  current="$("$EXPRESSVPN_CTL" --timeout 8 get split-app 2>/dev/null || true)"
+  [[ "$current" == *Tailscale.app* ]] && has_app=yes
+  [[ "$current" == *io.tailscale.ipn.macsys.network-extension* ]] && has_extension=yes
+  [[ "$mode" == disabled ]] && expected_split=false
+  if [[ "$(vpn_get splittunnel || true)" == "$expected_split" ]]; then
+    case "$mode:$has_app:$has_extension" in
+      both:yes:yes|app-only:yes:no|extension-only:no:yes|neither:no:no|disabled:no:no)
+        return 0
+        ;;
+    esac
+  fi
+  remove_all_tailscale_rules || return 1
   while IFS= read -r entry; do
     [[ "$entry" == bypass:* ]] || continue
     [[ "$entry" == *Tailscale.app* ]] && app="$entry"
@@ -847,11 +868,11 @@ deadman_restore_state() {
   [[ -r "$INITIAL" ]] || return 1
   "$DARKMESH_CLI" panic >/dev/null 2>&1 || true
   "$EXPRESSVPN_CTL" --timeout 10 disconnect >/dev/null 2>&1 || true
-  "$EXPRESSVPN_CTL" --timeout 8 set protocol "$(read_initial state_protocol)" >/dev/null 2>&1 || return 1
-  "$EXPRESSVPN_CTL" --timeout 8 set region "$(read_initial state_region)" >/dev/null 2>&1 || return 1
+  set_vpn_setting_if_needed protocol "$(read_initial state_protocol)" || return 1
+  set_vpn_setting_if_needed region "$(read_initial state_region)" || return 1
   restore_split_rules || return 1
-  "$EXPRESSVPN_CTL" --timeout 8 set networklock "$(read_initial state_lock)" >/dev/null 2>&1 || return 1
-  "$EXPRESSVPN_CTL" --timeout 8 set autoconnect "$(read_initial state_autoconnect)" >/dev/null 2>&1 || return 1
+  set_vpn_setting_if_needed networklock "$(read_initial state_lock)" || return 1
+  set_vpn_setting_if_needed autoconnect "$(read_initial state_autoconnect)" || return 1
   accept_dns="$(initial_accept_dns)"
   [[ "$accept_dns" == unknown ]] || set_tailscale_dns "$accept_dns" || return 1
   tailscale_up_existing || return 1
@@ -886,12 +907,12 @@ restore_campaign() {
   observe restoration-start campaign recovery "restoring exact initial state"
   restore_attempt "panic" "$DARKMESH_CLI" panic
   "$EXPRESSVPN_CTL" --timeout 10 disconnect >/dev/null 2>&1 || true
-  restore_attempt "restore protocol" "$EXPRESSVPN_CTL" --timeout 8 set protocol "$(read_initial state_protocol)"
-  restore_attempt "restore region" "$EXPRESSVPN_CTL" --timeout 8 set region "$(read_initial state_region)"
+  restore_attempt "restore protocol" set_vpn_setting_if_needed protocol "$(read_initial state_protocol)"
+  restore_attempt "restore region" set_vpn_setting_if_needed region "$(read_initial state_region)"
   restore_split_rules \
     || observe restoration-command campaign recovery "split-rule convergence timed out"
-  restore_attempt "restore Network Lock" "$EXPRESSVPN_CTL" --timeout 8 set networklock "$(read_initial state_lock)"
-  restore_attempt "restore autoconnect" "$EXPRESSVPN_CTL" --timeout 8 set autoconnect "$(read_initial state_autoconnect)"
+  restore_attempt "restore Network Lock" set_vpn_setting_if_needed networklock "$(read_initial state_lock)"
+  restore_attempt "restore autoconnect" set_vpn_setting_if_needed autoconnect "$(read_initial state_autoconnect)"
   accept_dns="$(initial_accept_dns)"
   [[ "$accept_dns" == unknown ]] || set_tailscale_dns "$accept_dns" \
     || observe restoration-command campaign recovery "restore Tailscale DNS returned nonzero"
@@ -1092,12 +1113,12 @@ recover_case() {
   observe restoration-start "$CURRENT_CASE" recovery "restoring exact initial state"
   restore_attempt "panic" "$DARKMESH_CLI" panic
   "$EXPRESSVPN_CTL" --timeout 10 disconnect >/dev/null 2>&1 || true
-  restore_attempt "restore protocol" "$EXPRESSVPN_CTL" --timeout 8 set protocol "$(read_initial state_protocol)"
-  restore_attempt "restore region" "$EXPRESSVPN_CTL" --timeout 8 set region "$(read_initial state_region)"
+  restore_attempt "restore protocol" set_vpn_setting_if_needed protocol "$(read_initial state_protocol)"
+  restore_attempt "restore region" set_vpn_setting_if_needed region "$(read_initial state_region)"
   restore_split_rules \
     || observe restoration-command "$CURRENT_CASE" recovery "split-rule convergence timed out"
-  restore_attempt "restore Network Lock" "$EXPRESSVPN_CTL" --timeout 8 set networklock "$(read_initial state_lock)"
-  restore_attempt "restore autoconnect" "$EXPRESSVPN_CTL" --timeout 8 set autoconnect "$(read_initial state_autoconnect)"
+  restore_attempt "restore Network Lock" set_vpn_setting_if_needed networklock "$(read_initial state_lock)"
+  restore_attempt "restore autoconnect" set_vpn_setting_if_needed autoconnect "$(read_initial state_autoconnect)"
   accept_dns="$(initial_accept_dns)"
   [[ "$accept_dns" == unknown ]] || set_tailscale_dns "$accept_dns" \
     || observe restoration-command "$CURRENT_CASE" recovery "restore Tailscale DNS returned nonzero"
@@ -1124,10 +1145,10 @@ run_case() {
   spawn_deadman case "$CASE_DEADMAN"
   for ((cycle=1; cycle<=cycles; cycle++)); do
     contain_transfers || { outcome=PRECONDITION; class=transfer-containment; detail="PF containment unavailable"; break; }
-    "$EXPRESSVPN_CTL" --timeout 8 set networklock false >/dev/null 2>&1 \
-      || { outcome=PRECONDITION; class=privilege; detail="cannot set Network Lock"; break; }
-    "$EXPRESSVPN_CTL" --timeout 8 set autoconnect false >/dev/null 2>&1 \
-      || { outcome=PRECONDITION; class=privilege; detail="cannot set autoconnect"; break; }
+    [[ "$(vpn_get networklock || true)" == false ]] \
+      || { outcome=PRECONDITION; class=privilege; detail="Network Lock must remain off"; break; }
+    [[ "$(vpn_get autoconnect || true)" == false ]] \
+      || { outcome=PRECONDITION; class=privilege; detail="autoconnect must remain off"; break; }
     "$EXPRESSVPN_CTL" --timeout 8 set protocol "$protocol" >/dev/null 2>&1 \
       || { outcome=PRECONDITION; class=connection; detail="protocol unsupported"; break; }
     "$EXPRESSVPN_CTL" --timeout 8 set region "$region" >/dev/null 2>&1 \
@@ -1189,7 +1210,7 @@ run_baseline_case() {
   observe case-start "$id" info "baseline split=$split"
   spawn_deadman case "$CASE_DEADMAN"
   contain_transfers || { outcome=PRECONDITION; class=transfer-containment; detail="PF containment unavailable"; }
-  if [[ "$outcome" == PASS ]]; then
+  if [[ "$outcome" == PASS && "$(vpn_get splittunnel || true)" != "$split" ]]; then
     "$EXPRESSVPN_CTL" --timeout 8 set splittunnel "$split" >/dev/null 2>&1 \
       || { outcome=PRECONDITION; class=split-routing; detail="supported CLI cannot set split tunneling=$split"; }
   fi
