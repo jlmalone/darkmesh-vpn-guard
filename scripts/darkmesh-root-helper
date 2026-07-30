@@ -72,6 +72,29 @@ valid_dns_list() {
   [[ $count -gt 0 ]]
 }
 
+volatile_dns_list() {
+  local list="$1" item second oldifs="$IFS"
+  IFS=' '
+  for item in $list; do
+    case "$item" in
+      100.*)
+        second="${item#100.}"
+        second="${second%%.*}"
+        if [[ "$second" =~ ^[0-9]+$ ]] && (( second >= 64 && second <= 127 )); then
+          IFS="$oldifs"
+          return 0
+        fi
+        ;;
+      fd7a:115c:a1e0:*|FD7A:115C:A1E0:*)
+        IFS="$oldifs"
+        return 0
+        ;;
+    esac
+  done
+  IFS="$oldifs"
+  return 1
+}
+
 journal_value() {
   local key="$1"
   sed -n "s/^${key}=//p" "$JOURNAL" 2>/dev/null | head -1
@@ -79,7 +102,7 @@ journal_value() {
 
 restore_dns() {
   [[ -f "$JOURNAL" ]] || return 0
-  local service mode values
+  local service mode values restored_mode
   service="$(journal_value SERVICE)"
   mode="$(journal_value MODE)"
   values="$(journal_value VALUES)"
@@ -87,17 +110,26 @@ restore_dns() {
 
   if [[ "$mode" == "dhcp" ]]; then
     networksetup -setdnsservers "$service" Empty
+    restored_mode=dhcp
   elif [[ "$mode" == "static" ]] && valid_dns_list "$values"; then
-    # values are validated address tokens; intentional splitting supplies argv.
-    # shellcheck disable=SC2086
-    networksetup -setdnsservers "$service" $values
+    if volatile_dns_list "$values"; then
+      # VPN and tailnet resolvers are runtime-owned. Restoring one after its
+      # tunnel disappears recreates the outage the override just repaired.
+      networksetup -setdnsservers "$service" Empty
+      restored_mode=dhcp-discarded-volatile
+    else
+      # values are validated address tokens; intentional splitting supplies argv.
+      # shellcheck disable=SC2086
+      networksetup -setdnsservers "$service" $values
+      restored_mode=static
+    fi
   else
     log dns-restore "invalid journal: mode/values"
     return 1
   fi
   flush_dns
   rm -f "$JOURNAL"
-  log dns-restore "service=$service mode=$mode"
+  log dns-restore "service=$service mode=$restored_mode"
 }
 
 override_dns() {
@@ -127,7 +159,14 @@ override_dns() {
     else
       values="$(printf '%s\n' "$current" | awk '/^[0-9A-Fa-f:.%]+$/{printf "%s%s", sep, $0; sep=" "}')"
       valid_dns_list "$values" || { log dns-override "refused: cannot snapshot prior DNS"; return 1; }
-      mode=static
+      if volatile_dns_list "$values"; then
+        # A resolver owned by a VPN or tailnet is not durable Wi-Fi state.
+        # Retire to DHCP instead of journaling a future outage.
+        mode=dhcp
+        values=
+      else
+        mode=static
+      fi
     fi
     tmp="${JOURNAL}.tmp.$$"
     {

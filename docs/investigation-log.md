@@ -433,3 +433,25 @@ Server Monitor now renders an active transfer gate as `Transfers blocked`, inclu
 dedicated probe row, and pulls the menu icon off green. Live verification on the
 affected network showed the guard transition to `SAFE`, the PF sidecar transition to
 `pf_kill_active=false`, and the client return to a connected state.
+## 2026-07-29: DNS recovery journal restored a dead VPN resolver
+
+## Symptom
+
+With the commercial VPN disconnected and VPN intent off, ordinary internet
+failed again about ten minutes after each successful panic recovery.
+
+## Evidence
+
+The healthcheck repeatedly logged `dns override restored before probing`,
+immediately followed by failed DNS and end-to-end probes. The active journal
+had captured one resolver in `100.64.0.0/10` as prior static Wi-Fi DNS, while
+the DHCP resolver list was healthy. Each panic replaced the dead resolver with
+DHCP DNS, but the age-based restore later reintroduced the dead saved value.
+
+## Repair
+
+The root helper now classifies VPN and tailnet resolver ranges as volatile.
+It snapshots DHCP mode instead of volatile static DNS, and legacy journals
+containing a volatile resolver retire to DHCP on restore. Focused tests cover
+new journal creation, legacy poisoned-journal retirement, and preservation of
+ordinary static DNS.

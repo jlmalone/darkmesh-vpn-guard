@@ -233,6 +233,13 @@ resolver:
 5. It restores the snapshot when the interface, gateway, or DHCP DNS changes,
    or after the poison disappears.
 
+VPN and tailnet resolvers in `100.64.0.0/10` or
+`fd7a:115c:a1e0::/48` are runtime-owned, not durable network-service
+configuration. The privileged helper never journals them as restorable static
+DNS. If an older journal contains one, `dns-restore` retires the service to
+DHCP instead of putting the dead resolver back. This prevents a recovery loop
+where internet returns temporarily and fails again when the journal ages out.
+
 Install the permanent privilege once per machine:
 
 ```bash
