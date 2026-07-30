@@ -147,6 +147,14 @@ the CLI cannot upgrade it to a direct path. The experiment does not run
 `tailscale login`, accept an authentication URL, create a node, change
 split-tunnel rules, or start a transfer.
 
+After Lightway connects, the experiment waits for an initial 30-second route
+settle, then probes the named peer repeatedly for up to 90 additional seconds.
+Each failed probe is timestamped, and ordinary internet plus the VPN connection
+are rechecked throughout the convergence window. This distinguishes slow
+control-plane or relay recovery from a persistent block. The detached recovery
+deadline is five minutes so it remains outside the complete bounded observation
+window.
+
 Cleanup is unconditional on success, failure, signal, and timeout. It leaves
 VPN intent off, ExpressVPN disconnected, Network Lock and autoconnect off,
 restores the previously selected VPN protocol, brings Tailscale up using its

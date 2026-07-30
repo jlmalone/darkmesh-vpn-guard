@@ -45,6 +45,14 @@ if [[ "${TEST_FAIL_TAILSCALE_WITH_VPN:-no}" == yes && "$1" == ping ]] \
   && [[ "$(grep "^darkmesh " "${TEST_CALLS:?}" | tail -1)" == "darkmesh up" ]]; then
   exit 1
 fi
+if [[ -n "${TEST_TAILSCALE_RECOVER_AFTER:-}" && "$1" == ping ]] \
+  && [[ "$(grep "^darkmesh " "${TEST_CALLS:?}" | tail -1)" == "darkmesh up" ]]; then
+  count=0
+  [[ -r "${TEST_CALLS}.ping-count" ]] && count="$(cat "${TEST_CALLS}.ping-count")"
+  count=$((count + 1))
+  printf "%s\n" "$count" >"${TEST_CALLS}.ping-count"
+  ((count > TEST_TAILSCALE_RECOVER_AFTER)) || exit 1
+fi
 if [[ "${TEST_DERP_PONG_NONZERO:-no}" == yes && "$1" == ping ]]; then
   printf "pong from peer.example via DERP(example) in 12ms\n"
   exit 1
@@ -76,6 +84,7 @@ run_trial() {
   DARKMESH_TRIAL_LOG="$case_dir/log" DARKMESH_TRIAL_RESULT="$case_dir/result" \
   DARKMESH_TRIAL_LOCK="$case_dir/lock" DARKMESH_TRIAL_DISABLE_DEADMAN=yes \
   DARKMESH_TRIAL_CONNECT_TIMEOUT=2 DARKMESH_TRIAL_SETTLE_SECONDS=0 \
+  DARKMESH_TRIAL_TAILSCALE_TIMEOUT=10 DARKMESH_TRIAL_PROBE_INTERVAL=5 \
   "$@" "$ROOT/scripts/darkmesh-coexistence-trial" --mode "$trial_mode" \
     --peer peer.example --ssh-target peer-alias
 }
@@ -99,11 +108,16 @@ if run_trial "$FAILURE" bypass env TEST_FAIL_TAILSCALE_WITH_VPN=yes; then
   echo "expected coexistence failure" >&2
   exit 1
 fi
-grep -q 'FAIL: the Tailscale peer failed with Lightway connected' "$FAILURE/log"
+grep -q 'FAIL: the Tailscale peer did not converge within 10s' "$FAILURE/log"
 grep -q 'DIAGNOSIS: the configured ExpressVPN bypass did not preserve the Tailscale data path' "$FAILURE/log"
 grep -q 'finished; experiment_rc=1; internet=yes; dns=yes; tailscale_peer=yes; vpn=off; split_rules_restored=yes' "$FAILURE/result"
 [[ "$(grep -c '^darkmesh panic$' "$FAILURE/calls")" -eq 2 ]]
 grep -q '^tailscale up$' "$FAILURE/calls"
+
+DELAYED="$TMP/delayed"
+run_trial "$DELAYED" bypass env TEST_TAILSCALE_RECOVER_AFTER=2
+grep -q 'Tailscale peer converged after 10s of observation' "$DELAYED/log"
+grep -q 'finished; experiment_rc=0; internet=yes; dns=yes' "$DELAYED/result"
 
 DEADMAN="$TMP/deadman"
 mkdir -p "$DEADMAN"

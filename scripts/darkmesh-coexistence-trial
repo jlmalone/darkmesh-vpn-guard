@@ -22,8 +22,10 @@ LOG="${DARKMESH_TRIAL_LOG:-/tmp/darkmesh-coexistence-trial.log}"
 RESULT="${DARKMESH_TRIAL_RESULT:-/tmp/darkmesh-coexistence-trial-result}"
 LOCK="${DARKMESH_TRIAL_LOCK:-${TMPDIR:-/tmp}/darkmesh-coexistence-trial.lock}"
 CONNECT_TIMEOUT="${DARKMESH_TRIAL_CONNECT_TIMEOUT:-75}"
-SETTLE_SECONDS="${DARKMESH_TRIAL_SETTLE_SECONDS:-20}"
-DEADMAN_SECONDS="${DARKMESH_TRIAL_DEADMAN_SECONDS:-180}"
+SETTLE_SECONDS="${DARKMESH_TRIAL_SETTLE_SECONDS:-30}"
+TAILSCALE_TIMEOUT="${DARKMESH_TRIAL_TAILSCALE_TIMEOUT:-90}"
+PROBE_INTERVAL="${DARKMESH_TRIAL_PROBE_INTERVAL:-5}"
+DEADMAN_SECONDS="${DARKMESH_TRIAL_DEADMAN_SECONDS:-300}"
 
 mode="bypass"
 peer=""
@@ -53,6 +55,8 @@ Modes:
               restore the exact entries during every cleanup path
 
 Performs one bounded full-session reset and Lightway TCP coexistence test.
+After Lightway connects, it observes Tailscale convergence for up to 90 seconds
+instead of judging the result from one immediate probe.
 It always finishes with ExpressVPN disconnected, VPN intent off, Tailscale
 brought up using its existing identity, and ordinary DNS/internet checked.
 
@@ -69,9 +73,11 @@ done
 [[ "$mode" == bypass || "$mode" == through-vpn ]] \
   || { echo "ERROR: --mode must be bypass or through-vpn" >&2; exit 2; }
 
-for seconds in "$CONNECT_TIMEOUT" "$SETTLE_SECONDS" "$DEADMAN_SECONDS"; do
+for seconds in "$CONNECT_TIMEOUT" "$SETTLE_SECONDS" "$TAILSCALE_TIMEOUT" \
+  "$PROBE_INTERVAL" "$DEADMAN_SECONDS"; do
   [[ "$seconds" =~ ^[0-9]+$ ]] || { echo "ERROR: trial timeouts must be non-negative integers" >&2; exit 2; }
 done
+((PROBE_INTERVAL > 0)) || { echo "ERROR: probe interval must be greater than zero" >&2; exit 2; }
 
 safe_token() {
   [[ -n "$1" && "$1" != -* && "$1" != *$'\n'* && "$1" != *$'\r'* ]]
@@ -272,12 +278,29 @@ done
 [[ "$connected" == yes ]] || { log "ERROR: ExpressVPN did not connect"; exit 1; }
 "$SLEEP" "$SETTLE_SECONDS"
 
-log "phase 5: test VPN internet, DNS, Tailscale peer, and optional SSH"
+log "phase 5: test internet and DNS, then observe Tailscale for up to ${TAILSCALE_TIMEOUT}s"
 internet_ok || { log "FAIL: ordinary internet failed with Lightway connected"; exit 1; }
 dns_ok || { log "FAIL: DNS failed with Lightway connected"; exit 1; }
-tailscale_peer_ok || {
-  log "FAIL: the Tailscale peer failed with Lightway connected"
-  log "DIAGNOSIS: the configured ExpressVPN bypass did not preserve the Tailscale data path"
+peer_ready=no
+for ((probe_elapsed=0; probe_elapsed<=TAILSCALE_TIMEOUT; probe_elapsed+=PROBE_INTERVAL)); do
+  if tailscale_peer_ok; then
+    peer_ready=yes
+    log "Tailscale peer converged after ${probe_elapsed}s of observation"
+    break
+  fi
+  log "Tailscale peer not ready at +${probe_elapsed}s"
+  [[ "$(vpn_state)" == Connected ]] \
+    || { log "FAIL: ExpressVPN disconnected during Tailscale convergence"; exit 1; }
+  internet_ok || { log "FAIL: ordinary internet failed during Tailscale convergence"; exit 1; }
+  ((probe_elapsed < TAILSCALE_TIMEOUT)) && "$SLEEP" "$PROBE_INTERVAL"
+done
+[[ "$peer_ready" == yes ]] || {
+  log "FAIL: the Tailscale peer did not converge within ${TAILSCALE_TIMEOUT}s"
+  if [[ "$mode" == bypass ]]; then
+    log "DIAGNOSIS: the configured ExpressVPN bypass did not preserve the Tailscale data path"
+  else
+    log "DIAGNOSIS: routing Tailscale through Lightway did not preserve the Tailscale data path"
+  fi
   exit 1
 }
 if [[ -n "$ssh_target" ]]; then
