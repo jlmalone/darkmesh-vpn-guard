@@ -313,24 +313,28 @@ PY
 }
 
 guided_start() {
-  local -a common=()
   local answer run_rc=0
-  [[ "$CONFIG" == "$HOME/.config/darkmesh/experiment.conf" ]] \
-    || common+=(--config "$CONFIG")
-  [[ "$CAPTURE_PATH_METADATA" != yes ]] || common+=(--capture-path-metadata)
 
   configure_private_targets
   printf '\nExperiment plan:\n'
   "$0" plan --profile staged
   printf '\nPausing transfers and checking every precondition.\n'
   "$DARKMESH_TRANSFER" pause
-  "$0" preflight "${common[@]}"
+  if [[ "$CAPTURE_PATH_METADATA" == yes ]]; then
+    "$0" preflight --config "$CONFIG" --capture-path-metadata
+  else
+    "$0" preflight --config "$CONFIG"
+  fi
   printf '\nThis will now change VPN and Tailscale state on this Mac.\n'
   printf 'Type RUN STAGED EXPERIMENT to continue: '
   IFS= read -r answer || die "confirmation input ended"
   [[ "$answer" == "RUN STAGED EXPERIMENT" ]] || die "live campaign cancelled"
   printf '\nStarting staged campaign. Its deadmen will attempt exact restoration.\n'
-  "$0" run --profile staged "${common[@]}" || run_rc=$?
+  if [[ "$CAPTURE_PATH_METADATA" == yes ]]; then
+    "$0" run --profile staged --config "$CONFIG" --capture-path-metadata || run_rc=$?
+  else
+    "$0" run --profile staged --config "$CONFIG" || run_rc=$?
+  fi
   printf '\nLatest report:\n'
   "$0" report || true
   return "$run_rc"

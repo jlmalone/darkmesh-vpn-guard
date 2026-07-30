@@ -263,4 +263,19 @@ fi
 grep -q 'live campaign cancelled' "$cancelled/out"
 ! grep -q '^expressvpnctl --timeout 8 connect' "$cancelled/state/calls"
 
+echo "16. guided start supports the default config path under nounset"
+default_home="$TMP/default-home"
+default_fixture="$(new_fixture default-config)"
+mkdir -p "$default_home/.config/darkmesh"
+cp "$guided/config" "$default_home/.config/darkmesh/experiment.conf"
+chmod 600 "$default_home/.config/darkmesh/experiment.conf"
+if printf '%s\n' 'not approved' |
+  run_experiment "$default_fixture" env HOME="$default_home" \
+    DARKMESH_EXPERIMENT_CONFIG="$default_home/.config/darkmesh/experiment.conf" \
+    "$ROOT/scripts/darkmesh-experiment" start >"$default_fixture/default.out" 2>&1; then
+  fail "default-config guided start ran without exact confirmation"
+fi
+grep -q 'live campaign cancelled' "$default_fixture/default.out"
+! grep -q 'unbound variable' "$default_fixture/default.out"
+
 echo "darkmesh experiment tests passed"
