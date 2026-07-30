@@ -38,6 +38,10 @@ if [[ "${TEST_FAIL_TAILSCALE_WITH_VPN:-no}" == yes && "$1" == ping ]] \
   && [[ "$(grep "^darkmesh " "${TEST_CALLS:?}" | tail -1)" == "darkmesh up" ]]; then
   exit 1
 fi
+if [[ "${TEST_DERP_PONG_NONZERO:-no}" == yes && "$1" == ping ]]; then
+  printf "pong from peer.example via DERP(example) in 12ms\n"
+  exit 1
+fi
 exit 0
 '
 make_stub darkmesh '
@@ -74,6 +78,10 @@ grep -q 'finished; experiment_rc=0; internet=yes; dns=yes; tailscale_peer=yes; v
 grep -q '^ctl --timeout 8 background disable$' "$SUCCESS/calls"
 grep -q '^ctl --timeout 8 set protocol lightwaytcp$' "$SUCCESS/calls"
 grep -q '^ssh -o BatchMode=yes -o ConnectTimeout=10 peer-alias nice -n 19 true$' "$SUCCESS/calls"
+
+DERP="$TMP/derp"
+run_trial "$DERP" env TEST_DERP_PONG_NONZERO=yes
+grep -q 'finished; experiment_rc=0; internet=yes; dns=yes; tailscale_peer=yes; vpn=off' "$DERP/result"
 
 FAILURE="$TMP/failure"
 if run_trial "$FAILURE" env TEST_FAIL_TAILSCALE_WITH_VPN=yes; then

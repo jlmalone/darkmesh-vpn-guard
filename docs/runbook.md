@@ -142,8 +142,10 @@ darkmesh coexistence-trial --peer <tailnet-host-or-IP> \
 The experiment performs one full ExpressVPN application-session recycle,
 brings up the existing Tailscale identity first, selects Lightway TCP, then
 tests ordinary internet, DNS, the named Tailscale peer, and optional private
-SSH. It does not run `tailscale login`, accept an authentication URL, create a
-node, change split-tunnel rules, or start a transfer.
+SSH. An authenticated Tailscale relay pong counts as peer reachability even if
+the CLI cannot upgrade it to a direct path. The experiment does not run
+`tailscale login`, accept an authentication URL, create a node, change
+split-tunnel rules, or start a transfer.
 
 Cleanup is unconditional on success, failure, signal, and timeout. It leaves
 VPN intent off, ExpressVPN disconnected, Network Lock and autoconnect off,

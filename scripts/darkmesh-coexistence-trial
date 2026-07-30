@@ -98,7 +98,13 @@ dns_ok() {
   "$HOST" -W 4 example.com >/dev/null 2>&1
 }
 tailscale_peer_ok() {
-  "$TAILSCALE_CLI" ping --c 1 "$peer" >/dev/null 2>&1
+  local output
+  if output="$("$TAILSCALE_CLI" ping --c 1 "$peer" 2>&1)"; then
+    return 0
+  fi
+  # tailscale ping can print a valid DERP pong, then exit nonzero only because
+  # it did not upgrade that authenticated relay path to a direct connection.
+  printf '%s\n' "$output" | grep -q '^pong from '
 }
 tailscale_up_existing() {
   local output
