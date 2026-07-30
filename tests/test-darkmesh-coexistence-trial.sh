@@ -23,11 +23,14 @@ case "$*" in
   *"get connectionstate"*)
     if [[ "$(grep "^darkmesh " "${TEST_CALLS:?}" | tail -1)" == "darkmesh panic" ]]; then
       printf "Disconnected\n"
+    elif [[ "${TEST_VPN_NEVER_CONNECTS:-no}" == yes ]]; then
+      printf "Connecting\n"
     else
       printf "Connected\n"
     fi
     ;;
   *"get protocol"*) printf "lightwaytcp\n" ;;
+  *"get region"*) printf "smart\n" ;;
   *"get splittunnel"*) printf "true\n" ;;
   *"get split-app"*) cat "${TEST_SPLIT_STATE:?}" ;;
   *"set split-app remove:"*)
@@ -142,5 +145,13 @@ UDP="$TMP/udp"
 run_trial "$UDP" bypass lightwayudp env
 grep -q 'set protocol lightwayudp' "$UDP/calls"
 grep -q 'PASS: protocol=lightwayudp' "$UDP/log"
+
+NO_CONNECT="$TMP/no-connect"
+if run_trial "$NO_CONNECT" bypass lightwayudp env TEST_VPN_NEVER_CONNECTS=yes; then
+  echo "expected VPN connection timeout" >&2
+  exit 1
+fi
+grep -q 'did not connect (state=Connecting protocol=lightwayudp region=smart)' "$NO_CONNECT/log"
+grep -q 'finished; experiment_rc=1; internet=yes; dns=yes' "$NO_CONNECT/result"
 
 echo "darkmesh coexistence trial tests passed"

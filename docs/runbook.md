@@ -195,6 +195,11 @@ bounded Lightway test, and restores and verifies both entries during normal
 cleanup and deadman recovery. It does not alter the separate private tailnet
 address-range bypasses.
 
+The same 2026-07-29 investigation tested this mode with Lightway TCP through
+the complete convergence window. Tailscale did not regain its control-plane,
+relay, peer, or SSH path while ExpressVPN remained connected. Disconnecting
+ExpressVPN restored the paths and the original split rules.
+
 Select either Lightway transport explicitly:
 
 ```bash
@@ -205,6 +210,12 @@ darkmesh coexistence-trial --protocol lightwayudp --mode bypass \
 The bounded tool intentionally permits only `lightwaytcp` and `lightwayudp`.
 It never tests or persists OpenVPN. Cleanup restores the protocol selected
 before the experiment.
+
+Lightway UDP was also attempted against the then-selected VPN region. ExpressVPN
+14.1.0 remained in its connection sequence and did not reach `Connected` within
+75 seconds, so that run never reached a Tailscale coexistence test. This is a
+VPN transport or region connection failure, distinct from the verified
+Lightway TCP split-tunnel rejection.
 
 ## Why The Client May Get "Stuck"
 

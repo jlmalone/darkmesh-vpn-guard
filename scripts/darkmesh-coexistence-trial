@@ -283,7 +283,12 @@ for ((elapsed=0; elapsed<CONNECT_TIMEOUT; elapsed+=2)); do
   if [[ "$(vpn_state)" == Connected ]]; then connected=yes; break; fi
   "$SLEEP" 2
 done
-[[ "$connected" == yes ]] || { log "ERROR: ExpressVPN did not connect"; exit 1; }
+if [[ "$connected" != yes ]]; then
+  final_vpn_state="$(vpn_state || echo unknown)"
+  final_region="$("$EXPRESSVPN_CTL" --timeout 3 get region 2>/dev/null | head -1)"
+  log "ERROR: ExpressVPN did not connect (state=${final_vpn_state:-unknown} protocol=$protocol region=${final_region:-unknown})"
+  exit 1
+fi
 "$SLEEP" "$SETTLE_SECONDS"
 
 log "phase 5: test internet and DNS, then observe Tailscale for up to ${TAILSCALE_TIMEOUT}s"
