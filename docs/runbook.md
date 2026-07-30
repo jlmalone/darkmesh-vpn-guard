@@ -203,7 +203,9 @@ fingerprints:
 
 Any fingerprint change resets the relevant stability counter. Independent case
 and campaign deadmen request the same recovery. A failed case recovery stops
-the campaign.
+the campaign. Exact split-rule restoration also waits for bounded ExpressVPN
+read-back convergence instead of treating asynchronous preference propagation
+as an immediate restoration failure.
 
 Evidence is stored under
 `~/.local/share/darkmesh/experiments/<timestamp>-<pid>/` with mode `0700`.

@@ -25,7 +25,14 @@ case "$name" in
       "get splittunnel") read_state splittunnel ;;
       "get networklock") read_state networklock ;;
       "get autoconnect") read_state autoconnect ;;
-      "get split-app") cat "$state/split-rules" ;;
+      "get split-app")
+        if [[ "${TEST_DELAYED_SPLIT_READ:-no}" == yes && -f "$state/split-read-pending" ]]; then
+          rm -f "$state/split-read-pending"
+          printf 'pending\n'
+        else
+          cat "$state/split-rules"
+        fi
+        ;;
       "set protocol")
         if [[ "${TEST_RESTORE_FAILURE:-no}" == yes &&
               -f "$state/panic-called" && "${3:-}" == lightwaytcp ]]; then
@@ -47,6 +54,7 @@ case "$name" in
           grep -qxF "$value" "$state/split-rules" ||
             printf '%s\n' "$value" >>"$state/split-rules"
         fi
+        [[ "${TEST_DELAYED_SPLIT_READ:-no}" != yes ]] || touch "$state/split-read-pending"
         ;;
       "disconnect ")
         write_state vpn-state Disconnected

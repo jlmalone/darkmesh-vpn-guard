@@ -40,6 +40,7 @@ VPN_INTENT="${DARKMESH_VPN_INTENT:-$HOME/.config/darkmesh/vpn-desired}"
 TRANSFER_INTENT="${DARKMESH_TRANSFER_INTENT:-$HOME/.config/darkmesh/transfer-desired}"
 PF_SIDECAR="${DARKMESH_PF_SIDECAR:-/tmp/darkmesh-pf.json}"
 PF_SIDECAR_MAX_AGE="${DARKMESH_EXPERIMENT_PF_MAX_AGE:-120}"
+SPLIT_RESTORE_MAX="${DARKMESH_EXPERIMENT_SPLIT_RESTORE_MAX:-30}"
 
 BASELINE_MAX="${DARKMESH_EXPERIMENT_BASELINE_MAX:-180}"
 BASELINE_QUIET="${DARKMESH_EXPERIMENT_BASELINE_QUIET:-15}"
@@ -136,6 +137,8 @@ for value in "$BASELINE_MAX" "$BASELINE_QUIET" "$CONNECT_MAX" "$STABILIZE_MIN" \
   [[ "$value" =~ ^[0-9]+$ ]] || die "experiment timing values must be non-negative integers"
 done
 ((SAMPLE_INTERVAL > 0)) || die "sample interval must be greater than zero"
+[[ "$SPLIT_RESTORE_MAX" =~ ^[0-9]+$ ]] \
+  || die "split restore maximum must be a non-negative integer"
 
 PEER_A_ADDRESS=""
 PEER_A_SSH=""
@@ -621,8 +624,9 @@ print(m.group(1).lower() if m else "unknown")
 PY
 }
 restore_split_rules() {
-  local original current entry
+  local original original_split current entry start now
   original="$(read_initial state_rules)"
+  original_split="$(read_initial state_split)"
   current="$("$EXPRESSVPN_CTL" --timeout 8 get split-app 2>/dev/null || true)"
   while IFS= read -r entry; do
     [[ "$entry" == bypass:* ]] || continue
@@ -632,8 +636,18 @@ restore_split_rules() {
     [[ "$entry" == bypass:* ]] || continue
     "$EXPRESSVPN_CTL" --timeout 8 set split-app "$entry" >/dev/null 2>&1 || return 1
   done <<<"$original"
-  "$EXPRESSVPN_CTL" --timeout 8 set splittunnel "$(read_initial state_split)" >/dev/null 2>&1
-  [[ "$("$EXPRESSVPN_CTL" --timeout 8 get split-app 2>/dev/null || true)" == "$original" ]]
+  "$EXPRESSVPN_CTL" --timeout 8 set splittunnel "$original_split" >/dev/null 2>&1 \
+    || return 1
+  start="$(now_epoch)"
+  while :; do
+    if [[ "$("$EXPRESSVPN_CTL" --timeout 8 get split-app 2>/dev/null || true)" == "$original" &&
+          "$("$EXPRESSVPN_CTL" --timeout 8 get splittunnel 2>/dev/null || true)" == "$original_split" ]]; then
+      return 0
+    fi
+    now="$(now_epoch)"
+    ((now - start < SPLIT_RESTORE_MAX)) || return 1
+    "$SLEEP" 2
+  done
 }
 tailscale_up_existing() {
   local before output after
