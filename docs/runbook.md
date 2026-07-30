@@ -173,6 +173,19 @@ A separate bounded experiment may test Tailscale through the VPN rather than as
 a bypassed app; it must preserve the existing Tailscale identity and retain the
 same unconditional plain-network rollback.
 
+The follow-up mode tests that alternative without making it persistent:
+
+```bash
+darkmesh coexistence-trial --mode through-vpn \
+  --peer <tailnet-host-or-IP> --ssh-target <private-ssh-alias>
+```
+
+This mode backs up the exact two Tailscale app-bypass entries, temporarily
+removes only those entries while ExpressVPN is disconnected, performs the
+bounded Lightway test, and restores and verifies both entries during normal
+cleanup and deadman recovery. It does not alter the separate private tailnet
+address-range bypasses.
+
 ## Why The Client May Get "Stuck"
 
 The transfer-client binding is intentionally fail-closed.

@@ -29,7 +29,14 @@ case "$*" in
     ;;
   *"get protocol"*) printf "lightwaytcp\n" ;;
   *"get splittunnel"*) printf "true\n" ;;
-  *"get split-app"*) printf "bypass:/Applications/Tailscale.app/Contents/MacOS/Tailscale\nbypass:/Library/SystemExtensions/example/io.tailscale.ipn.macsys.network-extension.systemextension/Contents/MacOS/io.tailscale.ipn.macsys.network-extension\n" ;;
+  *"get split-app"*) cat "${TEST_SPLIT_STATE:?}" ;;
+  *"set split-app remove:"*)
+    : >"${TEST_SPLIT_STATE:?}"
+    ;;
+  *"set split-app bypass:"*)
+    entry="${!#}"
+    grep -qxF "$entry" "${TEST_SPLIT_STATE:?}" || printf "%s\n" "$entry" >>"${TEST_SPLIT_STATE:?}"
+    ;;
 esac
 '
 make_stub tailscale '
@@ -57,22 +64,26 @@ make_stub sleep 'exit 0'
 
 run_trial() {
   local case_dir="$1"
-  shift
+  local trial_mode="$2"
+  shift 2
   mkdir -p "$case_dir"
+  printf "bypass:/Applications/Tailscale.app/Contents/MacOS/Tailscale\nbypass:/Library/SystemExtensions/example/io.tailscale.ipn.macsys.network-extension.systemextension/Contents/MacOS/io.tailscale.ipn.macsys.network-extension\n" >"$case_dir/split-state"
   TEST_CALLS="$case_dir/calls" \
+  TEST_SPLIT_STATE="$case_dir/split-state" \
   EXPRESSVPN_CTL="$BIN/expressvpnctl" TAILSCALE_CLI="$BIN/tailscale" \
   DARKMESH_CLI="$BIN/darkmesh" CURL="$BIN/curl" HOST="$BIN/host" \
   OPEN_CMD="$BIN/open" OSASCRIPT="$BIN/osascript" SSH="$BIN/ssh" SLEEP="$BIN/sleep" \
   DARKMESH_TRIAL_LOG="$case_dir/log" DARKMESH_TRIAL_RESULT="$case_dir/result" \
   DARKMESH_TRIAL_LOCK="$case_dir/lock" DARKMESH_TRIAL_DISABLE_DEADMAN=yes \
   DARKMESH_TRIAL_CONNECT_TIMEOUT=2 DARKMESH_TRIAL_SETTLE_SECONDS=0 \
-  "$@" "$ROOT/scripts/darkmesh-coexistence-trial" --peer peer.example --ssh-target peer-alias
+  "$@" "$ROOT/scripts/darkmesh-coexistence-trial" --mode "$trial_mode" \
+    --peer peer.example --ssh-target peer-alias
 }
 
 SUCCESS="$TMP/success"
-run_trial "$SUCCESS" env
+run_trial "$SUCCESS" bypass env
 grep -q 'PASS: Lightway TCP' "$SUCCESS/log"
-grep -q 'finished; experiment_rc=0; internet=yes; dns=yes; tailscale_peer=yes; vpn=off' "$SUCCESS/result"
+grep -q 'finished; experiment_rc=0; internet=yes; dns=yes; tailscale_peer=yes; vpn=off; split_rules_restored=yes' "$SUCCESS/result"
 [[ "$(grep -c '^darkmesh panic$' "$SUCCESS/calls")" -eq 2 ]]
 [[ "$(tail -1 "$SUCCESS/calls")" == "tailscale ping --c 1 peer.example" ]]
 grep -q '^ctl --timeout 8 background disable$' "$SUCCESS/calls"
@@ -80,28 +91,35 @@ grep -q '^ctl --timeout 8 set protocol lightwaytcp$' "$SUCCESS/calls"
 grep -q '^ssh -o BatchMode=yes -o ConnectTimeout=10 peer-alias nice -n 19 true$' "$SUCCESS/calls"
 
 DERP="$TMP/derp"
-run_trial "$DERP" env TEST_DERP_PONG_NONZERO=yes
-grep -q 'finished; experiment_rc=0; internet=yes; dns=yes; tailscale_peer=yes; vpn=off' "$DERP/result"
+run_trial "$DERP" bypass env TEST_DERP_PONG_NONZERO=yes
+grep -q 'finished; experiment_rc=0; internet=yes; dns=yes; tailscale_peer=yes; vpn=off; split_rules_restored=yes' "$DERP/result"
 
 FAILURE="$TMP/failure"
-if run_trial "$FAILURE" env TEST_FAIL_TAILSCALE_WITH_VPN=yes; then
+if run_trial "$FAILURE" bypass env TEST_FAIL_TAILSCALE_WITH_VPN=yes; then
   echo "expected coexistence failure" >&2
   exit 1
 fi
 grep -q 'FAIL: the Tailscale peer failed with Lightway connected' "$FAILURE/log"
 grep -q 'DIAGNOSIS: the configured ExpressVPN bypass did not preserve the Tailscale data path' "$FAILURE/log"
-grep -q 'finished; experiment_rc=1; internet=yes; dns=yes; tailscale_peer=yes; vpn=off' "$FAILURE/result"
+grep -q 'finished; experiment_rc=1; internet=yes; dns=yes; tailscale_peer=yes; vpn=off; split_rules_restored=yes' "$FAILURE/result"
 [[ "$(grep -c '^darkmesh panic$' "$FAILURE/calls")" -eq 2 ]]
 grep -q '^tailscale up$' "$FAILURE/calls"
 
 DEADMAN="$TMP/deadman"
 mkdir -p "$DEADMAN"
-if ! run_trial "$DEADMAN" env DARKMESH_TRIAL_DISABLE_DEADMAN=no \
+if ! run_trial "$DEADMAN" bypass env DARKMESH_TRIAL_DISABLE_DEADMAN=no \
   DEADMAN_SLEEP=/bin/sleep DARKMESH_TRIAL_DEADMAN_SECONDS=30 \
   >"$DEADMAN/stdout" 2>"$DEADMAN/stderr"; then
   echo "expected deadman-cancellation run to pass" >&2
   exit 1
 fi
 ! grep -q 'Terminated' "$DEADMAN/stderr"
+
+THROUGH="$TMP/through"
+run_trial "$THROUGH" through-vpn env
+grep -q 'PASS: Lightway TCP.*mode=through-vpn' "$THROUGH/log"
+[[ "$(grep -c 'set split-app remove:' "$THROUGH/calls")" -eq 2 ]]
+grep -q 'bypass:/Applications/Tailscale.app/Contents/MacOS/Tailscale' "$THROUGH/split-state"
+grep -q 'bypass:.*io.tailscale.ipn.macsys.network-extension' "$THROUGH/split-state"
 
 echo "darkmesh coexistence trial tests passed"

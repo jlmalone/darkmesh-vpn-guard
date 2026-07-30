@@ -25,10 +25,15 @@ CONNECT_TIMEOUT="${DARKMESH_TRIAL_CONNECT_TIMEOUT:-75}"
 SETTLE_SECONDS="${DARKMESH_TRIAL_SETTLE_SECONDS:-20}"
 DEADMAN_SECONDS="${DARKMESH_TRIAL_DEADMAN_SECONDS:-180}"
 
+mode="bypass"
 peer=""
 ssh_target=""
 while (($#)); do
   case "$1" in
+    --mode)
+      (($# >= 2)) || { echo "ERROR: --mode requires a value" >&2; exit 2; }
+      mode="$2"; shift 2
+      ;;
     --peer)
       (($# >= 2)) || { echo "ERROR: --peer requires a value" >&2; exit 2; }
       peer="$2"; shift 2
@@ -39,7 +44,13 @@ while (($#)); do
       ;;
     -h|--help)
       cat <<'EOF'
-Usage: darkmesh coexistence-trial --peer <tailnet-host-or-IP> [--ssh-target <ssh-alias>]
+Usage: darkmesh coexistence-trial [--mode bypass|through-vpn]
+       --peer <tailnet-host-or-IP> [--ssh-target <ssh-alias>]
+
+Modes:
+  bypass      test the configured Tailscale app bypass (default)
+  through-vpn temporarily remove only the Tailscale app bypasses, test, then
+              restore the exact entries during every cleanup path
 
 Performs one bounded full-session reset and Lightway TCP coexistence test.
 It always finishes with ExpressVPN disconnected, VPN intent off, Tailscale
@@ -54,6 +65,9 @@ EOF
     *) printf 'unknown argument: %s\n' "$1" >&2; exit 2 ;;
   esac
 done
+
+[[ "$mode" == bypass || "$mode" == through-vpn ]] \
+  || { echo "ERROR: --mode must be bypass or through-vpn" >&2; exit 2; }
 
 for seconds in "$CONNECT_TIMEOUT" "$SETTLE_SECONDS" "$DEADMAN_SECONDS"; do
   [[ "$seconds" =~ ^[0-9]+$ ]] || { echo "ERROR: trial timeouts must be non-negative integers" >&2; exit 2; }
@@ -121,8 +135,21 @@ tailscale_up_existing() {
 }
 
 original_protocol=""
+declare -a tailscale_bypass_entries=()
 deadman_pid=""
 cleaning=no
+restore_tailscale_bypasses() {
+  local entry current restored=yes
+  ((${#tailscale_bypass_entries[@]})) || return 0
+  for entry in "${tailscale_bypass_entries[@]}"; do
+    "$EXPRESSVPN_CTL" --timeout 8 set split-app "$entry" >>"$LOG" 2>&1 || restored=no
+  done
+  current="$("$EXPRESSVPN_CTL" --timeout 8 get split-app 2>/dev/null || true)"
+  for entry in "${tailscale_bypass_entries[@]}"; do
+    printf '%s\n' "$current" | grep -qxF "$entry" || restored=no
+  done
+  [[ "$restored" == yes ]]
+}
 cleanup() {
   local rc=$?
   [[ "$cleaning" == yes ]] && return
@@ -147,6 +174,8 @@ cleanup() {
   if [[ -n "$original_protocol" ]]; then
     "$EXPRESSVPN_CTL" --timeout 5 set protocol "$original_protocol" >>"$LOG" 2>&1 || true
   fi
+  local rules=yes
+  restore_tailscale_bypasses || rules=no
   tailscale_up_existing >>"$LOG" 2>&1 || true
 
   local net=no dns=no ts=no vpn
@@ -154,11 +183,11 @@ cleanup() {
   dns_ok && dns=yes
   tailscale_peer_ok && ts=yes
   vpn="$(vpn_state || echo unknown)"
-  log "SAFETY RESULT: internet=$net dns=$dns tailscale_peer=$ts vpn=$vpn"
-  if [[ "$net" == yes && "$dns" == yes && "$vpn" == Disconnected ]]; then
-    write_result "finished; experiment_rc=$rc; internet=yes; dns=yes; tailscale_peer=$ts; vpn=off"
+  log "SAFETY RESULT: internet=$net dns=$dns tailscale_peer=$ts vpn=$vpn split_rules_restored=$rules"
+  if [[ "$net" == yes && "$dns" == yes && "$vpn" == Disconnected && "$rules" == yes ]]; then
+    write_result "finished; experiment_rc=$rc; internet=yes; dns=yes; tailscale_peer=$ts; vpn=off; split_rules_restored=yes"
   else
-    write_result "recovery-incomplete; experiment_rc=$rc; internet=$net; dns=$dns; tailscale_peer=$ts; vpn=$vpn"
+    write_result "recovery-incomplete; experiment_rc=$rc; internet=$net; dns=$dns; tailscale_peer=$ts; vpn=$vpn; split_rules_restored=$rules"
     rc=1
   fi
   rmdir "$LOCK" >/dev/null 2>&1 || true
@@ -173,6 +202,7 @@ spawn_deadman() {
     "$DEADMAN_SLEEP" "$DEADMAN_SECONDS"
     log "DEADMAN: trial exceeded ${DEADMAN_SECONDS}s; forcing plain-network recovery"
     "$DARKMESH_CLI" panic >>"$LOG" 2>&1 || true
+    restore_tailscale_bypasses || true
     "$TAILSCALE_CLI" up >>"$LOG" 2>&1 || true
     kill -TERM $$ >/dev/null 2>&1 || true
   ) </dev/null >/dev/null 2>&1 &
@@ -187,6 +217,14 @@ tailscale_peer_ok || { log "ERROR: peer is not reachable before the experiment";
 
 original_protocol="$("$EXPRESSVPN_CTL" --timeout 3 get protocol 2>/dev/null | head -1)"
 original_protocol="${original_protocol##*: }"
+if [[ "$mode" == through-vpn ]]; then
+  while IFS= read -r entry; do
+    [[ "$entry" == bypass:* ]] && tailscale_bypass_entries+=("$entry")
+  done < <("$EXPRESSVPN_CTL" --timeout 8 get split-app 2>/dev/null \
+    | grep -E 'Tailscale\.app|io\.tailscale\.ipn\.macsys\.network-extension' || true)
+  ((${#tailscale_bypass_entries[@]} >= 2)) \
+    || { log "ERROR: cannot safely back up both Tailscale bypass entries"; exit 1; }
+fi
 spawn_deadman
 
 log "phase 1: disarm Darkmesh and fully recycle the ExpressVPN app session"
@@ -209,10 +247,20 @@ log "phase 3: launch ExpressVPN, enforce safe settings, and select Lightway TCP"
 "$EXPRESSVPN_CTL" --timeout 8 get splittunnel 2>/dev/null | grep -qx true \
   || { log "ERROR: ExpressVPN split tunneling is not enabled"; exit 1; }
 split_apps="$("$EXPRESSVPN_CTL" --timeout 8 get split-app 2>/dev/null)"
-printf '%s\n' "$split_apps" | grep -qi 'Tailscale.app' \
-  || { log "ERROR: Tailscale app bypass is missing"; exit 1; }
-printf '%s\n' "$split_apps" | grep -qi 'io.tailscale.ipn.macsys.network-extension' \
-  || { log "ERROR: Tailscale extension bypass is missing"; exit 1; }
+if [[ "$mode" == bypass ]]; then
+  printf '%s\n' "$split_apps" | grep -qi 'Tailscale.app' \
+    || { log "ERROR: Tailscale app bypass is missing"; exit 1; }
+  printf '%s\n' "$split_apps" | grep -qi 'io.tailscale.ipn.macsys.network-extension' \
+    || { log "ERROR: Tailscale extension bypass is missing"; exit 1; }
+else
+  log "phase 3b: temporarily route Tailscale public traffic through Lightway"
+  for entry in "${tailscale_bypass_entries[@]}"; do
+    "$EXPRESSVPN_CTL" --timeout 8 set split-app "remove:${entry#bypass:}" >>"$LOG" 2>&1
+  done
+  split_apps="$("$EXPRESSVPN_CTL" --timeout 8 get split-app 2>/dev/null)"
+  ! printf '%s\n' "$split_apps" | grep -qiE 'Tailscale\.app|io\.tailscale\.ipn\.macsys\.network-extension' \
+    || { log "ERROR: temporary Tailscale bypass removal did not take effect"; exit 1; }
+fi
 
 log "phase 4: arm Darkmesh and wait up to ${CONNECT_TIMEOUT}s for ExpressVPN"
 "$DARKMESH_CLI" up >>"$LOG" 2>&1
@@ -237,6 +285,6 @@ if [[ -n "$ssh_target" ]]; then
     >>"$LOG" 2>&1 || { log "FAIL: private SSH failed with Lightway connected"; exit 1; }
 fi
 
-log "PASS: Lightway TCP, ordinary internet, DNS, Tailscale, and requested SSH coexisted"
+log "PASS: Lightway TCP, ordinary internet, DNS, Tailscale, and requested SSH coexisted (mode=$mode)"
 write_result "pass; cleanup=pending"
 exit 0
