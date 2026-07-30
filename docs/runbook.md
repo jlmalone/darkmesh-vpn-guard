@@ -155,6 +155,24 @@ also requests the same recovery if the main process wedges. Results are written
 to `/tmp/darkmesh-coexistence-trial.log` and
 `/tmp/darkmesh-coexistence-trial-result`.
 
+### Verified ExpressVPN bypass limitation
+
+On 2026-07-29, the bounded experiment verified that a full ExpressVPN session
+recycle and Tailscale-first startup order did not make the configured app bypass
+work with Lightway TCP. ExpressVPN reported Split Tunnel enabled and listed both
+the Tailscale app and network extension as bypassed. While connected, however,
+the ExpressVPN split-tunnel extension logged `provider rejected new flow` for
+the Tailscale network-extension process. Tailscale lost both its control-plane
+and relay paths. Those paths recovered immediately after ExpressVPN
+disconnected.
+
+Treat this signature as an ExpressVPN split-tunnel enforcement limitation, not
+as a Darkmesh ordering, DNS, peer, SSH, or Tailscale-identity problem. Do not
+loop reconnects when this signature is present. Keep plain networking restored.
+A separate bounded experiment may test Tailscale through the VPN rather than as
+a bypassed app; it must preserve the existing Tailscale identity and retain the
+same unconditional plain-network rollback.
+
 ## Why The Client May Get "Stuck"
 
 The transfer-client binding is intentionally fail-closed.

@@ -89,8 +89,19 @@ if run_trial "$FAILURE" env TEST_FAIL_TAILSCALE_WITH_VPN=yes; then
   exit 1
 fi
 grep -q 'FAIL: the Tailscale peer failed with Lightway connected' "$FAILURE/log"
+grep -q 'DIAGNOSIS: the configured ExpressVPN bypass did not preserve the Tailscale data path' "$FAILURE/log"
 grep -q 'finished; experiment_rc=1; internet=yes; dns=yes; tailscale_peer=yes; vpn=off' "$FAILURE/result"
 [[ "$(grep -c '^darkmesh panic$' "$FAILURE/calls")" -eq 2 ]]
 grep -q '^tailscale up$' "$FAILURE/calls"
+
+DEADMAN="$TMP/deadman"
+mkdir -p "$DEADMAN"
+if ! run_trial "$DEADMAN" env DARKMESH_TRIAL_DISABLE_DEADMAN=no \
+  DEADMAN_SLEEP=/bin/sleep DARKMESH_TRIAL_DEADMAN_SECONDS=30 \
+  >"$DEADMAN/stdout" 2>"$DEADMAN/stderr"; then
+  echo "expected deadman-cancellation run to pass" >&2
+  exit 1
+fi
+! grep -q 'Terminated' "$DEADMAN/stderr"
 
 echo "darkmesh coexistence trial tests passed"

@@ -15,6 +15,7 @@ CURL="${CURL:-/usr/bin/curl}"
 HOST="${HOST:-/usr/bin/host}"
 SSH="${SSH:-/usr/bin/ssh}"
 SLEEP="${SLEEP:-/bin/sleep}"
+DEADMAN_SLEEP="${DEADMAN_SLEEP:-/bin/sleep}"
 DATE="${DATE:-/bin/date}"
 
 LOG="${DARKMESH_TRIAL_LOG:-/tmp/darkmesh-coexistence-trial.log}"
@@ -127,7 +128,10 @@ cleanup() {
   [[ "$cleaning" == yes ]] && return
   cleaning=yes
   trap - EXIT INT TERM HUP
-  [[ -n "$deadman_pid" ]] && kill "$deadman_pid" >/dev/null 2>&1 || true
+  if [[ -n "$deadman_pid" ]]; then
+    kill "$deadman_pid" >/dev/null 2>&1 || true
+    wait "$deadman_pid" >/dev/null 2>&1 || true
+  fi
 
   log "SAFETY: restoring plain internet"
   "$DARKMESH_CLI" panic >>"$LOG" 2>&1 || {
@@ -166,7 +170,7 @@ trap 'exit 130' INT TERM HUP
 spawn_deadman() {
   [[ "${DARKMESH_TRIAL_DISABLE_DEADMAN:-no}" == yes ]] && return
   (
-    "$SLEEP" "$DEADMAN_SECONDS"
+    "$DEADMAN_SLEEP" "$DEADMAN_SECONDS"
     log "DEADMAN: trial exceeded ${DEADMAN_SECONDS}s; forcing plain-network recovery"
     "$DARKMESH_CLI" panic >>"$LOG" 2>&1 || true
     "$TAILSCALE_CLI" up >>"$LOG" 2>&1 || true
@@ -223,7 +227,11 @@ done
 log "phase 5: test VPN internet, DNS, Tailscale peer, and optional SSH"
 internet_ok || { log "FAIL: ordinary internet failed with Lightway connected"; exit 1; }
 dns_ok || { log "FAIL: DNS failed with Lightway connected"; exit 1; }
-tailscale_peer_ok || { log "FAIL: the Tailscale peer failed with Lightway connected"; exit 1; }
+tailscale_peer_ok || {
+  log "FAIL: the Tailscale peer failed with Lightway connected"
+  log "DIAGNOSIS: the configured ExpressVPN bypass did not preserve the Tailscale data path"
+  exit 1
+}
 if [[ -n "$ssh_target" ]]; then
   "$SSH" -o BatchMode=yes -o ConnectTimeout=10 "$ssh_target" 'nice -n 19 true' \
     >>"$LOG" 2>&1 || { log "FAIL: private SSH failed with Lightway connected"; exit 1; }
