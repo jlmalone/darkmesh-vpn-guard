@@ -129,107 +129,133 @@ requires local approval.
 The concrete client config path and section name are derived by
 `transfer-vpn-doctor` at runtime from weakly encoded identifiers.
 
-## Bounded coexistence experiment
+## Staged coexistence experiments
 
-Use the focused experiment only when plain internet, DNS, and an existing
-tailnet peer are initially healthy:
-
-```bash
-darkmesh coexistence-trial --peer <tailnet-host-or-IP> \
-  --ssh-target <private-ssh-alias>
-```
-
-The experiment performs one full ExpressVPN application-session recycle,
-brings up the existing Tailscale identity first, selects Lightway TCP, then
-tests ordinary internet, DNS, the named Tailscale peer, and optional private
-SSH. An authenticated Tailscale relay pong counts as peer reachability even if
-the CLI cannot upgrade it to a direct path. The experiment does not run
-`tailscale login`, accept an authentication URL, create a node, change
-split-tunnel rules, or start a transfer.
-
-After Lightway connects, the experiment waits for an initial 30-second route
-settle, then probes the named peer repeatedly for up to 90 additional seconds.
-Each failed probe records actual wall-clock elapsed time, including the time
-spent inside the probe, and ordinary internet plus the VPN connection are
-rechecked throughout the convergence window. This distinguishes slow
-control-plane or relay recovery from a persistent block. The detached recovery
-deadline is seven minutes so it remains outside the complete bounded
-observation and cleanup window.
-
-Cleanup is unconditional on success, failure, signal, and timeout. It leaves
-VPN intent off, ExpressVPN disconnected, Network Lock and autoconnect off,
-restores the previously selected VPN protocol, brings Tailscale up using its
-existing identity, and verifies ordinary internet and DNS. A detached deadline
-also requests the same recovery if the main process wedges. Results are written
-to `/tmp/darkmesh-coexistence-trial.log` and
-`/tmp/darkmesh-coexistence-trial-result`.
-
-### Verified ExpressVPN bypass limitation
-
-On 2026-07-29, the bounded experiment verified that a full ExpressVPN session
-recycle and Tailscale-first startup order did not make the configured app bypass
-work with Lightway TCP. ExpressVPN reported Split Tunnel enabled and listed both
-the Tailscale app and network extension as bypassed. While connected, however,
-the ExpressVPN split-tunnel extension logged `provider rejected new flow` for
-the Tailscale network-extension process. Tailscale lost both its control-plane
-and relay paths. Those paths recovered immediately after ExpressVPN
-disconnected.
-
-Treat this signature as an ExpressVPN split-tunnel enforcement limitation, not
-as a Darkmesh ordering, DNS, peer, SSH, or Tailscale-identity problem. Do not
-loop reconnects when this signature is present. Keep plain networking restored.
-A separate bounded experiment may test Tailscale through the VPN rather than as
-a bypassed app; it must preserve the existing Tailscale identity and retain the
-same unconditional plain-network rollback.
-
-The follow-up mode tests that alternative without making it persistent:
+The current experiment is an adaptive campaign, not a one-off protocol trial.
+Start by creating the private local target map:
 
 ```bash
-darkmesh coexistence-trial --mode through-vpn \
-  --peer <tailnet-host-or-IP> --ssh-target <private-ssh-alias>
+mkdir -p ~/.config/darkmesh
+cp "$(brew --prefix)/share/darkmesh/experiment.conf.example" \
+  ~/.config/darkmesh/experiment.conf
+chmod 600 ~/.config/darkmesh/experiment.conf
 ```
 
-This mode backs up the exact two Tailscale app-bypass entries, temporarily
-removes only those entries while ExpressVPN is disconnected, performs the
-bounded Lightway test, and restores and verifies both entries during normal
-cleanup and deadman recovery. It does not alter the separate private tailnet
-address-range bypasses.
+Replace the neutral peer addresses and SSH aliases in that file. The file is
+literal `KEY=value` data, is never sourced as shell, and must remain untracked.
+The peers are passive targets. The experiment changes network state only on the
+Mac where it runs.
 
-The same 2026-07-29 investigation tested this mode with Lightway TCP through
-the complete convergence window. Tailscale did not regain its control-plane,
-relay, peer, or SSH path while ExpressVPN remained connected. Disconnecting
-ExpressVPN restored the paths and the original split rules.
-
-Select either Lightway transport explicitly:
+Review the complete adaptive inventory without changing network state:
 
 ```bash
-darkmesh coexistence-trial --protocol lightwayudp --mode bypass \
-  --peer <tailnet-host-or-IP> --ssh-target <private-ssh-alias>
+darkmesh experiment plan --profile staged
+darkmesh-transfer pause
+darkmesh experiment preflight
 ```
 
-The bounded tool intentionally permits only `lightwaytcp` and `lightwayudp`.
-It never tests or persists OpenVPN. Cleanup restores the protocol selected
-before the experiment.
+Preflight is read-only. It requires the ExpressVPN GUI and daemon to be running,
+the split extension to be approved, ExpressVPN disconnected with VPN intent
+off, transfer intent explicitly paused, the saved Lightway protocol and Seattle
+selection present, PF containment enforced, both existing Tailscale/SSH
+identities reachable, and ordinary internet and DNS healthy. A privilege error,
+missing PF rule, unsupported split toggle, or pending extension approval is a
+`PRECONDITION`, never evidence against a protocol.
 
-Select a temporary ExpressVPN location with `--region smart` or an exact region
-slug:
+Run the live campaign only with explicit authority for local network changes:
 
 ```bash
-darkmesh coexistence-trial --protocol lightwayudp --mode bypass \
-  --region smart --peer <tailnet-host-or-IP> \
-  --ssh-target <private-ssh-alias>
+darkmesh experiment run --profile staged
+darkmesh experiment report
 ```
 
-The experiment records the currently selected region before any mutation.
-Normal cleanup and deadman recovery restore and verify that exact original
-region. Omitting `--region` uses the operator's current selection without
-changing it.
+The campaign screens WireGuard, Lightway TCP, and Lightway UDP. OpenVPN is
+excluded. It adaptively challenges connected protocols across Tailscale DNS,
+Seattle and Smart selection, split-rule isolation, startup order, repeatability,
+the real Darkmesh reconnect state machine, and an ordinary disconnect. A nearby
+region is added only for ambiguous Lightway UDP negotiation. Passing screen
+cases run twice more; a connection timeout receives one retry after complete
+recovery.
 
-Lightway UDP was also attempted against the then-selected VPN region. ExpressVPN
-14.1.0 remained in its connection sequence and did not reach `Connected` within
-75 seconds, so that run never reached a Tailscale coexistence test. This is a
-VPN transport or region connection failure, distinct from the verified
-Lightway TCP split-tunnel rejection.
+Every mutation begins by pausing the transfer client and proving that PF
+containment is active. The campaign never starts a transfer and never changes
+ExpressVPN background mode. Tailscale `up` is rejected if it requests login,
+authorization, or an identity replacement. The exact preflight transfer intent
+is restored, which means a campaign that starts paused finishes paused. Resuming
+transfers is a separate operator action after reviewing the report.
+
+Convergence uses route, interface, resolver, VPN, and system-extension
+fingerprints:
+
+- baseline: three healthy samples and 15 seconds of fingerprint quiet, within
+  180 seconds;
+- connection: `Connected` within 150 seconds;
+- VPN stabilization: at least 45 seconds, then three stable samples ten seconds
+  apart, within 240 seconds;
+- Tailscale: two successful Tailscale, TCP 22, and SSH samples for each peer,
+  within 180 seconds;
+- post-disconnect: three healthy samples and 20 seconds of fingerprint quiet,
+  within 180 seconds.
+
+Any fingerprint change resets the relevant stability counter. Independent case
+and campaign deadmen request the same recovery. A failed case recovery stops
+the campaign.
+
+Evidence is stored under
+`~/.local/share/darkmesh/experiments/<timestamp>-<pid>/` with mode `0700`.
+It contains a read-only initial snapshot, timestamped JSONL observations,
+read-only per-case JSON, a comparison report, and a read-only final-restoration
+snapshot. Final verification requires ExpressVPN disconnected, intent off, the
+exact protocol, region, complete split rules, Network Lock, autoconnect,
+Tailscale preferences and identity restored, plus healthy internet, DNS,
+Tailscale, TCP 22, and SSH to both peers.
+
+`--capture-path-metadata` requests one administrator session before the
+campaign. It records bounded textual route, process, and packet-header metadata.
+It does not save raw packets, payloads, or a packet-capture file.
+
+`darkmesh coexistence-trial` remains a no-argument compatibility wrapper for
+the staged campaign. The autonomous `darkmesh-protocol-trial` is retired because
+it lacked these restoration and convergence guarantees.
+
+### Captive-network field profile
+
+Use the separate field profile only while actually attached to a captive Wi-Fi
+network:
+
+```bash
+darkmesh experiment plan --profile captive
+darkmesh experiment run --profile captive
+```
+
+It requires positive portal evidence, forces transfer containment, verifies
+DHCP DNS evidence, and invokes the normal captive standdown. It then stops for
+owner sign-in and prints a mode-`0700` run directory. After signing in, resume
+that exact snapshot:
+
+```bash
+darkmesh experiment run --profile captive --resume \
+  ~/.local/share/darkmesh/experiments/<run>
+```
+
+Resume verifies internet, DNS, both passive peers, and controlled VPN rearm,
+then performs the normal exact-state restoration. The profile never poisons
+routes or DNS to simulate a portal on a home network. Any later campaign that
+changes a peer machine remains separately owner-gated.
+
+### Corrected historical conclusions
+
+- ExpressVPN, Tailscale, SSH, and fail-closed transfer protection previously
+  coexisted.
+- WireGuard with `tailscale set --accept-dns=false` is the strongest historical
+  success.
+- Lightway stability is not historically established.
+- Changing VPN region did not solve the historical DNS collision.
+- ExpressVPN split tunneling affects the local network even while disconnected.
+- The latest Seattle attempt stopped at ExpressVPN 14.2's root-only background
+  mode precondition. It was not a fast Lightway failure.
+- `provider rejected new flow` remains ambiguous without path evidence. Do not
+  classify it as a provider block from the log string alone.
 
 ## Why The Client May Get "Stuck"
 

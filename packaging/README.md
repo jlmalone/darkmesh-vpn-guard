@@ -12,7 +12,8 @@ Homebrew can fetch them without authentication.
    so the formula's own sha never feeds back into the tarball):
    ```
    git archive --format=tar.gz --prefix=darkmesh-X.Y.Z/ \
-     -o /tmp/darkmesh-X.Y.Z.tar.gz HEAD scripts vpn-guard newsyslog README.md LICENSE
+     -o /tmp/darkmesh-X.Y.Z.tar.gz HEAD scripts vpn-guard newsyslog \
+     experiment.conf.example README.md LICENSE
    ```
 3. Compute the sha and paste it into `darkmesh.rb`:
    ```

@@ -35,6 +35,10 @@ When safety and availability conflict, the transfer client should fail closed.
 - The transfer client does **not** start paused: a paused headless session never
   announces or rechecks and nothing resumes it (it parked a transfer node for days);
   fail-closed is the socket-bind, not a pause.
+- A staged coexistence experiment is the deliberate exception. Its preflight
+  requires explicit paused intent, it keeps PF containment active, and it
+  restores paused intent without starting a transfer. Resuming after report
+  review is a separate operator action.
 - The transfer client UPnP/NAT-PMP setting is disabled.
 - `vpn-guard` handles unsafe network states (PF block on the transfer ports + pause/resume).
 

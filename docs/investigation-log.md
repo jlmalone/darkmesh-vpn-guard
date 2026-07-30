@@ -128,6 +128,11 @@ corrected two of my conclusions and provided the breakthrough:
 
 ### The systematic test: `darkmesh-protocol-trial`
 
+> Historical note (2026-07-30): this autonomous harness is retired. Its fixed
+> sleeps and partial restoration contract are not safe enough for current use.
+> `darkmesh experiment` replaces it with staged convergence and exact-state
+> recovery. The evidence below remains part of the historical record.
+
 User had to leave; said "run a long series of tests and attempts, plan for the agent
 losing connectivity." I built `scripts/darkmesh-protocol-trial` — an autonomous
 test harness, run detached via `nohup`, with absolute deadman + per-test
@@ -200,8 +205,8 @@ list with the headless host's.
 
 - `scripts/darkmesh-diag` — non-interactive failure-state capture with deadman
 - `scripts/darkmesh-healthcheck` (+ LaunchAgent at `vpn-guard/com.user.darkmesh-healthcheck.plist`) — periodic probe + auto-disconnect + accept-dns auto-toggle
-- `scripts/darkmesh-protocol-trial` — autonomous test harness, finds the
-  working config across protocols/regions/mitigations
+- `scripts/darkmesh-protocol-trial` — historical autonomous harness, now a
+  refusal that routes operators to `darkmesh experiment`
 - `docs/llm-second-opinion-prompt.md` — self-contained prompt to seek
   challenge of analysis from another LLM (or future engineer)
 - `docs/investigation-log.md` (this file)
@@ -222,7 +227,9 @@ list with the headless host's.
 
 ### Things to revisit if behavior changes
 
-- New ExpressVPN client version: re-run `darkmesh-protocol-trial`. They may
+- New ExpressVPN client version: run `darkmesh experiment preflight`, review
+  `darkmesh experiment plan`, then use the staged profile with live-change
+  authority. The provider may
   change which DNS server they push, or stop pushing DNS for bypass apps.
 - Tailscale releases an OS-level DNS scoping fix for the CGNAT collision: their
   recommendation may shift from `--accept-dns=false` to `--disable-ipv4` or a
@@ -455,3 +462,22 @@ It snapshots DHCP mode instead of volatile static DNS, and legacy journals
 containing a volatile resolver retire to DHCP on restore. Focused tests cover
 new journal creation, legacy poisoned-journal retirement, and preservation of
 ordinary static DNS.
+
+## 2026-07-30: staged coexistence experiment replaces narrow trials
+
+Historical records establish that ExpressVPN, Tailscale, SSH, and fail-closed
+transfer protection previously coexisted. The strongest reproduced setting was
+WireGuard with `accept-dns=false`. Lightway stability was never established,
+and changing VPN region did not resolve the old DNS collision.
+
+The most recent Seattle attempt did not establish a Lightway failure.
+ExpressVPN 14.2 required root for a background-mode operation, so the attempt
+stopped at a privilege precondition before protocol evidence existed. The new
+suite never changes background mode and requires the GUI and daemon to be
+running at preflight.
+
+`darkmesh experiment` now snapshots the complete local state, uses health and
+fingerprint convergence instead of fixed sleeps, tests the adaptive protocol,
+DNS, region, split-rule, and startup-order matrix, and verifies exact recovery.
+The legacy coexistence command is a compatibility wrapper. The historical
+autonomous protocol command refuses to run.

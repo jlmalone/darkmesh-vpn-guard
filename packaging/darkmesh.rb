@@ -17,7 +17,8 @@ class Darkmesh < Formula
     user_tools = %w[
       darkmesh darkmesh-setup darkmesh-audit darkmesh-healthcheck darkmesh-breaker
       darkmesh-root-helper darkmesh-reconnect darkmesh-repair darkmesh-restore-plain-network
-      darkmesh-up darkmesh-panic darkmesh-captive darkmesh-diag darkmesh-coexistence-trial
+      darkmesh-up darkmesh-panic darkmesh-captive darkmesh-diag darkmesh-experiment
+      darkmesh-coexistence-trial darkmesh-transfer
       darkmesh-transfer-daemon
       darkmesh-migrate-agent install-root-helper.sh transfer-vpn-doctor darkmesh-expressvpn-tailscale
       relax-network-lock emergency-restore-internet vpn-guard.sh
@@ -31,6 +32,7 @@ class Darkmesh < Formula
                          "vpn-guard/com.user.vpnguard.plist",
                          "vpn-guard/unsafe.pf.conf",
                          "vpn-guard/sudoers.d-vpn-guard"]
+    pkgshare.install "experiment.conf.example"
   end
 
   def caveats

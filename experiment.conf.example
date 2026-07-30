@@ -1,0 +1,14 @@
+# Copy to ~/.config/darkmesh/experiment.conf, replace the neutral examples,
+# and run: chmod 600 ~/.config/darkmesh/experiment.conf
+#
+# Values are parsed as literal text. Shell expansion and command substitution
+# are not supported.
+PEER_A_ADDRESS=peer-a.example
+PEER_A_SSH=host-a
+PEER_B_ADDRESS=peer-b.example
+PEER_B_SSH=host-b
+
+# ExpressVPN's saved local selection and the nearby diagnostic region. The
+# staged campaign always restores the exact selection captured at startup.
+SEATTLE_REGION=usa-seattle
+NEARBY_REGION=canada-vancouver

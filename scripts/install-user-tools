@@ -11,7 +11,7 @@ mkdir -p "$BIN_DIR" "$SHARE_DIR"
 tools=(
   darkmesh darkmesh-setup darkmesh-audit darkmesh-healthcheck darkmesh-breaker
   darkmesh-root-helper darkmesh-reconnect darkmesh-repair darkmesh-restore-plain-network darkmesh-up darkmesh-panic
-  darkmesh-captive darkmesh-diag darkmesh-protocol-trial darkmesh-coexistence-trial darkmesh-transfer darkmesh-fleet
+  darkmesh-captive darkmesh-diag darkmesh-experiment darkmesh-coexistence-trial darkmesh-transfer darkmesh-fleet
   darkmesh-transfer-daemon
   darkmesh-expressvpn-tailscale darkmesh-migrate-agent install-root-helper.sh
   transfer-vpn-doctor configure-client relax-network-lock emergency-restore-internet
@@ -20,6 +20,8 @@ tools=(
 for tool in "${tools[@]}"; do
   [[ -f "$ROOT/scripts/$tool" ]] && install -m 0755 "$ROOT/scripts/$tool" "$BIN_DIR/$tool"
 done
+# Never leave the retired autonomous matrix executable after a local upgrade.
+rm -f "$BIN_DIR/darkmesh-protocol-trial"
 install -m 0755 "$ROOT/vpn-guard/vpn-guard.sh" "$BIN_DIR/vpn-guard.sh"
 # This retired helper encoded the wrong DNS recovery direction. Never leave a
 # stale copy shadowing the current fixed root helper after an upgrade.
@@ -30,6 +32,7 @@ for payload in \
   unsafe.pf.conf sudoers.d-vpn-guard; do
   install -m 0644 "$ROOT/vpn-guard/$payload" "$SHARE_DIR/$payload"
 done
+install -m 0644 "$ROOT/experiment.conf.example" "$SHARE_DIR/experiment.conf.example"
 
 echo "Installed development payload to $BIN_DIR"
 exec "$BIN_DIR/darkmesh-setup" "$@"

@@ -1,0 +1,176 @@
+#!/bin/bash
+set -euo pipefail
+
+name="$(basename "$0")"
+state="${TEST_STATE:?}"
+printf '%s %s\n' "$name" "$*" >>"$state/calls"
+
+read_state() { cat "$state/$1"; }
+write_state() { printf '%s\n' "$2" >"$state/$1"; }
+
+case "$name" in
+  expressvpnctl)
+    if [[ "${1:-}" == --timeout ]]; then shift 2; fi
+    case "${1:-} ${2:-}" in
+      "get connectionstate")
+        if [[ "$(read_state vpn-intent)" == on &&
+              "$(read_state vpn-state)" == Disconnected &&
+              "${TEST_DISABLE_AUTO_RECONNECT:-no}" != yes ]]; then
+          write_state vpn-state Connected
+        fi
+        read_state vpn-state
+        ;;
+      "get protocol") read_state protocol ;;
+      "get region") read_state region ;;
+      "get splittunnel") read_state splittunnel ;;
+      "get networklock") read_state networklock ;;
+      "get autoconnect") read_state autoconnect ;;
+      "get split-app") cat "$state/split-rules" ;;
+      "set protocol")
+        if [[ "${TEST_RESTORE_FAILURE:-no}" == yes &&
+              -f "$state/panic-called" && "${3:-}" == lightwaytcp ]]; then
+          exit 1
+        fi
+        write_state protocol "${3:?}"
+        ;;
+      "set region") write_state region "${3:?}" ;;
+      "set splittunnel") write_state splittunnel "${3:?}" ;;
+      "set networklock") write_state networklock "${3:?}" ;;
+      "set autoconnect") write_state autoconnect "${3:?}" ;;
+      "set split-app")
+        value="${3:?}"
+        if [[ "$value" == remove:* ]]; then
+          target="bypass:${value#remove:}"
+          grep -vxF "$target" "$state/split-rules" >"$state/split-rules.tmp" || true
+          mv "$state/split-rules.tmp" "$state/split-rules"
+        else
+          grep -qxF "$value" "$state/split-rules" ||
+            printf '%s\n' "$value" >>"$state/split-rules"
+        fi
+        ;;
+      "disconnect ")
+        write_state vpn-state Disconnected
+        ;;
+      *) exit 0 ;;
+    esac
+    ;;
+  tailscale)
+    case "${1:-}" in
+      version) printf '1.90.0\n' ;;
+      status)
+        if [[ "${2:-}" == --json ]]; then
+          printf '{"BackendState":"Running","Self":{"ID":"%s","DNSName":"local.example."}}\n' \
+            "$(read_state identity)"
+        fi
+        ;;
+      debug)
+        [[ "${2:-}" == prefs ]] && printf '{"CorpDNS":%s}\n' "$(read_state accept-dns)"
+        ;;
+      netcheck) printf 'Report: DERP latency: region: 12ms\n' ;;
+      ping)
+        [[ "${TEST_PEER_FAILURE:-no}" != yes ]]
+        printf 'pong from peer via DERP(region) in 12ms\n'
+        ;;
+      set)
+        value="${2#--accept-dns=}"
+        write_state accept-dns "$value"
+        ;;
+      down) write_state tailscale-state Stopped ;;
+      up)
+        if [[ "${TEST_AUTH_REQUEST:-no}" == yes ]]; then
+          printf 'Login required\n'
+          exit 1
+        fi
+        write_state tailscale-state Running
+        [[ "${TEST_IDENTITY_CHANGE:-no}" != yes ]] || write_state identity replacement
+        ;;
+    esac
+    ;;
+  darkmesh)
+    case "${1:-}" in
+      up)
+        if [[ ",${TEST_UNSUPPORTED_PROTOCOLS:-}," == *",$(read_state protocol),"* ]]; then
+          exit 1
+        fi
+        write_state vpn-intent on
+        if [[ -n "${TEST_TIMEOUT_PROTOCOL:-}" &&
+              "$(read_state protocol)" == "$TEST_TIMEOUT_PROTOCOL" ]]; then
+          write_state vpn-state Connecting
+        else
+          write_state vpn-state Connected
+        fi
+        ;;
+      panic|captive)
+        write_state vpn-intent off
+        write_state vpn-state Disconnected
+        touch "$state/panic-called"
+        ;;
+    esac
+    ;;
+  darkmesh-transfer)
+    [[ "${1:-}" == pause ]] && write_state transfer-intent paused
+    ;;
+  vpn-guard.sh|transfer-vpn-doctor) exit 0 ;;
+  curl)
+    [[ "${TEST_INTERNET_FAILURE:-no}" != yes ]] || exit 1
+    if [[ "${TEST_CAPTIVE_PORTAL:-no}" == yes ]]; then
+      output=""
+      while (($#)); do
+        if [[ "$1" == -o ]]; then output="$2"; shift 2; else shift; fi
+      done
+      [[ -z "$output" ]] || printf '<HTML><TITLE>Sign In</TITLE></HTML>\n' >"$output"
+      printf '302 http://portal.example/\n'
+    fi
+    ;;
+  host) [[ "${TEST_DNS_FAILURE:-no}" != yes ]] ;;
+  ssh|nc) exit 0 ;;
+  systemextensionsctl)
+    printf '* * TEAM com.expressvpn.vpn.splittunnel (14.2/1) SplitTunnel [activated enabled]\n'
+    printf '* * TEAM io.tailscale.ipn.macsys.network-extension (1.90/1) Tailscale [activated enabled]\n'
+    ;;
+  scutil)
+    printf 'resolver #1\n  nameserver[0] : 192.0.2.53\n  if_index : 4 (en0)\n'
+    ;;
+  netstat)
+    if [[ "${TEST_FINGERPRINT_FLAP:-no}" == yes ]]; then
+      count=0
+      [[ ! -f "$state/netstat-count" ]] || count="$(read_state netstat-count)"
+      count=$((count + 1))
+      write_state netstat-count "$count"
+      printf 'default 192.0.2.%s UGSc en0\n' "$((count % 2 + 1))"
+    else
+      printf 'default 192.0.2.1 UGSc en0\n'
+    fi
+    ;;
+  ifconfig) [[ "${1:-}" == -l ]] && printf 'lo0 en0 utun3\n' ;;
+  ipconfig) printf 'domain_name_server (ip_mult): {192.0.2.53}\n' ;;
+  pfctl)
+    case "$*" in
+      *"-s info"*) printf 'Status: Enabled\n' ;;
+      *"-sr"*) printf 'block drop out proto tcp from any to any port 50000\n' ;;
+    esac
+    ;;
+  sudo)
+    [[ "${TEST_PRIVILEGE_FAILURE:-no}" != yes ]] || exit 1
+    if [[ "${1:-}" == -v ]]; then exit 0; fi
+    [[ "${1:-}" == -n ]] && shift
+    exec "$@"
+    ;;
+  pgrep) exit 0 ;;
+  defaults) printf '14.2.0\n' ;;
+  date)
+    if [[ "${1:-}" == +%s ]]; then
+      tick=1000
+      [[ ! -f "$state/tick" ]] || tick="$(read_state tick)"
+      tick=$((tick + 5))
+      write_state tick "$tick"
+      printf '%s\n' "$tick"
+    else
+      printf '2026-07-30T12:00:00Z\n'
+    fi
+    ;;
+  sleep) exit 0 ;;
+  nettop) printf 'process,bytes_in,bytes_out,state\nstub,10,20,established\n' ;;
+  tcpdump) printf 'IP 192.0.2.10.443 > 198.51.100.10.443: tcp 0\n' ;;
+  *) exit 0 ;;
+esac

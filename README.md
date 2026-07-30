@@ -118,6 +118,27 @@ cat /tmp/darkmesh-status.json            # current verdict (LaunchAgent updates 
 vpn-guard.sh
 ```
 
+## Coexistence experiments
+
+`darkmesh experiment` provides a mutation-free planner, read-only preflight,
+adaptive staged campaign, and local report:
+
+```bash
+darkmesh experiment plan --profile staged
+darkmesh-transfer pause
+darkmesh experiment preflight
+darkmesh experiment run --profile staged
+darkmesh experiment report
+```
+
+Peer addresses and SSH aliases come from the untracked mode-`0600`
+`~/.config/darkmesh/experiment.conf`; start with
+`experiment.conf.example`. The campaign never starts a transfer or changes
+ExpressVPN background mode. See
+[`docs/runbook.md`](docs/runbook.md#staged-coexistence-experiments) before any
+live run. The captive profile intentionally stops for portal sign-in and
+provides an explicit `--resume` command for controlled rearm afterward.
+
 One-time privileged recovery setup (fixed verbs only, never a general root shell):
 
 ```bash
@@ -255,6 +276,13 @@ private agent context, runtime configuration, credentials, and operational data 
 correct places when provisioning another trusted machine.
 
 ## Helpers
+
+### `scripts/darkmesh-experiment`
+
+Runs the convergence-based WireGuard and Lightway coexistence suite with exact
+state snapshots, per-case results, independent deadmen, and verified recovery.
+OpenVPN is excluded. `darkmesh coexistence-trial` is a compatibility wrapper;
+the old autonomous protocol trial is retired.
 
 ### `scripts/darkmesh-expressvpn-tailscale`
 

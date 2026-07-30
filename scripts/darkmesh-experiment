@@ -1,0 +1,1204 @@
+#!/bin/bash
+# Convergence-based ExpressVPN/Tailscale coexistence experiments for macOS.
+# The live campaign mutates only the local Mac. Configured peers are passive
+# Tailscale, TCP 22, and key-based SSH targets.
+set -euo pipefail
+
+/usr/bin/renice 19 -p $$ >/dev/null 2>&1 || true
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+EXPRESSVPN_CTL="${EXPRESSVPN_CTL:-/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl}"
+TAILSCALE_CLI="${TAILSCALE_CLI:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
+DARKMESH_CLI="${DARKMESH_CLI:-$SELF_DIR/darkmesh}"
+DARKMESH_TRANSFER="${DARKMESH_TRANSFER:-$SELF_DIR/darkmesh-transfer}"
+TRANSFER_DOCTOR="${TRANSFER_DOCTOR:-$SELF_DIR/transfer-vpn-doctor}"
+VPN_GUARD="${VPN_GUARD:-$SELF_DIR/vpn-guard.sh}"
+CURL="${CURL:-/usr/bin/curl}"
+HOST_CMD="${HOST_CMD:-/usr/bin/host}"
+SSH_CMD="${SSH_CMD:-/usr/bin/ssh}"
+NC_CMD="${NC_CMD:-/usr/bin/nc}"
+SYSTEMEXTENSIONSCTL="${SYSTEMEXTENSIONSCTL:-/usr/bin/systemextensionsctl}"
+SCUTIL="${SCUTIL:-/usr/sbin/scutil}"
+NETSTAT="${NETSTAT:-/usr/sbin/netstat}"
+IFCONFIG="${IFCONFIG:-/sbin/ifconfig}"
+PFCTL="${PFCTL:-/sbin/pfctl}"
+SUDO="${SUDO:-/usr/bin/sudo}"
+SLEEP="${SLEEP:-/bin/sleep}"
+DATE="${DATE:-/bin/date}"
+SHASUM="${SHASUM:-/usr/bin/shasum}"
+TCPDUMP="${TCPDUMP:-/usr/sbin/tcpdump}"
+NETTOP="${NETTOP:-/usr/bin/nettop}"
+PGREP="${PGREP:-/usr/bin/pgrep}"
+DEFAULTS="${DEFAULTS:-/usr/bin/defaults}"
+PERL="${PERL:-/usr/bin/perl}"
+IPCONFIG="${IPCONFIG:-/usr/sbin/ipconfig}"
+
+CONFIG="${DARKMESH_EXPERIMENT_CONFIG:-$HOME/.config/darkmesh/experiment.conf}"
+EXPERIMENT_ROOT="${DARKMESH_EXPERIMENT_ROOT:-$HOME/.local/share/darkmesh/experiments}"
+LOCK_DIR="${DARKMESH_EXPERIMENT_LOCK:-${TMPDIR:-/tmp}/darkmesh-experiment.lock}"
+VPN_INTENT="${DARKMESH_VPN_INTENT:-$HOME/.config/darkmesh/vpn-desired}"
+TRANSFER_INTENT="${DARKMESH_TRANSFER_INTENT:-$HOME/.config/darkmesh/transfer-desired}"
+
+BASELINE_MAX="${DARKMESH_EXPERIMENT_BASELINE_MAX:-180}"
+BASELINE_QUIET="${DARKMESH_EXPERIMENT_BASELINE_QUIET:-15}"
+CONNECT_MAX="${DARKMESH_EXPERIMENT_CONNECT_MAX:-150}"
+STABILIZE_MIN="${DARKMESH_EXPERIMENT_STABILIZE_MIN:-45}"
+STABILIZE_MAX="${DARKMESH_EXPERIMENT_STABILIZE_MAX:-240}"
+SAMPLE_INTERVAL="${DARKMESH_EXPERIMENT_SAMPLE_INTERVAL:-10}"
+TAILSCALE_MAX="${DARKMESH_EXPERIMENT_TAILSCALE_MAX:-180}"
+RECOVERY_MAX="${DARKMESH_EXPERIMENT_RECOVERY_MAX:-180}"
+RECOVERY_QUIET="${DARKMESH_EXPERIMENT_RECOVERY_QUIET:-20}"
+CASE_DEADMAN="${DARKMESH_EXPERIMENT_CASE_DEADMAN:-900}"
+CAMPAIGN_DEADMAN="${DARKMESH_EXPERIMENT_CAMPAIGN_DEADMAN:-14400}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  darkmesh experiment preflight [--config FILE] [--capture-path-metadata]
+  darkmesh experiment run --profile staged [--config FILE] [--capture-path-metadata]
+  darkmesh experiment run --profile captive [--config FILE]
+  darkmesh experiment run --profile captive --resume RUN_DIRECTORY [--config FILE]
+  darkmesh experiment report [RUN_DIRECTORY]
+  darkmesh experiment plan [--profile staged|captive] [--format text|json]
+
+preflight is read-only. run performs local network changes and always attempts
+exact restoration. plan is mutation-free and prints the adaptive case inventory
+plus a conservative maximum duration.
+
+Private peer addresses and SSH aliases must be stored in a mode-0600 config file.
+The staged profile never starts a transfer and never changes ExpressVPN
+background mode. --capture-path-metadata requests one administrator session and
+stores bounded textual packet/process metadata only, never packet payloads or a
+capture file.
+
+The captive profile is a field checklist. It refuses to simulate a portal or
+modify routes/DNS and must be run only on a real captive network.
+EOF
+}
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
+now_epoch() { "$DATE" +%s; }
+now_iso() { "$DATE" -u +%FT%TZ; }
+safe_value() {
+  [[ -n "$1" && "$1" != -* && "$1" != *$'\n'* && "$1" != *$'\r'* ]]
+}
+file_value() {
+  [[ -f "$1" ]] && { printf 'present:'; cat "$1"; } || printf 'absent'
+}
+
+PROFILE=""
+FORMAT=text
+CAPTURE_PATH_METADATA=no
+RUN_DIR=""
+RESUME_DIR=""
+ACTION="${1:-}"
+shift || true
+while (($#)); do
+  case "$1" in
+    --profile) (($# >= 2)) || die "--profile requires a value"; PROFILE="$2"; shift 2 ;;
+    --config) (($# >= 2)) || die "--config requires a value"; CONFIG="$2"; shift 2 ;;
+    --capture-path-metadata) CAPTURE_PATH_METADATA=yes; shift ;;
+    --resume) (($# >= 2)) || die "--resume requires a run directory"; RESUME_DIR="$2"; shift 2 ;;
+    --format) (($# >= 2)) || die "--format requires a value"; FORMAT="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    --*) die "unknown option: $1" ;;
+    *) [[ "$ACTION" == report && -z "$RUN_DIR" ]] || die "unexpected argument: $1"; RUN_DIR="$1"; shift ;;
+  esac
+done
+
+case "$ACTION" in
+  preflight|run|report|plan) ;;
+  -h|--help|"") usage; exit 0 ;;
+  *) die "unknown experiment action: $ACTION" ;;
+esac
+[[ -z "$PROFILE" || "$PROFILE" == staged || "$PROFILE" == captive ]] \
+  || die "--profile must be staged or captive"
+[[ "$FORMAT" == text || "$FORMAT" == json ]] || die "--format must be text or json"
+if [[ "$ACTION" == run ]]; then
+  [[ -n "$PROFILE" ]] || die "run requires --profile staged or captive"
+fi
+[[ -n "$PROFILE" ]] || PROFILE=staged
+[[ -z "$RESUME_DIR" || "$ACTION" == run && "$PROFILE" == captive ]] \
+  || die "--resume is valid only with run --profile captive"
+
+for value in "$BASELINE_MAX" "$BASELINE_QUIET" "$CONNECT_MAX" "$STABILIZE_MIN" \
+  "$STABILIZE_MAX" "$SAMPLE_INTERVAL" "$TAILSCALE_MAX" "$RECOVERY_MAX" \
+  "$RECOVERY_QUIET" "$CASE_DEADMAN" "$CAMPAIGN_DEADMAN"; do
+  [[ "$value" =~ ^[0-9]+$ ]] || die "experiment timing values must be non-negative integers"
+done
+((SAMPLE_INTERVAL > 0)) || die "sample interval must be greater than zero"
+
+PEER_A_ADDRESS=""
+PEER_A_SSH=""
+PEER_B_ADDRESS=""
+PEER_B_SSH=""
+SEATTLE_REGION="usa-seattle"
+NEARBY_REGION="canada-vancouver"
+load_config() {
+  [[ -f "$CONFIG" ]] || die "private config missing: $CONFIG (copy experiment.conf.example)"
+  local mode key value
+  mode="$(/usr/bin/stat -f %Lp "$CONFIG" 2>/dev/null || true)"
+  [[ "$mode" == 600 ]] || die "private config must have mode 0600: $CONFIG (found ${mode:-unknown})"
+  while IFS='=' read -r key value; do
+    [[ -z "$key" || "$key" == \#* ]] && continue
+    case "$key" in
+      PEER_A_ADDRESS|PEER_A_SSH|PEER_B_ADDRESS|PEER_B_SSH|SEATTLE_REGION|NEARBY_REGION)
+        printf -v "$key" '%s' "$value"
+        ;;
+      *) die "unsupported key in private config: $key" ;;
+    esac
+  done <"$CONFIG"
+  for value in "$PEER_A_ADDRESS" "$PEER_A_SSH" "$PEER_B_ADDRESS" "$PEER_B_SSH" \
+    "$SEATTLE_REGION" "$NEARBY_REGION"; do
+    safe_value "$value" || die "private config contains an empty or unsafe value"
+  done
+  [[ "$PEER_A_ADDRESS" =~ ^[A-Za-z0-9._:-]+$ &&
+     "$PEER_B_ADDRESS" =~ ^[A-Za-z0-9._:-]+$ ]] \
+    || die "peer addresses must be hostnames or IP address literals"
+  [[ "$PEER_A_SSH" =~ ^[A-Za-z0-9._@-]+$ &&
+     "$PEER_B_SSH" =~ ^[A-Za-z0-9._@-]+$ ]] \
+    || die "SSH targets must be simple hosts, users, or aliases"
+  [[ "$SEATTLE_REGION" =~ ^[A-Za-z0-9._-]+$ &&
+     "$NEARBY_REGION" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || die "region selections must be simple slugs"
+}
+
+plan_rows() {
+  cat <<EOF
+baseline|split-enabled|conditional=no|cycles=1
+baseline|split-disabled|conditional=supported|cycles=1
+screen|wireguard,seattle,dns-off,both,tailscale-first|conditional=no|cycles=1+2-if-pass
+screen|lightwaytcp,seattle,dns-off,both,tailscale-first|conditional=no|cycles=1+2-if-pass
+screen|lightwayudp,seattle,dns-off,both,tailscale-first|conditional=no|cycles=1+2-if-pass
+challenge|survivors,seattle,dns-on,both,tailscale-first|conditional=connected|cycles=1
+challenge|survivors,smart,dns-off,both,tailscale-first|conditional=connected|cycles=1
+challenge|survivors,nearby,dns-off,both,tailscale-first|conditional=udp-ambiguous|cycles=1
+split|survivors,seattle,dns-off,extension-only,tailscale-first|conditional=connected|cycles=1
+split|survivors,seattle,dns-off,app-only,tailscale-first|conditional=connected|cycles=1
+split|survivors,seattle,dns-off,neither,tailscale-first|conditional=connected|cycles=1
+split|survivors,seattle,dns-off,disabled,tailscale-first|conditional=connected|cycles=1
+startup|survivors,seattle,dns-off,both,vpn-first|conditional=connected|cycles=1
+startup|survivors,seattle,dns-off,both,tailscale-restart|conditional=connected|cycles=1
+repeatability|survivors,best-settings|conditional=survivor|cycles=3
+production|best,reconnect-state-machine|conditional=winner|cycles=1
+production|best,ordinary-disconnect-recovery|conditional=winner|cycles=1
+production|panic-and-baseline-recovery|conditional=no|cycles=1
+EOF
+}
+
+print_plan() {
+  if [[ "$PROFILE" == captive ]]; then
+    if [[ "$FORMAT" == json ]]; then
+      printf '{"profile":"captive","mutationFree":true,"estimatedMaximumSeconds":1080,"cases":'
+      printf '%s\n' \
+        '["detect-real-portal","contain-transfer","portal-standdown","dhcp-dns","owner-sign-in","controlled-rearm","baseline-recovery"]}'
+    else
+      cat <<'EOF'
+profile: captive (field-only; never simulates a portal)
+cases: detect-real-portal, contain-transfer, portal-standdown, DHCP-DNS,
+       owner-sign-in, controlled-rearm, baseline-recovery
+estimated maximum: 18 minutes plus owner portal sign-in time
+EOF
+    fi
+    return
+  fi
+  local estimate
+  estimate=$((2 * BASELINE_MAX + 30 * (CONNECT_MAX + STABILIZE_MAX + TAILSCALE_MAX + RECOVERY_MAX) + 3 * 900))
+  if [[ "$FORMAT" == json ]]; then
+    PLAN_ROWS="$(plan_rows)" PLAN_ESTIMATE="$estimate" /usr/bin/python3 <<'PY'
+import json, os
+rows=[]
+for line in os.environ["PLAN_ROWS"].splitlines():
+    phase,case,conditional,cycles=line.split("|")
+    rows.append({"phase":phase,"case":case,
+                 "conditional":conditional.split("=",1)[1],
+                 "cycles":cycles.split("=",1)[1]})
+print(json.dumps({"profile":"staged","mutationFree":True,
+                  "estimatedMaximumSeconds":int(os.environ["PLAN_ESTIMATE"]),
+                  "cases":rows},indent=2))
+PY
+  else
+    printf 'profile: staged (adaptive)\n'
+    plan_rows | sed 's/|/  /g'
+    printf 'conservative maximum if every branch survives: %dh %dm\n' \
+      "$((estimate / 3600))" "$(((estimate % 3600) / 60))"
+  fi
+}
+
+if [[ "$ACTION" == plan ]]; then
+  print_plan
+  exit 0
+fi
+
+if [[ "$ACTION" == report ]]; then
+  if [[ -z "$RUN_DIR" ]]; then
+    RUN_DIR="$(/bin/ls -1dt "$EXPERIMENT_ROOT"/* 2>/dev/null | head -1 || true)"
+  fi
+  [[ -n "$RUN_DIR" && -d "$RUN_DIR" ]] || die "no experiment run found"
+  [[ -r "$RUN_DIR/report.txt" ]] || die "report is missing: $RUN_DIR/report.txt"
+  cat "$RUN_DIR/report.txt"
+  exit 0
+fi
+
+load_config
+
+preflight_fail=0
+preflight_record() {
+  local id="$1" status="$2" detail="$3"
+  printf '%s\t%s\t%s\n' "$id" "$status" "$detail"
+  [[ "$status" == PASS ]] || preflight_fail=1
+}
+command_present() { [[ -x "$1" ]]; }
+vpn_get() { "$EXPRESSVPN_CTL" --timeout 8 get "$1" 2>/dev/null | head -1; }
+vpn_protocol() {
+  local value
+  value="$(vpn_get protocol || true)"
+  printf '%s\n' "${value##*: }"
+}
+vpn_state() { vpn_get connectionstate; }
+internet_ok() { "$CURL" -fsS --max-time 8 https://captive.apple.com/hotspot-detect.html >/dev/null 2>&1; }
+dns_ok() { "$HOST_CMD" -W 5 example.com >/dev/null 2>&1; }
+ts_ping() {
+  local peer="$1" output
+  if output="$("$TAILSCALE_CLI" ping --c 1 "$peer" 2>&1)"; then return 0; fi
+  printf '%s\n' "$output" | grep -q '^pong from '
+}
+tcp22_ok() { "$NC_CMD" -G 8 -z "$1" 22 >/dev/null 2>&1; }
+ssh_ok() {
+  "$SSH_CMD" -o BatchMode=yes -o ConnectTimeout=10 "$1" 'nice -n 19 true' >/dev/null 2>&1
+}
+pf_enforced() {
+  "$SUDO" -n "$PFCTL" -s info 2>/dev/null | grep -q 'Status: Enabled' &&
+    "$SUDO" -n "$PFCTL" -a com.apple/vpn-guard -sr 2>/dev/null | grep -qE 'block|drop'
+}
+extension_ready() {
+  "$SYSTEMEXTENSIONSCTL" list 2>/dev/null |
+    grep -Ei 'expressvpn.*split|SplitTunnel.*expressvpn' |
+    grep -q 'activated enabled'
+}
+gui_running() { "$PGREP" -f '/Applications/ExpressVPN.app/' >/dev/null 2>&1; }
+daemon_running() { "$PGREP" -f 'expressvpn.*daemon|expressvpnd' >/dev/null 2>&1; }
+tailscale_identity() {
+  "$TAILSCALE_CLI" status --json 2>/dev/null | /usr/bin/python3 -c \
+    'import json,sys; d=json.load(sys.stdin); s=d.get("Self") or {}; print(s.get("ID") or s.get("NodeKey") or s.get("DNSName") or "")' 2>/dev/null
+}
+
+run_preflight() {
+  local version identity
+  for item in "$EXPRESSVPN_CTL:ExpressVPN CLI" "$TAILSCALE_CLI:Tailscale CLI" \
+    "$DARKMESH_CLI:Darkmesh CLI" "$DARKMESH_TRANSFER:transfer containment" \
+    "$VPN_GUARD:PF guard" "$TRANSFER_DOCTOR:transfer binding check" \
+    "$CURL:curl" "$HOST_CMD:host" "$SSH_CMD:ssh" "$NC_CMD:nc"; do
+    command_present "${item%%:*}" \
+      && preflight_record "tool.${item##*:}" PASS "${item##*:} available" \
+      || preflight_record "tool.${item##*:}" PRECONDITION "${item##*:} missing"
+  done
+  [[ "$(id -u)" -ne 0 ]] \
+    && preflight_record user PASS "running as the login user" \
+    || preflight_record user PRECONDITION "run as the login user, not root"
+  gui_running \
+    && preflight_record expressvpn.gui PASS "ExpressVPN GUI running" \
+    || preflight_record expressvpn.gui PRECONDITION "ExpressVPN GUI is not running"
+  daemon_running \
+    && preflight_record expressvpn.daemon PASS "ExpressVPN daemon running" \
+    || preflight_record expressvpn.daemon PRECONDITION "ExpressVPN daemon is not running"
+  version="$("$DEFAULTS" read /Applications/ExpressVPN.app/Contents/Info CFBundleShortVersionString 2>/dev/null || true)"
+  [[ -n "$version" ]] \
+    && preflight_record expressvpn.version PASS "ExpressVPN version $version" \
+    || preflight_record expressvpn.version PRECONDITION "ExpressVPN version unavailable"
+  version="$("$TAILSCALE_CLI" version 2>/dev/null | head -1 || true)"
+  [[ -n "$version" ]] \
+    && preflight_record tailscale.version PASS "Tailscale version $version" \
+    || preflight_record tailscale.version PRECONDITION "Tailscale version unavailable"
+  extension_ready \
+    && preflight_record expressvpn.extension PASS "split extension activated and enabled" \
+    || preflight_record expressvpn.extension PRECONDITION "split extension is not activated and enabled"
+  pf_enforced \
+    && preflight_record containment.pf PASS "PF containment anchor enforced" \
+    || preflight_record containment.pf PRECONDITION "PF containment missing or privilege unavailable"
+  identity="$(tailscale_identity)"
+  [[ -n "$identity" ]] \
+    && preflight_record tailscale.identity PASS "existing Tailscale identity present" \
+    || preflight_record tailscale.identity PRECONDITION "Tailscale identity unavailable"
+  if [[ "$PROFILE" == captive ]]; then
+    preflight_record peers.deferred PASS "peer checks deferred until captive sign-in completes"
+    preflight_record internet.deferred PASS "ordinary internet is not required before captive sign-in"
+    preflight_record dns.deferred PASS "ordinary DNS is not required before captive sign-in"
+  else
+    for pair in "$PEER_A_ADDRESS:$PEER_A_SSH:peer-a" "$PEER_B_ADDRESS:$PEER_B_SSH:peer-b"; do
+      IFS=: read -r address alias label <<<"$pair"
+      ts_ping "$address" \
+        && preflight_record "$label.tailscale" PASS "$label Tailscale reachable" \
+        || preflight_record "$label.tailscale" PRECONDITION "$label Tailscale unreachable"
+      tcp22_ok "$address" \
+        && preflight_record "$label.tcp22" PASS "$label TCP 22 reachable" \
+        || preflight_record "$label.tcp22" PRECONDITION "$label TCP 22 unreachable"
+      ssh_ok "$alias" \
+        && preflight_record "$label.ssh" PASS "$label key-based SSH works" \
+        || preflight_record "$label.ssh" PRECONDITION "$label key-based SSH failed"
+    done
+    internet_ok \
+      && preflight_record internet PASS "ordinary internet reachable" \
+      || preflight_record internet PRECONDITION "ordinary internet unavailable"
+    dns_ok \
+      && preflight_record dns PASS "ordinary DNS works" \
+      || preflight_record dns PRECONDITION "ordinary DNS unavailable"
+  fi
+  [[ "$(vpn_state || true)" == Disconnected ]] \
+    && preflight_record vpn.off PASS "ExpressVPN disconnected" \
+    || preflight_record vpn.off PRECONDITION "ExpressVPN must start disconnected"
+  [[ "$(vpn_protocol)" == lightway* ]] \
+    && preflight_record vpn.protocol PASS "saved protocol is Lightway" \
+    || preflight_record vpn.protocol PRECONDITION "saved protocol must be a Lightway variant before the campaign"
+  [[ "$(vpn_get region || true)" == "$SEATTLE_REGION" ]] \
+    && preflight_record vpn.region PASS "saved region is the configured Seattle selection" \
+    || preflight_record vpn.region PRECONDITION "saved region must match SEATTLE_REGION before the campaign"
+  [[ "$(file_value "$VPN_INTENT")" == "present:off" ]] \
+    && preflight_record vpn.intent PASS "VPN intent off" \
+    || preflight_record vpn.intent PRECONDITION "VPN intent must be off before the campaign"
+  [[ "$(file_value "$TRANSFER_INTENT")" == "present:paused" ]] \
+    && preflight_record transfer.intent PASS "transfer intent explicitly paused" \
+    || preflight_record transfer.intent PRECONDITION "transfer intent must be paused before the campaign"
+  [[ "$CAPTURE_PATH_METADATA" != yes ]] || {
+    command_present "$TCPDUMP" && command_present "$NETTOP" \
+      && preflight_record metadata.tools PASS "bounded metadata tools available" \
+      || preflight_record metadata.tools PRECONDITION "metadata tools missing"
+  }
+}
+
+if [[ "$ACTION" == preflight ]]; then
+  run_preflight
+  exit "$preflight_fail"
+fi
+
+mkdir -p "$EXPERIMENT_ROOT"
+chmod 700 "$EXPERIMENT_ROOT"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  die "another experiment is active: $LOCK_DIR"
+fi
+if [[ -n "$RESUME_DIR" ]]; then
+  RUN_DIR="$RESUME_DIR"
+  [[ -d "$RUN_DIR" && -r "$RUN_DIR/initial-state.json" ]] \
+    || die "captive run is not resumable: $RUN_DIR"
+  [[ "$(/usr/bin/stat -f %Lp "$RUN_DIR" 2>/dev/null || true)" == 700 ]] \
+    || die "captive run directory must retain mode 0700"
+  mkdir -p "$RUN_DIR/cases" "$RUN_DIR/metadata"
+  chmod 600 "$RUN_DIR/preflight.tsv" "$RUN_DIR/report.txt" "$RUN_DIR/summary.json" 2>/dev/null || true
+else
+  RUN_ID="$(now_iso | tr ':+' '__')-$$"
+  RUN_DIR="$EXPERIMENT_ROOT/$RUN_ID"
+  mkdir -m 700 "$RUN_DIR" "$RUN_DIR/cases" "$RUN_DIR/metadata"
+fi
+OBSERVATIONS="$RUN_DIR/observations.jsonl"
+REPORT="$RUN_DIR/report.txt"
+PREFLIGHT="$RUN_DIR/preflight.tsv"
+INITIAL="$RUN_DIR/initial-state.json"
+FINAL="$RUN_DIR/final-restoration.json"
+touch "$OBSERVATIONS" "$REPORT"
+chmod 600 "$OBSERVATIONS" "$REPORT"
+
+observe() {
+  local event="$1" case_id="${2:-campaign}" classification="${3:-info}" detail="${4:-}"
+  OBS_TS="$(now_iso)" OBS_EVENT="$event" OBS_CASE="$case_id" \
+    OBS_CLASS="$classification" OBS_DETAIL="$detail" /usr/bin/python3 >>"$OBSERVATIONS" <<'PY'
+import json,os
+print(json.dumps({"timestamp":os.environ["OBS_TS"],"event":os.environ["OBS_EVENT"],
+ "case":os.environ["OBS_CASE"],"classification":os.environ["OBS_CLASS"],
+ "detail":os.environ["OBS_DETAIL"]},separators=(",",":")))
+PY
+}
+
+capture_state() {
+  local target="$1"
+  STATE_PROTOCOL="$(vpn_protocol)"
+  STATE_REGION="$(vpn_get region || true)"
+  STATE_SPLIT="$(vpn_get splittunnel || true)"
+  STATE_RULES="$("$EXPRESSVPN_CTL" --timeout 8 get split-app 2>/dev/null || true)"
+  STATE_LOCK="$(vpn_get networklock || true)"
+  STATE_AUTOCONNECT="$(vpn_get autoconnect || true)"
+  STATE_VPN="$(vpn_state || true)"
+  STATE_TS_ID="$(tailscale_identity)"
+  STATE_TS_PREFS="$("$TAILSCALE_CLI" debug prefs 2>/dev/null || true)"
+  STATE_VPN_INTENT="$(file_value "$VPN_INTENT")"
+  STATE_TRANSFER_INTENT="$(file_value "$TRANSFER_INTENT")"
+  STATE_EXTENSIONS="$("$SYSTEMEXTENSIONSCTL" list 2>/dev/null | grep -Ei 'expressvpn|tailscale' || true)"
+  STATE_ROUTES="$("$NETSTAT" -rn -f inet 2>/dev/null || true)"
+  STATE_RESOLVERS="$("$SCUTIL" --dns 2>/dev/null || true)"
+  STATE_TS_STATUS="$("$TAILSCALE_CLI" status --json 2>/dev/null || true)"
+  STATE_TS_NETCHECK="$("$TAILSCALE_CLI" netcheck 2>/dev/null || true)"
+  STATE_EXPRESSVPN_VERSION="$("$DEFAULTS" read /Applications/ExpressVPN.app/Contents/Info CFBundleShortVersionString 2>/dev/null || true)"
+  STATE_TAILSCALE_VERSION="$("$TAILSCALE_CLI" version 2>/dev/null | head -1 || true)"
+  STATE_PROTOCOL="$STATE_PROTOCOL" STATE_REGION="$STATE_REGION" STATE_SPLIT="$STATE_SPLIT" \
+  STATE_RULES="$STATE_RULES" STATE_LOCK="$STATE_LOCK" STATE_AUTOCONNECT="$STATE_AUTOCONNECT" \
+  STATE_VPN="$STATE_VPN" STATE_TS_ID="$STATE_TS_ID" STATE_TS_PREFS="$STATE_TS_PREFS" \
+  STATE_VPN_INTENT="$STATE_VPN_INTENT" STATE_TRANSFER_INTENT="$STATE_TRANSFER_INTENT" \
+  STATE_EXTENSIONS="$STATE_EXTENSIONS" CAPTURED_AT="$(now_iso)" \
+  STATE_ROUTES="$STATE_ROUTES" STATE_RESOLVERS="$STATE_RESOLVERS" \
+  STATE_TS_STATUS="$STATE_TS_STATUS" STATE_TS_NETCHECK="$STATE_TS_NETCHECK" \
+  STATE_EXPRESSVPN_VERSION="$STATE_EXPRESSVPN_VERSION" \
+  STATE_TAILSCALE_VERSION="$STATE_TAILSCALE_VERSION" \
+    /usr/bin/python3 - "$target" <<'PY'
+import json,os,sys
+out={k.lower():os.environ.get(k,"") for k in (
+ "STATE_PROTOCOL","STATE_REGION","STATE_SPLIT","STATE_RULES","STATE_LOCK",
+ "STATE_AUTOCONNECT","STATE_VPN","STATE_TS_ID","STATE_TS_PREFS",
+ "STATE_VPN_INTENT","STATE_TRANSFER_INTENT","STATE_EXTENSIONS","STATE_ROUTES",
+ "STATE_RESOLVERS","STATE_TS_STATUS","STATE_TS_NETCHECK",
+ "STATE_EXPRESSVPN_VERSION","STATE_TAILSCALE_VERSION")}
+out["captured_at"]=os.environ["CAPTURED_AT"]
+with open(sys.argv[1],"w") as f: json.dump(out,f,indent=2,sort_keys=True); f.write("\n")
+PY
+  chmod 600 "$target"
+}
+
+read_initial() {
+  /usr/bin/python3 - "$INITIAL" "$1" <<'PY'
+import json,sys
+v=json.load(open(sys.argv[1])).get(sys.argv[2],"")
+print(v,end="")
+PY
+}
+restore_file_value() {
+  local path="$1" encoded="$2"
+  case "$encoded" in
+    absent) rm -f "$path" ;;
+    present:*) mkdir -p "$(dirname "$path")"; printf '%s' "${encoded#present:}" >"$path" ;;
+    *) return 1 ;;
+  esac
+}
+set_tailscale_dns() {
+  local value="$1"
+  "$TAILSCALE_CLI" set "--accept-dns=$value" >/dev/null 2>&1
+}
+initial_accept_dns() {
+  /usr/bin/python3 - "$INITIAL" <<'PY'
+import json,re,sys
+p=json.load(open(sys.argv[1])).get("state_ts_prefs","")
+m=re.search(r'"?CorpDNS"?\s*:\s*(true|false)',p,re.I)
+if not m: m=re.search(r'"?AcceptDNS"?\s*:\s*(true|false)',p,re.I)
+print(m.group(1).lower() if m else "unknown")
+PY
+}
+restore_split_rules() {
+  local original current entry
+  original="$(read_initial state_rules)"
+  current="$("$EXPRESSVPN_CTL" --timeout 8 get split-app 2>/dev/null || true)"
+  while IFS= read -r entry; do
+    [[ "$entry" == bypass:* ]] || continue
+    "$EXPRESSVPN_CTL" --timeout 8 set split-app "remove:${entry#bypass:}" >/dev/null 2>&1 || return 1
+  done <<<"$current"
+  while IFS= read -r entry; do
+    [[ "$entry" == bypass:* ]] || continue
+    "$EXPRESSVPN_CTL" --timeout 8 set split-app "$entry" >/dev/null 2>&1 || return 1
+  done <<<"$original"
+  "$EXPRESSVPN_CTL" --timeout 8 set splittunnel "$(read_initial state_split)" >/dev/null 2>&1
+  [[ "$("$EXPRESSVPN_CTL" --timeout 8 get split-app 2>/dev/null || true)" == "$original" ]]
+}
+tailscale_up_existing() {
+  local before output after
+  before="$(read_initial state_ts_id)"
+  if ! output="$("$TAILSCALE_CLI" up 2>&1)"; then
+    observe tailscale-up "${CURRENT_CASE:-campaign}" precondition "$output"
+    return 1
+  fi
+  if printf '%s' "$output" | grep -qiE 'login|authenticate|authorization|new identity'; then
+    observe tailscale-up "${CURRENT_CASE:-campaign}" precondition "authentication or identity replacement requested"
+    return 1
+  fi
+  after="$(tailscale_identity)"
+  [[ -n "$before" && "$after" == "$before" ]]
+}
+
+fingerprint() {
+  {
+    "$NETSTAT" -rn -f inet 2>/dev/null | awk '$1=="default" || $1=="0/1" || $1=="128.0/1" {print}'
+    "$IFCONFIG" -l 2>/dev/null
+    "$SCUTIL" --dns 2>/dev/null | grep -E 'resolver #|nameserver\\[[0-9]+\\]|if_index|flags' || true
+    printf 'vpn=%s\n' "$(vpn_state || true)"
+    "$SYSTEMEXTENSIONSCTL" list 2>/dev/null | grep -Ei 'expressvpn|tailscale' || true
+  } | "$SHASUM" -a 256 | awk '{print $1}'
+}
+all_peers_once() {
+  ts_ping "$PEER_A_ADDRESS" && tcp22_ok "$PEER_A_ADDRESS" && ssh_ok "$PEER_A_SSH" &&
+    ts_ping "$PEER_B_ADDRESS" && tcp22_ok "$PEER_B_ADDRESS" && ssh_ok "$PEER_B_SSH"
+}
+tailscale_control_ok() {
+  "$TAILSCALE_CLI" status --json 2>/dev/null | /usr/bin/python3 -c \
+    'import json,sys; print(json.load(sys.stdin).get("BackendState",""))' 2>/dev/null |
+    grep -qx Running
+}
+baseline_healthy() {
+  [[ "$(vpn_state || true)" == Disconnected ]] && internet_ok && dns_ok && all_peers_once && pf_enforced
+}
+vpn_healthy() {
+  [[ "$(vpn_state || true)" == Connected ]] && internet_ok && dns_ok && pf_enforced
+}
+wait_convergence() {
+  local kind="$1" max="$2" quiet="$3" required="$4" health="$5"
+  local start now last_change fingerprint_now last="" stable=0
+  start="$(now_epoch)"; last_change="$start"
+  while :; do
+    now="$(now_epoch)"
+    fingerprint_now="$(fingerprint)"
+    if [[ "$fingerprint_now" != "$last" ]]; then
+      [[ -z "$last" ]] || observe convergence-reset "${CURRENT_CASE:-campaign}" "$kind" "route/interface/DNS/VPN/extension fingerprint changed"
+      last="$fingerprint_now"; last_change="$now"; stable=0
+    fi
+    if "$health"; then stable=$((stable + 1)); else stable=0; fi
+    if ((stable >= required && now - last_change >= quiet)); then return 0; fi
+    if ((now - start >= max)); then return 1; fi
+    "$SLEEP" "$SAMPLE_INTERVAL"
+  done
+}
+wait_connected() {
+  local start now
+  start="$(now_epoch)"
+  while :; do
+    [[ "$(vpn_state || true)" == Connected ]] && return 0
+    now="$(now_epoch)"
+    ((now - start < CONNECT_MAX)) || return 1
+    "$SLEEP" 2
+  done
+}
+wait_vpn_stable() {
+  local start now stable=0 last="" current
+  start="$(now_epoch)"
+  while :; do
+    now="$(now_epoch)"
+    current="$(fingerprint)"
+    if [[ "$current" != "$last" ]]; then
+      [[ -z "$last" ]] || observe convergence-reset "$CURRENT_CASE" stabilization "fingerprint changed"
+      last="$current"; stable=0
+    elif vpn_healthy; then
+      stable=$((stable + 1))
+    else
+      stable=0
+    fi
+    if ((now - start >= STABILIZE_MIN && stable >= 3)); then return 0; fi
+    ((now - start < STABILIZE_MAX)) || return 1
+    "$SLEEP" "$SAMPLE_INTERVAL"
+  done
+}
+wait_tailscale_convergence() {
+  local start now a=0 b=0
+  start="$(now_epoch)"
+  while :; do
+    ts_ping "$PEER_A_ADDRESS" && tcp22_ok "$PEER_A_ADDRESS" && ssh_ok "$PEER_A_SSH" \
+      && a=$((a + 1)) || a=0
+    ts_ping "$PEER_B_ADDRESS" && tcp22_ok "$PEER_B_ADDRESS" && ssh_ok "$PEER_B_SSH" \
+      && b=$((b + 1)) || b=0
+    ((a >= 2 && b >= 2)) && return 0
+    [[ "$(vpn_state || true)" == Connected ]] || return 1
+    now="$(now_epoch)"
+    ((now - start < TAILSCALE_MAX)) || return 1
+    "$SLEEP" "$SAMPLE_INTERVAL"
+  done
+}
+
+contain_transfers() {
+  "$DARKMESH_TRANSFER" pause >/dev/null 2>&1 || return 1
+  "$VPN_GUARD" --force-unsafe >/dev/null 2>&1 || return 1
+  pf_enforced
+}
+remove_all_tailscale_rules() {
+  local current entry
+  current="$("$EXPRESSVPN_CTL" --timeout 8 get split-app 2>/dev/null || true)"
+  while IFS= read -r entry; do
+    [[ "$entry" == bypass:* ]] || continue
+    if [[ "$entry" == *Tailscale.app* || "$entry" == *io.tailscale.ipn.macsys.network-extension* ]]; then
+      "$EXPRESSVPN_CTL" --timeout 8 set split-app "remove:${entry#bypass:}" >/dev/null 2>&1 || return 1
+    fi
+  done <<<"$current"
+}
+set_split_mode() {
+  local mode="$1" original app="" extension="" entry
+  original="$(read_initial state_rules)"
+  remove_all_tailscale_rules
+  while IFS= read -r entry; do
+    [[ "$entry" == bypass:* ]] || continue
+    [[ "$entry" == *Tailscale.app* ]] && app="$entry"
+    [[ "$entry" == *io.tailscale.ipn.macsys.network-extension* ]] && extension="$entry"
+  done <<<"$original"
+  case "$mode" in
+    both)
+      [[ -n "$app" && -n "$extension" ]] || return 1
+      "$EXPRESSVPN_CTL" --timeout 8 set split-app "$app" >/dev/null 2>&1
+      "$EXPRESSVPN_CTL" --timeout 8 set split-app "$extension" >/dev/null 2>&1
+      "$EXPRESSVPN_CTL" --timeout 8 set splittunnel true >/dev/null 2>&1
+      ;;
+    app-only)
+      [[ -n "$app" ]] || return 1
+      "$EXPRESSVPN_CTL" --timeout 8 set split-app "$app" >/dev/null 2>&1
+      "$EXPRESSVPN_CTL" --timeout 8 set splittunnel true >/dev/null 2>&1
+      ;;
+    extension-only)
+      [[ -n "$extension" ]] || return 1
+      "$EXPRESSVPN_CTL" --timeout 8 set split-app "$extension" >/dev/null 2>&1
+      "$EXPRESSVPN_CTL" --timeout 8 set splittunnel true >/dev/null 2>&1
+      ;;
+    neither) "$EXPRESSVPN_CTL" --timeout 8 set splittunnel true >/dev/null 2>&1 ;;
+    disabled) "$EXPRESSVPN_CTL" --timeout 8 set splittunnel false >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+capture_path_metadata() {
+  local case_id="$1" output
+  output="$RUN_DIR/metadata/$case_id.txt"
+  [[ "$CAPTURE_PATH_METADATA" == yes ]] || return 0
+  {
+    printf 'captured_at=%s\n' "$(now_iso)"
+    printf 'routes:\n'; "$NETSTAT" -rn -f inet 2>/dev/null
+    printf 'process_paths:\n'; "$NETTOP" -P -L 1 -J bytes_in,bytes_out,state 2>/dev/null | head -120 || true
+    printf 'packet_headers_no_payload:\n'
+    "$PERL" -e 'alarm shift; exec @ARGV' 20 \
+      "$SUDO" -n "$TCPDUMP" -n -q -l -c 20 -i any \
+      '(host 100.100.100.100 or port 22 or port 41641 or port 3478 or port 443)' \
+      2>/dev/null || true
+  } >"$output"
+  chmod 400 "$output"
+}
+
+CASE_DEADMAN_PID=""
+CAMPAIGN_DEADMAN_PID=""
+deadman_restore_state() {
+  local accept_dns
+  [[ -r "$INITIAL" ]] || return 1
+  "$DARKMESH_CLI" panic >/dev/null 2>&1 || true
+  "$EXPRESSVPN_CTL" --timeout 10 disconnect >/dev/null 2>&1 || true
+  "$EXPRESSVPN_CTL" --timeout 8 set protocol "$(read_initial state_protocol)" >/dev/null 2>&1 || return 1
+  "$EXPRESSVPN_CTL" --timeout 8 set region "$(read_initial state_region)" >/dev/null 2>&1 || return 1
+  restore_split_rules || return 1
+  "$EXPRESSVPN_CTL" --timeout 8 set networklock "$(read_initial state_lock)" >/dev/null 2>&1 || return 1
+  "$EXPRESSVPN_CTL" --timeout 8 set autoconnect "$(read_initial state_autoconnect)" >/dev/null 2>&1 || return 1
+  accept_dns="$(initial_accept_dns)"
+  [[ "$accept_dns" == unknown ]] || set_tailscale_dns "$accept_dns" || return 1
+  tailscale_up_existing || return 1
+  restore_file_value "$VPN_INTENT" "$(read_initial state_vpn_intent)" || return 1
+  restore_file_value "$TRANSFER_INTENT" "$(read_initial state_transfer_intent)" || return 1
+}
+spawn_deadman() {
+  local scope="$1" seconds="$2"
+  [[ "${DARKMESH_EXPERIMENT_DISABLE_DEADMAN:-no}" == yes ]] && return
+  (
+    "$SLEEP" "$seconds"
+    printf '%s\n' "$scope deadman expired" >>"$RUN_DIR/deadman.log"
+    if deadman_restore_state; then
+      printf '%s\n' "$scope deadman restored captured state" >>"$RUN_DIR/deadman.log"
+    else
+      printf '%s\n' "$scope deadman restoration incomplete" >>"$RUN_DIR/deadman.log"
+    fi
+    kill -TERM "$$" >/dev/null 2>&1 || true
+  ) </dev/null >/dev/null 2>&1 &
+  if [[ "$scope" == case ]]; then CASE_DEADMAN_PID=$!; else CAMPAIGN_DEADMAN_PID=$!; fi
+}
+stop_case_deadman() {
+  [[ -z "$CASE_DEADMAN_PID" ]] || {
+    kill "$CASE_DEADMAN_PID" >/dev/null 2>&1 || true
+    wait "$CASE_DEADMAN_PID" >/dev/null 2>&1 || true
+    CASE_DEADMAN_PID=""
+  }
+}
+
+restore_campaign() {
+  local ok=yes accept_dns
+  observe restoration-start campaign recovery "restoring exact initial state"
+  "$DARKMESH_CLI" panic >/dev/null 2>&1 || ok=no
+  "$EXPRESSVPN_CTL" --timeout 10 disconnect >/dev/null 2>&1 || true
+  "$EXPRESSVPN_CTL" --timeout 8 set protocol "$(read_initial state_protocol)" >/dev/null 2>&1 || ok=no
+  "$EXPRESSVPN_CTL" --timeout 8 set region "$(read_initial state_region)" >/dev/null 2>&1 || ok=no
+  restore_split_rules || ok=no
+  "$EXPRESSVPN_CTL" --timeout 8 set networklock "$(read_initial state_lock)" >/dev/null 2>&1 || ok=no
+  "$EXPRESSVPN_CTL" --timeout 8 set autoconnect "$(read_initial state_autoconnect)" >/dev/null 2>&1 || ok=no
+  accept_dns="$(initial_accept_dns)"
+  [[ "$accept_dns" == unknown ]] || set_tailscale_dns "$accept_dns" || ok=no
+  tailscale_up_existing || ok=no
+  restore_file_value "$VPN_INTENT" "$(read_initial state_vpn_intent)" || ok=no
+  restore_file_value "$TRANSFER_INTENT" "$(read_initial state_transfer_intent)" || ok=no
+  if ! wait_convergence recovery "$RECOVERY_MAX" "$RECOVERY_QUIET" 3 baseline_healthy; then ok=no; fi
+  capture_state "$FINAL"
+  FINAL_MATCH=no
+  /usr/bin/python3 - "$INITIAL" "$FINAL" <<'PY' >/dev/null 2>&1 && FINAL_MATCH=yes || true
+import json,sys
+a=json.load(open(sys.argv[1])); b=json.load(open(sys.argv[2]))
+keys=("state_protocol","state_region","state_split","state_rules","state_lock",
+      "state_autoconnect","state_ts_id","state_ts_prefs","state_extensions",
+      "state_vpn_intent","state_transfer_intent")
+raise SystemExit(0 if all(a.get(k)==b.get(k) for k in keys)
+                 and b.get("state_vpn")=="Disconnected" else 1)
+PY
+  [[ "$FINAL_MATCH" == yes ]] || ok=no
+  RESTORATION_STATUS="$ok"
+  observe restoration-finish campaign recovery "exact_match=$FINAL_MATCH healthy=$ok"
+  [[ "$ok" == yes ]]
+}
+
+CAMPAIGN_RC=1
+CLEANING=no
+CAPTIVE_WAITING=no
+CURRENT_CASE=campaign
+cleanup() {
+  local signal_rc=$?
+  [[ "$CLEANING" == yes ]] && return
+  CLEANING=yes
+  trap - EXIT INT TERM HUP
+  rm -f "$RUN_DIR/.portal-body"
+  stop_case_deadman
+  [[ -z "$CAMPAIGN_DEADMAN_PID" ]] || {
+    kill "$CAMPAIGN_DEADMAN_PID" >/dev/null 2>&1 || true
+    wait "$CAMPAIGN_DEADMAN_PID" >/dev/null 2>&1 || true
+  }
+  if [[ "$CAPTIVE_WAITING" == yes ]]; then
+    RESTORATION_STATUS=standdown
+  elif [[ -r "$INITIAL" ]]; then
+    restore_campaign || CAMPAIGN_RC=1
+  else
+    RESTORATION_STATUS=no
+  fi
+  /usr/bin/python3 - "$RUN_DIR" "${RESTORATION_STATUS:-no}" "$CAMPAIGN_RC" <<'PY'
+import json,os,sys
+root,restored,rc=sys.argv[1:]
+cases=[]
+for name in sorted(os.listdir(os.path.join(root,"cases"))):
+    if not name.endswith(".json"): continue
+    try: cases.append(json.load(open(os.path.join(root,"cases",name))))
+    except Exception: pass
+summary={
+ "run":os.path.basename(root),"restoration_verified":restored=="yes",
+ "campaign_rc":int(rc),"cases":len(cases),
+ "passed":sum(c.get("outcome")=="PASS" for c in cases),
+ "preconditions":sum(c.get("outcome")=="PRECONDITION" for c in cases),
+ "failed":sum(c.get("outcome")=="FAIL" for c in cases)}
+with open(os.path.join(root,"summary.json"),"w") as f:
+ json.dump(summary,f,indent=2); f.write("\n")
+lines=[
+ "Darkmesh coexistence experiment",
+ "run: "+summary["run"],
+ "restoration verified: "+str(summary["restoration_verified"]).lower(),
+ "cases: {cases}  passed: {passed}  preconditions: {preconditions}  failed: {failed}".format(**summary),
+ "",
+ "Corrected historical conclusions:",
+ "- ExpressVPN, Tailscale, SSH, and fail-closed transfer protection previously coexisted.",
+ "- WireGuard with Tailscale accept-dns=false is the strongest historical success.",
+ "- Lightway stability is not historically established.",
+ "- Changing VPN region did not solve the historical DNS collision.",
+ "- ExpressVPN split tunneling can affect the local network while disconnected.",
+ "- The latest Seattle trial stopped at a root-only background-mode precondition; it was not a fast Lightway failure.",
+]
+for c in cases:
+ lines.append("- {id}: {outcome} [{classification}]".format(**c))
+with open(os.path.join(root,"report.txt"),"w") as f: f.write("\n".join(lines)+"\n")
+PY
+  chmod 400 "$FINAL" "$RUN_DIR/summary.json" "$REPORT" 2>/dev/null || true
+  rmdir "$LOCK_DIR" >/dev/null 2>&1 || true
+  if [[ "$CAPTIVE_WAITING" == yes ]]; then
+    printf 'Captive standdown is active. Complete portal sign-in, then run:\n'
+    printf '  darkmesh experiment run --profile captive --resume %q\n' "$RUN_DIR"
+    exit 3
+  fi
+  if [[ "$RESTORATION_STATUS" != yes ]]; then
+    printf 'ERROR: restoration verification failed; inspect %s\n' "$RUN_DIR" >&2
+    exit 1
+  fi
+  printf 'Experiment evidence: %s\n' "$RUN_DIR"
+  [[ "$signal_rc" -eq 0 ]] || CAMPAIGN_RC="$signal_rc"
+  exit "$CAMPAIGN_RC"
+}
+trap cleanup EXIT
+trap 'observe signal "$CURRENT_CASE" recovery "INT"; CAMPAIGN_RC=130; exit 130' INT
+trap 'observe signal "$CURRENT_CASE" recovery "TERM"; CAMPAIGN_RC=143; exit 143' TERM
+trap 'observe signal "$CURRENT_CASE" recovery "HUP"; CAMPAIGN_RC=129; exit 129' HUP
+
+run_preflight >"$PREFLIGHT"
+chmod 400 "$PREFLIGHT"
+if ((preflight_fail)); then
+  cat "$PREFLIGHT"
+  observe preflight campaign precondition "one or more preconditions failed"
+  exit 1
+fi
+if [[ "$CAPTURE_PATH_METADATA" == yes ]]; then
+  printf 'Administrator approval is requested once for bounded textual path metadata.\n'
+  "$SUDO" -v || { observe privilege campaign precondition "administrator session unavailable"; exit 1; }
+fi
+if [[ -z "$RESUME_DIR" ]]; then
+  capture_state "$INITIAL"
+  chmod 400 "$INITIAL"
+fi
+spawn_deadman campaign "$CAMPAIGN_DEADMAN"
+if [[ "${DARKMESH_EXPERIMENT_TEST_SIGNAL_AFTER_SNAPSHOT:-no}" == yes ]]; then
+  kill -TERM "$$"
+fi
+if [[ "${DARKMESH_EXPERIMENT_TEST_DEADMAN_AFTER_SNAPSHOT:-no}" == yes ]]; then
+  printf '%s\n' "campaign deadman expired" >>"$RUN_DIR/deadman.log"
+  deadman_restore_state
+  kill -TERM "$$"
+fi
+
+case_result() {
+  local id="$1" outcome="$2" classification="$3" detail="$4"
+  CASE_ID="$id" CASE_OUTCOME="$outcome" CASE_CLASS="$classification" CASE_DETAIL="$detail" \
+    CASE_AT="$(now_iso)" /usr/bin/python3 - "$RUN_DIR/cases/$id.json" <<'PY'
+import json,os,sys
+evidence_path=sys.argv[1]+".evidence"
+try: evidence=json.load(open(evidence_path))
+except Exception: evidence={}
+with open(sys.argv[1],"w") as f:
+ json.dump({"id":os.environ["CASE_ID"],"outcome":os.environ["CASE_OUTCOME"],
+  "classification":os.environ["CASE_CLASS"],"detail":os.environ["CASE_DETAIL"],
+  "finished_at":os.environ["CASE_AT"],"evidence":evidence},f,indent=2); f.write("\n")
+PY
+  rm -f "$RUN_DIR/cases/$id.json.evidence"
+  chmod 400 "$RUN_DIR/cases/$id.json"
+  observe case-finish "$id" "$classification" "$outcome: $detail"
+}
+
+capture_case_evidence() {
+  local id="$1" routes resolvers ts_status netcheck tunnel_iface tunnel_ip path_a path_b
+  routes="$("$NETSTAT" -rn -f inet 2>/dev/null | awk '$1=="default" || $1=="0/1" || $1=="128.0/1" {print}' || true)"
+  resolvers="$("$SCUTIL" --dns 2>/dev/null | grep -E 'resolver #|nameserver\\[[0-9]+\\]|if_index|flags' || true)"
+  ts_status="$("$TAILSCALE_CLI" status --json 2>/dev/null || true)"
+  netcheck="$("$TAILSCALE_CLI" netcheck 2>/dev/null || true)"
+  tunnel_iface="$(printf '%s\n' "$routes" | awk '$1=="0/1" || $1=="128.0/1" {print $NF; exit}')"
+  tunnel_ip=""
+  [[ -z "$tunnel_iface" ]] || tunnel_ip="$("$IFCONFIG" "$tunnel_iface" 2>/dev/null | awk '/inet / {print $2; exit}' || true)"
+  path_a="$("$TAILSCALE_CLI" ping --c 1 "$PEER_A_ADDRESS" 2>&1 || true)"
+  path_b="$("$TAILSCALE_CLI" ping --c 1 "$PEER_B_ADDRESS" 2>&1 || true)"
+  CASE_ROUTES="$routes" CASE_RESOLVERS="$resolvers" CASE_TS_STATUS="$ts_status" \
+  CASE_NETCHECK="$netcheck" CASE_TUNNEL_IP="$tunnel_ip" CASE_PATH_A="$path_a" \
+  CASE_PATH_B="$path_b" CASE_VPN_STATE="$(vpn_state || true)" \
+    /usr/bin/python3 - "$RUN_DIR/cases/$id.json.evidence" <<'PY'
+import hashlib,ipaddress,json,os,sys
+address=os.environ.get("CASE_TUNNEL_IP","")
+kind="none"
+try:
+    ip=ipaddress.ip_address(address)
+    if ip in ipaddress.ip_network("100.64.0.0/10"): kind="cgnat"
+    elif ip in ipaddress.ip_network("10.0.0.0/8"): kind="private-10"
+    elif ip.is_private: kind="private-other"
+    else: kind="public"
+except ValueError: pass
+try: status=json.loads(os.environ.get("CASE_TS_STATUS",""))
+except Exception: status={}
+out={
+ "vpn_state":os.environ.get("CASE_VPN_STATE",""),
+ "tunnel_address_class":kind,
+ "routes":os.environ.get("CASE_ROUTES","").splitlines(),
+ "resolver_fingerprint":hashlib.sha256(
+     os.environ.get("CASE_RESOLVERS","").encode()).hexdigest(),
+ "tailscale_backend":status.get("BackendState"),
+ "tailscale_paths":{
+   "peer-a":os.environ.get("CASE_PATH_A",""),
+   "peer-b":os.environ.get("CASE_PATH_B","")},
+ "netcheck":os.environ.get("CASE_NETCHECK",""),
+}
+with open(sys.argv[1],"w") as f: json.dump(out,f,indent=2); f.write("\n")
+PY
+  chmod 600 "$RUN_DIR/cases/$id.json.evidence"
+}
+
+recover_case() {
+  local accept_dns
+  stop_case_deadman
+  "$DARKMESH_CLI" panic >/dev/null 2>&1 || return 1
+  "$EXPRESSVPN_CTL" --timeout 10 disconnect >/dev/null 2>&1 || true
+  "$EXPRESSVPN_CTL" --timeout 8 set protocol "$(read_initial state_protocol)" >/dev/null 2>&1 || return 1
+  "$EXPRESSVPN_CTL" --timeout 8 set region "$(read_initial state_region)" >/dev/null 2>&1 || return 1
+  restore_split_rules || return 1
+  "$EXPRESSVPN_CTL" --timeout 8 set networklock "$(read_initial state_lock)" >/dev/null 2>&1 || return 1
+  "$EXPRESSVPN_CTL" --timeout 8 set autoconnect "$(read_initial state_autoconnect)" >/dev/null 2>&1 || return 1
+  accept_dns="$(initial_accept_dns)"
+  [[ "$accept_dns" == unknown ]] || set_tailscale_dns "$accept_dns" || return 1
+  tailscale_up_existing || return 1
+  wait_convergence recovery "$RECOVERY_MAX" "$RECOVERY_QUIET" 3 baseline_healthy || return 1
+  [[ "$(vpn_protocol)" == "$(read_initial state_protocol)" ]] &&
+    [[ "$(vpn_get region || true)" == "$(read_initial state_region)" ]] &&
+    [[ "$(vpn_get networklock || true)" == "$(read_initial state_lock)" ]] &&
+    [[ "$(vpn_get autoconnect || true)" == "$(read_initial state_autoconnect)" ]] &&
+    [[ "$(tailscale_identity)" == "$(read_initial state_ts_id)" ]]
+}
+
+run_case() {
+  local id="$1" protocol="$2" region="$3" accept_dns="$4" split_mode="$5" startup="$6" cycles="${7:-1}"
+  local cycle outcome=PASS class=none detail="all dimensions passed"
+  CURRENT_CASE="$id"
+  observe case-start "$id" info "protocol=$protocol region=$region dns=$accept_dns split=$split_mode startup=$startup cycles=$cycles"
+  spawn_deadman case "$CASE_DEADMAN"
+  for ((cycle=1; cycle<=cycles; cycle++)); do
+    contain_transfers || { outcome=PRECONDITION; class=transfer-containment; detail="PF containment unavailable"; break; }
+    "$EXPRESSVPN_CTL" --timeout 8 set networklock false >/dev/null 2>&1 \
+      || { outcome=PRECONDITION; class=privilege; detail="cannot set Network Lock"; break; }
+    "$EXPRESSVPN_CTL" --timeout 8 set autoconnect false >/dev/null 2>&1 \
+      || { outcome=PRECONDITION; class=privilege; detail="cannot set autoconnect"; break; }
+    "$EXPRESSVPN_CTL" --timeout 8 set protocol "$protocol" >/dev/null 2>&1 \
+      || { outcome=PRECONDITION; class=connection; detail="protocol unsupported"; break; }
+    "$EXPRESSVPN_CTL" --timeout 8 set region "$region" >/dev/null 2>&1 \
+      || { outcome=PRECONDITION; class=connection; detail="region unsupported"; break; }
+    set_tailscale_dns "$accept_dns" \
+      || { outcome=PRECONDITION; class=tailscale-control; detail="cannot set accept-dns"; break; }
+    set_split_mode "$split_mode" \
+      || { outcome=PRECONDITION; class=split-routing; detail="split mode unsupported or required rules missing"; break; }
+    case "$startup" in
+      tailscale-first) tailscale_up_existing || { outcome=PRECONDITION; class=identity; detail="existing Tailscale identity did not start"; break; } ;;
+      vpn-first) "$TAILSCALE_CLI" down >/dev/null 2>&1 || { outcome=PRECONDITION; class=tailscale-control; detail="Tailscale down failed"; break; } ;;
+      tailscale-restart) tailscale_up_existing || { outcome=PRECONDITION; class=identity; detail="existing Tailscale identity did not start"; break; } ;;
+      *) outcome=PRECONDITION; class=startup-order; detail="unsupported startup order"; break ;;
+    esac
+    contain_transfers || { outcome=PRECONDITION; class=transfer-containment; detail="containment lost before connect"; break; }
+    "$DARKMESH_CLI" up >/dev/null 2>&1 \
+      || { outcome=PRECONDITION; class=connection; detail="Darkmesh could not arm"; break; }
+    if ! wait_connected; then outcome=FAIL; class=connection; detail="connection timeout"; break; fi
+    if ! wait_vpn_stable; then outcome=FAIL; class=internet; detail="VPN did not stabilize"; break; fi
+    case "$startup" in
+      vpn-first)
+        tailscale_up_existing || { outcome=PRECONDITION; class=identity; detail="VPN-first Tailscale up requested authentication or changed identity"; break; }
+        ;;
+      tailscale-restart)
+        "$TAILSCALE_CLI" down >/dev/null 2>&1 &&
+          tailscale_up_existing || { outcome=PRECONDITION; class=identity; detail="post-VPN Tailscale restart unsafe"; break; }
+        ;;
+    esac
+    if ! internet_ok; then outcome=FAIL; class=internet; detail="ordinary internet failed"; break; fi
+    if ! dns_ok; then outcome=FAIL; class=dns; detail="DNS failed"; break; fi
+    if ! tailscale_control_ok; then outcome=FAIL; class=tailscale-control; detail="Tailscale control state is not Running"; break; fi
+    if ! wait_tailscale_convergence; then
+      if ! ts_ping "$PEER_A_ADDRESS" || ! ts_ping "$PEER_B_ADDRESS"; then
+        outcome=FAIL; class=peer-reachability; detail="Tailscale peer convergence failed"
+      elif ! tcp22_ok "$PEER_A_ADDRESS" || ! tcp22_ok "$PEER_B_ADDRESS"; then
+        outcome=FAIL; class=peer-reachability; detail="TCP 22 convergence failed"
+      else
+        outcome=FAIL; class=ssh; detail="key-based SSH convergence failed"
+      fi
+      break
+    fi
+    capture_case_evidence "$id"
+    capture_path_metadata "$id-cycle-$cycle"
+    "$DARKMESH_CLI" panic >/dev/null 2>&1 || { outcome=FAIL; class=recovery; detail="panic failed"; break; }
+    if ! recover_case; then outcome=FAIL; class=recovery; detail="case restoration failed"; break; fi
+  done
+  if ! recover_case; then
+    case_result "$id" FAIL recovery "case restoration failed"
+    CAMPAIGN_RC=1
+    return 2
+  fi
+  case_result "$id" "$outcome" "$class" "$detail"
+  [[ "$outcome" == PASS ]]
+}
+
+run_baseline_case() {
+  local id="$1" split="$2" outcome=PASS class=none detail="baseline converged"
+  CURRENT_CASE="$id"
+  observe case-start "$id" info "baseline split=$split"
+  spawn_deadman case "$CASE_DEADMAN"
+  contain_transfers || { outcome=PRECONDITION; class=transfer-containment; detail="PF containment unavailable"; }
+  if [[ "$outcome" == PASS ]]; then
+    "$EXPRESSVPN_CTL" --timeout 8 set splittunnel "$split" >/dev/null 2>&1 \
+      || { outcome=PRECONDITION; class=split-routing; detail="supported CLI cannot set split tunneling=$split"; }
+  fi
+  if [[ "$outcome" == PASS ]] &&
+     ! wait_convergence baseline "$BASELINE_MAX" "$BASELINE_QUIET" 3 baseline_healthy; then
+    outcome=FAIL; class=recovery; detail="baseline did not converge"
+  fi
+  if ! recover_case; then outcome=FAIL; class=recovery; detail="baseline restoration failed"; fi
+  case_result "$id" "$outcome" "$class" "$detail"
+  [[ "$outcome" == PASS ]]
+}
+
+run_captive_profile() {
+  local portal body iface
+  body="$RUN_DIR/.portal-body"
+  : >"$body"
+  chmod 600 "$body"
+  CURRENT_CASE=captive-field
+  contain_transfers || { case_result captive-field PRECONDITION transfer-containment "PF containment unavailable"; return 1; }
+  portal="$("$CURL" -sS -o "$body" -w '%{http_code} %{redirect_url}' \
+    --max-time 8 http://captive.apple.com/hotspot-detect.html 2>/dev/null || true)"
+  if [[ "$portal" != 3* && "$portal" != "511 "* ]] &&
+     { [[ "$portal" != "200 "* ]] || grep -q '<TITLE>Success</TITLE>' "$body" 2>/dev/null; }; then
+    rm -f "$body"
+    case_result captive-field PRECONDITION captive "no positive real captive-portal evidence; simulation refused"
+    return 1
+  fi
+  rm -f "$body"
+  "$DARKMESH_CLI" captive >/dev/null 2>&1 \
+    || { case_result captive-field FAIL recovery "portal standdown failed"; return 1; }
+  iface="$("$NETSTAT" -rn -f inet 2>/dev/null | awk '$1=="default" {print $NF; exit}')"
+  if [[ -z "$iface" ]] || ! "$IPCONFIG" getpacket "$iface" 2>/dev/null | grep -q 'domain_name_server'; then
+    case_result captive-field PRECONDITION captive "portal detected but DHCP DNS evidence is unavailable"
+    return 1
+  fi
+  case_result captive-field PRECONDITION captive "portal standdown verified; owner sign-in required before controlled rearm"
+  return 3
+}
+
+resume_captive_profile() {
+  CURRENT_CASE=captive-resume
+  contain_transfers || {
+    case_result "$CURRENT_CASE" PRECONDITION transfer-containment "PF containment unavailable after sign-in"
+    return 1
+  }
+  internet_ok || {
+    case_result "$CURRENT_CASE" PRECONDITION captive "portal sign-in is not complete: ordinary internet unavailable"
+    return 1
+  }
+  dns_ok || {
+    case_result "$CURRENT_CASE" PRECONDITION dns "portal sign-in is not complete: DNS unavailable"
+    return 1
+  }
+  all_peers_once || {
+    case_result "$CURRENT_CASE" PRECONDITION peer-reachability "passive peers are not reachable after sign-in"
+    return 1
+  }
+  "$DARKMESH_CLI" up >/dev/null 2>&1 || {
+    case_result "$CURRENT_CASE" FAIL recovery "controlled rearm failed"
+    return 1
+  }
+  if wait_connected && wait_vpn_stable && wait_tailscale_convergence; then
+    capture_case_evidence "$CURRENT_CASE"
+    case_result "$CURRENT_CASE" PASS none "portal sign-in and controlled rearm verified"
+    return 0
+  fi
+  case_result "$CURRENT_CASE" FAIL recovery "controlled rearm did not converge"
+  return 1
+}
+
+if [[ "$PROFILE" == captive ]]; then
+  if [[ -n "$RESUME_DIR" ]]; then
+    resume_captive_profile || exit 1
+    CAMPAIGN_RC=0
+    exit 0
+  fi
+  if run_captive_profile; then
+    exit 1
+  else
+    rc=$?
+    if [[ "$rc" -eq 3 ]]; then
+      CAPTIVE_WAITING=yes
+      CAMPAIGN_RC=3
+      exit 3
+    fi
+    exit 1
+  fi
+fi
+
+run_baseline_case baseline-split-enabled true || exit 1
+run_baseline_case baseline-split-disabled false || {
+  outcome="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["outcome"])' "$RUN_DIR/cases/baseline-split-disabled.json")"
+  [[ "$outcome" == PRECONDITION ]] || exit 1
+}
+
+declare -a CONNECTED_PROTOCOLS=()
+declare -a SURVIVORS=()
+UDP_AMBIGUOUS=no
+for protocol in wireguard lightwaytcp lightwayudp; do
+  id="screen-$protocol-1"
+  screen_pass=no
+  protocol_connected=no
+  if run_case "$id" "$protocol" "$SEATTLE_REGION" false both tailscale-first 1; then
+    screen_pass=yes
+    protocol_connected=yes
+  else
+    class="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["classification"])' "$RUN_DIR/cases/$id.json")"
+    outcome="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["outcome"])' "$RUN_DIR/cases/$id.json")"
+    detail="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["detail"])' "$RUN_DIR/cases/$id.json")"
+    if [[ "$class" == connection && "$detail" == "connection timeout" ]]; then
+      [[ "$protocol" != lightwayudp ]] || UDP_AMBIGUOUS=yes
+      if run_case "screen-$protocol-timeout-retry" "$protocol" "$SEATTLE_REGION" false both tailscale-first 1; then
+        screen_pass=yes
+        protocol_connected=yes
+      else
+        retry_file="$RUN_DIR/cases/screen-$protocol-timeout-retry.json"
+        retry_class="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["classification"])' "$retry_file")"
+        retry_outcome="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["outcome"])' "$retry_file")"
+        [[ "$retry_class" == connection || "$retry_outcome" == PRECONDITION ]] \
+          || protocol_connected=yes
+      fi
+    elif [[ "$class" != connection && "$outcome" != PRECONDITION ]]; then
+      protocol_connected=yes
+    fi
+  fi
+  [[ "$protocol_connected" != yes ]] || CONNECTED_PROTOCOLS+=("$protocol")
+  if [[ "$screen_pass" == yes ]] &&
+     run_case "screen-$protocol-2" "$protocol" "$SEATTLE_REGION" false both tailscale-first 1 &&
+     run_case "screen-$protocol-3" "$protocol" "$SEATTLE_REGION" false both tailscale-first 1; then
+    SURVIVORS+=("$protocol")
+  fi
+done
+
+if ((${#CONNECTED_PROTOCOLS[@]} == 0)); then
+  observe campaign-stop campaign connection "no primary protocol connected"
+  CAMPAIGN_RC=1
+  exit 1
+fi
+
+for protocol in "${CONNECTED_PROTOCOLS[@]}"; do
+  run_case "dns-$protocol-on" "$protocol" "$SEATTLE_REGION" true both tailscale-first 1 || true
+  if ! run_case "region-$protocol-smart" "$protocol" smart false both tailscale-first 1; then
+    if [[ "$protocol" == lightwayudp ]]; then
+      smart_file="$RUN_DIR/cases/region-$protocol-smart.json"
+      smart_class="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["classification"])' "$smart_file")"
+      [[ "$smart_class" != connection ]] || UDP_AMBIGUOUS=yes
+    fi
+  fi
+done
+
+if [[ "$UDP_AMBIGUOUS" == yes ]] &&
+   printf '%s\n' "${CONNECTED_PROTOCOLS[@]}" | grep -qx lightwayudp; then
+  run_case "region-lightwayudp-nearby" lightwayudp "$NEARBY_REGION" false both tailscale-first 1 || true
+fi
+
+declare -a FINALISTS=()
+for protocol in "${SURVIVORS[@]}"; do
+  for split in extension-only app-only neither disabled; do
+    run_case "split-$protocol-$split" "$protocol" "$SEATTLE_REGION" false "$split" tailscale-first 1 || true
+  done
+  run_case "startup-$protocol-vpn-first" "$protocol" "$SEATTLE_REGION" false both vpn-first 1 || true
+  run_case "startup-$protocol-restart" "$protocol" "$SEATTLE_REGION" false both tailscale-restart 1 || true
+  if run_case "repeat-$protocol" "$protocol" "$SEATTLE_REGION" false both tailscale-first 3; then
+    FINALISTS+=("$protocol")
+  fi
+done
+
+if ((${#FINALISTS[@]} == 0)); then
+  observe campaign-stop campaign repeatability "no repeatable finalist"
+  CAMPAIGN_RC=1
+  exit 1
+fi
+
+winner="${FINALISTS[0]}"
+run_case "production-$winner-reconnect" "$winner" "$SEATTLE_REGION" false both tailscale-first 1 || exit 1
+
+CURRENT_CASE="production-$winner-disconnect"
+contain_transfers || exit 1
+"$EXPRESSVPN_CTL" --timeout 8 set protocol "$winner" >/dev/null 2>&1 || exit 1
+"$EXPRESSVPN_CTL" --timeout 8 set region "$SEATTLE_REGION" >/dev/null 2>&1 || exit 1
+set_tailscale_dns false || exit 1
+set_split_mode both || exit 1
+tailscale_up_existing || exit 1
+"$DARKMESH_CLI" up >/dev/null 2>&1 || exit 1
+wait_connected && wait_vpn_stable && wait_tailscale_convergence || {
+  case_result "$CURRENT_CASE" FAIL connection "production candidate did not reach a stable connected state"
+  exit 1
+}
+"$EXPRESSVPN_CTL" --timeout 10 disconnect >/dev/null 2>&1 || true
+if wait_connected && wait_vpn_stable && wait_tailscale_convergence &&
+   pf_enforced && "$TRANSFER_DOCTOR" --check >/dev/null 2>&1; then
+  case_result "$CURRENT_CASE" PASS none "ordinary disconnect recovered, transfer binding checked, PF enforced, and peers reachable"
+else
+  case_result "$CURRENT_CASE" FAIL recovery "ordinary disconnect did not recover every production invariant"
+  exit 1
+fi
+
+CURRENT_CASE=production-final-panic
+"$DARKMESH_CLI" panic >/dev/null 2>&1 || {
+  case_result "$CURRENT_CASE" FAIL recovery "final panic failed"
+  exit 1
+}
+if recover_case; then
+  case_result "$CURRENT_CASE" PASS none "panic and baseline recovery verified"
+else
+  case_result "$CURRENT_CASE" FAIL recovery "final baseline recovery failed"
+  exit 1
+fi
+
+CAMPAIGN_RC=0
+exit 0
