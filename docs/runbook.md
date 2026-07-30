@@ -149,11 +149,12 @@ split-tunnel rules, or start a transfer.
 
 After Lightway connects, the experiment waits for an initial 30-second route
 settle, then probes the named peer repeatedly for up to 90 additional seconds.
-Each failed probe is timestamped, and ordinary internet plus the VPN connection
-are rechecked throughout the convergence window. This distinguishes slow
+Each failed probe records actual wall-clock elapsed time, including the time
+spent inside the probe, and ordinary internet plus the VPN connection are
+rechecked throughout the convergence window. This distinguishes slow
 control-plane or relay recovery from a persistent block. The detached recovery
-deadline is five minutes so it remains outside the complete bounded observation
-window.
+deadline is seven minutes so it remains outside the complete bounded
+observation and cleanup window.
 
 Cleanup is unconditional on success, failure, signal, and timeout. It leaves
 VPN intent off, ExpressVPN disconnected, Network Lock and autoconnect off,
@@ -193,6 +194,17 @@ removes only those entries while ExpressVPN is disconnected, performs the
 bounded Lightway test, and restores and verifies both entries during normal
 cleanup and deadman recovery. It does not alter the separate private tailnet
 address-range bypasses.
+
+Select either Lightway transport explicitly:
+
+```bash
+darkmesh coexistence-trial --protocol lightwayudp --mode bypass \
+  --peer <tailnet-host-or-IP> --ssh-target <private-ssh-alias>
+```
+
+The bounded tool intentionally permits only `lightwaytcp` and `lightwayudp`.
+It never tests or persists OpenVPN. Cleanup restores the protocol selected
+before the experiment.
 
 ## Why The Client May Get "Stuck"
 
