@@ -211,6 +211,20 @@ The bounded tool intentionally permits only `lightwaytcp` and `lightwayudp`.
 It never tests or persists OpenVPN. Cleanup restores the protocol selected
 before the experiment.
 
+Select a temporary ExpressVPN location with `--region smart` or an exact region
+slug:
+
+```bash
+darkmesh coexistence-trial --protocol lightwayudp --mode bypass \
+  --region smart --peer <tailnet-host-or-IP> \
+  --ssh-target <private-ssh-alias>
+```
+
+The experiment records the currently selected region before any mutation.
+Normal cleanup and deadman recovery restore and verify that exact original
+region. Omitting `--region` uses the operator's current selection without
+changing it.
+
 Lightway UDP was also attempted against the then-selected VPN region. ExpressVPN
 14.1.0 remained in its connection sequence and did not reach `Connected` within
 75 seconds, so that run never reached a Tailscale coexistence test. This is a

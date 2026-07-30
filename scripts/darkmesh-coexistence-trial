@@ -29,6 +29,7 @@ DEADMAN_SECONDS="${DARKMESH_TRIAL_DEADMAN_SECONDS:-420}"
 
 mode="bypass"
 protocol="lightwaytcp"
+requested_region=""
 peer=""
 ssh_target=""
 while (($#)); do
@@ -40,6 +41,10 @@ while (($#)); do
     --protocol)
       (($# >= 2)) || { echo "ERROR: --protocol requires a value" >&2; exit 2; }
       protocol="$2"; shift 2
+      ;;
+    --region)
+      (($# >= 2)) || { echo "ERROR: --region requires a value" >&2; exit 2; }
+      requested_region="$2"; shift 2
       ;;
     --peer)
       (($# >= 2)) || { echo "ERROR: --peer requires a value" >&2; exit 2; }
@@ -53,6 +58,7 @@ while (($#)); do
       cat <<'EOF'
 Usage: darkmesh coexistence-trial [--mode bypass|through-vpn]
        [--protocol lightwaytcp|lightwayudp]
+       [--region current|smart|<region-slug>]
        --peer <tailnet-host-or-IP> [--ssh-target <ssh-alias>]
 
 Modes:
@@ -80,6 +86,7 @@ done
   || { echo "ERROR: --mode must be bypass or through-vpn" >&2; exit 2; }
 [[ "$protocol" == lightwaytcp || "$protocol" == lightwayudp ]] \
   || { echo "ERROR: --protocol must be lightwaytcp or lightwayudp" >&2; exit 2; }
+[[ "$requested_region" == current ]] && requested_region=""
 
 for seconds in "$CONNECT_TIMEOUT" "$SETTLE_SECONDS" "$TAILSCALE_TIMEOUT" \
   "$PROBE_INTERVAL" "$DEADMAN_SECONDS"; do
@@ -97,6 +104,10 @@ if ! safe_token "$peer"; then
 fi
 if [[ -n "$ssh_target" ]] && ! safe_token "$ssh_target"; then
   echo "ERROR: --ssh-target must be a single safe SSH host or alias" >&2
+  exit 2
+fi
+if [[ -n "$requested_region" ]] && ! safe_token "$requested_region"; then
+  echo "ERROR: --region must be smart or a single region slug" >&2
   exit 2
 fi
 for required in "$EXPRESSVPN_CTL" "$TAILSCALE_CLI" "$DARKMESH_CLI" \
@@ -149,6 +160,7 @@ tailscale_up_existing() {
 }
 
 original_protocol=""
+original_region=""
 declare -a tailscale_bypass_entries=()
 deadman_pid=""
 cleaning=no
@@ -163,6 +175,11 @@ restore_tailscale_bypasses() {
     printf '%s\n' "$current" | grep -qxF "$entry" || restored=no
   done
   [[ "$restored" == yes ]]
+}
+restore_original_region() {
+  [[ -n "$requested_region" && -n "$original_region" ]] || return 0
+  "$EXPRESSVPN_CTL" --timeout 8 set region "$original_region" >>"$LOG" 2>&1 || return 1
+  [[ "$("$EXPRESSVPN_CTL" --timeout 5 get region 2>/dev/null | head -1)" == "$original_region" ]]
 }
 cleanup() {
   local rc=$?
@@ -190,6 +207,8 @@ cleanup() {
   fi
   local rules=yes
   restore_tailscale_bypasses || rules=no
+  local region=yes
+  restore_original_region || region=no
   tailscale_up_existing >>"$LOG" 2>&1 || true
 
   local net=no dns=no ts=no vpn
@@ -197,11 +216,11 @@ cleanup() {
   dns_ok && dns=yes
   tailscale_peer_ok && ts=yes
   vpn="$(vpn_state || echo unknown)"
-  log "SAFETY RESULT: internet=$net dns=$dns tailscale_peer=$ts vpn=$vpn split_rules_restored=$rules"
-  if [[ "$net" == yes && "$dns" == yes && "$vpn" == Disconnected && "$rules" == yes ]]; then
-    write_result "finished; experiment_rc=$rc; internet=yes; dns=yes; tailscale_peer=$ts; vpn=off; split_rules_restored=yes"
+  log "SAFETY RESULT: internet=$net dns=$dns tailscale_peer=$ts vpn=$vpn split_rules_restored=$rules region_restored=$region"
+  if [[ "$net" == yes && "$dns" == yes && "$vpn" == Disconnected && "$rules" == yes && "$region" == yes ]]; then
+    write_result "finished; experiment_rc=$rc; internet=yes; dns=yes; tailscale_peer=$ts; vpn=off; split_rules_restored=yes; region_restored=yes"
   else
-    write_result "recovery-incomplete; experiment_rc=$rc; internet=$net; dns=$dns; tailscale_peer=$ts; vpn=$vpn; split_rules_restored=$rules"
+    write_result "recovery-incomplete; experiment_rc=$rc; internet=$net; dns=$dns; tailscale_peer=$ts; vpn=$vpn; split_rules_restored=$rules; region_restored=$region"
     rc=1
   fi
   rmdir "$LOCK" >/dev/null 2>&1 || true
@@ -217,6 +236,7 @@ spawn_deadman() {
     log "DEADMAN: trial exceeded ${DEADMAN_SECONDS}s; forcing plain-network recovery"
     "$DARKMESH_CLI" panic >>"$LOG" 2>&1 || true
     restore_tailscale_bypasses || true
+    restore_original_region || true
     "$TAILSCALE_CLI" up >>"$LOG" 2>&1 || true
     kill -TERM $$ >/dev/null 2>&1 || true
   ) </dev/null >/dev/null 2>&1 &
@@ -231,6 +251,7 @@ tailscale_peer_ok || { log "ERROR: peer is not reachable before the experiment";
 
 original_protocol="$("$EXPRESSVPN_CTL" --timeout 3 get protocol 2>/dev/null | head -1)"
 original_protocol="${original_protocol##*: }"
+original_region="$("$EXPRESSVPN_CTL" --timeout 3 get region 2>/dev/null | head -1)"
 if [[ "$mode" == through-vpn ]]; then
   while IFS= read -r entry; do
     [[ "$entry" == bypass:* ]] && tailscale_bypass_entries+=("$entry")
@@ -258,6 +279,10 @@ log "phase 3: launch ExpressVPN, enforce safe settings, and select protocol=$pro
 "$EXPRESSVPN_CTL" --timeout 8 set networklock false >>"$LOG" 2>&1
 "$EXPRESSVPN_CTL" --timeout 8 set autoconnect false >>"$LOG" 2>&1
 "$EXPRESSVPN_CTL" --timeout 8 set protocol "$protocol" >>"$LOG" 2>&1
+if [[ -n "$requested_region" ]]; then
+  "$EXPRESSVPN_CTL" --timeout 8 set region "$requested_region" >>"$LOG" 2>&1
+  log "phase 3: selected region=$requested_region (original=$original_region)"
+fi
 "$EXPRESSVPN_CTL" --timeout 8 get splittunnel 2>/dev/null | grep -qx true \
   || { log "ERROR: ExpressVPN split tunneling is not enabled"; exit 1; }
 split_apps="$("$EXPRESSVPN_CTL" --timeout 8 get split-app 2>/dev/null)"

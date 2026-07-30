@@ -30,7 +30,10 @@ case "$*" in
     fi
     ;;
   *"get protocol"*) printf "lightwaytcp\n" ;;
-  *"get region"*) printf "smart\n" ;;
+  *"get region"*) cat "${TEST_REGION_STATE:?}" ;;
+  *"set region "*)
+    printf "%s\n" "${!#}" >"${TEST_REGION_STATE:?}"
+    ;;
   *"get splittunnel"*) printf "true\n" ;;
   *"get split-app"*) cat "${TEST_SPLIT_STATE:?}" ;;
   *"set split-app remove:"*)
@@ -77,11 +80,14 @@ run_trial() {
   local case_dir="$1"
   local trial_mode="$2"
   local trial_protocol="$3"
-  shift 3
+  local trial_region="$4"
+  shift 4
   mkdir -p "$case_dir"
   printf "bypass:/Applications/Tailscale.app/Contents/MacOS/Tailscale\nbypass:/Library/SystemExtensions/example/io.tailscale.ipn.macsys.network-extension.systemextension/Contents/MacOS/io.tailscale.ipn.macsys.network-extension\n" >"$case_dir/split-state"
+  printf "usa-seattle\n" >"$case_dir/region-state"
   TEST_CALLS="$case_dir/calls" \
   TEST_SPLIT_STATE="$case_dir/split-state" \
+  TEST_REGION_STATE="$case_dir/region-state" \
   EXPRESSVPN_CTL="$BIN/expressvpnctl" TAILSCALE_CLI="$BIN/tailscale" \
   DARKMESH_CLI="$BIN/darkmesh" CURL="$BIN/curl" HOST="$BIN/host" \
   OPEN_CMD="$BIN/open" OSASCRIPT="$BIN/osascript" SSH="$BIN/ssh" SLEEP="$BIN/sleep" \
@@ -91,11 +97,12 @@ run_trial() {
   DARKMESH_TRIAL_TAILSCALE_TIMEOUT=10 DARKMESH_TRIAL_PROBE_INTERVAL=5 \
   "$@" "$ROOT/scripts/darkmesh-coexistence-trial" --mode "$trial_mode" \
     --protocol "$trial_protocol" \
+    --region "$trial_region" \
     --peer peer.example --ssh-target peer-alias
 }
 
 SUCCESS="$TMP/success"
-run_trial "$SUCCESS" bypass lightwaytcp env
+run_trial "$SUCCESS" bypass lightwaytcp current env
 grep -q 'PASS: protocol=lightwaytcp' "$SUCCESS/log"
 grep -q 'finished; experiment_rc=0; internet=yes; dns=yes; tailscale_peer=yes; vpn=off; split_rules_restored=yes' "$SUCCESS/result"
 [[ "$(grep -c '^darkmesh panic$' "$SUCCESS/calls")" -eq 2 ]]
@@ -105,11 +112,11 @@ grep -q '^ctl --timeout 8 set protocol lightwaytcp$' "$SUCCESS/calls"
 grep -q '^ssh -o BatchMode=yes -o ConnectTimeout=10 peer-alias nice -n 19 true$' "$SUCCESS/calls"
 
 DERP="$TMP/derp"
-run_trial "$DERP" bypass lightwaytcp env TEST_DERP_PONG_NONZERO=yes
+run_trial "$DERP" bypass lightwaytcp current env TEST_DERP_PONG_NONZERO=yes
 grep -q 'finished; experiment_rc=0; internet=yes; dns=yes; tailscale_peer=yes; vpn=off; split_rules_restored=yes' "$DERP/result"
 
 FAILURE="$TMP/failure"
-if run_trial "$FAILURE" bypass lightwaytcp env TEST_FAIL_TAILSCALE_WITH_VPN=yes; then
+if run_trial "$FAILURE" bypass lightwaytcp current env TEST_FAIL_TAILSCALE_WITH_VPN=yes; then
   echo "expected coexistence failure" >&2
   exit 1
 fi
@@ -120,13 +127,13 @@ grep -q 'finished; experiment_rc=1; internet=yes; dns=yes; tailscale_peer=yes; v
 grep -q '^tailscale up$' "$FAILURE/calls"
 
 DELAYED="$TMP/delayed"
-run_trial "$DELAYED" bypass lightwaytcp env TEST_TAILSCALE_RECOVER_AFTER=2
+run_trial "$DELAYED" bypass lightwaytcp current env TEST_TAILSCALE_RECOVER_AFTER=2
 grep -q 'Tailscale peer converged after .*s of observation' "$DELAYED/log"
 grep -q 'finished; experiment_rc=0; internet=yes; dns=yes' "$DELAYED/result"
 
 DEADMAN="$TMP/deadman"
 mkdir -p "$DEADMAN"
-if ! run_trial "$DEADMAN" bypass lightwaytcp env DARKMESH_TRIAL_DISABLE_DEADMAN=no \
+if ! run_trial "$DEADMAN" bypass lightwaytcp current env DARKMESH_TRIAL_DISABLE_DEADMAN=no \
   DEADMAN_SLEEP=/bin/sleep DARKMESH_TRIAL_DEADMAN_SECONDS=30 \
   >"$DEADMAN/stdout" 2>"$DEADMAN/stderr"; then
   echo "expected deadman-cancellation run to pass" >&2
@@ -135,23 +142,29 @@ fi
 ! grep -q 'Terminated' "$DEADMAN/stderr"
 
 THROUGH="$TMP/through"
-run_trial "$THROUGH" through-vpn lightwaytcp env
+run_trial "$THROUGH" through-vpn lightwaytcp current env
 grep -q 'PASS: protocol=lightwaytcp.*mode=through-vpn' "$THROUGH/log"
 [[ "$(grep -c 'set split-app remove:' "$THROUGH/calls")" -eq 2 ]]
 grep -q 'bypass:/Applications/Tailscale.app/Contents/MacOS/Tailscale' "$THROUGH/split-state"
 grep -q 'bypass:.*io.tailscale.ipn.macsys.network-extension' "$THROUGH/split-state"
 
 UDP="$TMP/udp"
-run_trial "$UDP" bypass lightwayudp env
+run_trial "$UDP" bypass lightwayudp current env
 grep -q 'set protocol lightwayudp' "$UDP/calls"
 grep -q 'PASS: protocol=lightwayudp' "$UDP/log"
 
 NO_CONNECT="$TMP/no-connect"
-if run_trial "$NO_CONNECT" bypass lightwayudp env TEST_VPN_NEVER_CONNECTS=yes; then
+if run_trial "$NO_CONNECT" bypass lightwayudp current env TEST_VPN_NEVER_CONNECTS=yes; then
   echo "expected VPN connection timeout" >&2
   exit 1
 fi
-grep -q 'did not connect (state=Connecting protocol=lightwayudp region=smart)' "$NO_CONNECT/log"
+grep -q 'did not connect (state=Connecting protocol=lightwayudp region=usa-seattle)' "$NO_CONNECT/log"
 grep -q 'finished; experiment_rc=1; internet=yes; dns=yes' "$NO_CONNECT/result"
+
+REGION="$TMP/region"
+run_trial "$REGION" bypass lightwaytcp canada-vancouver env
+grep -q 'selected region=canada-vancouver (original=usa-seattle)' "$REGION/log"
+[[ "$(cat "$REGION/region-state")" == "usa-seattle" ]]
+grep -q 'region_restored=yes' "$REGION/result"
 
 echo "darkmesh coexistence trial tests passed"
