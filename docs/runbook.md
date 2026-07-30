@@ -260,7 +260,7 @@ changes a peer machine remains separately owner-gated.
 - Lightway stability is not historically established.
 - Changing VPN region did not solve the historical DNS collision.
 - ExpressVPN split tunneling affects the local network even while disconnected.
-- The latest Seattle attempt stopped at ExpressVPN 14.2's root-only background
+- The pre-suite Seattle attempt stopped at ExpressVPN 14.2's root-only background
   mode precondition. It was not a fast Lightway failure.
 - `provider rejected new flow` remains ambiguous without path evidence. Do not
   classify it as a provider block from the log string alone.

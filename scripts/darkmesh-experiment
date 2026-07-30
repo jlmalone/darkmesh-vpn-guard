@@ -994,7 +994,7 @@ lines=[
  "- Lightway stability is not historically established.",
  "- Changing VPN region did not solve the historical DNS collision.",
  "- ExpressVPN split tunneling can affect the local network while disconnected.",
- "- The latest Seattle trial stopped at a root-only background-mode precondition; it was not a fast Lightway failure.",
+ "- The pre-suite Seattle trial stopped at a root-only background-mode precondition; it was not a fast Lightway failure.",
 ]
 for c in cases:
  lines.append("- {id}: {outcome} [{classification}]".format(**c))
@@ -1344,13 +1344,13 @@ for protocol in wireguard lightwaytcp lightwayudp; do
   fi
 done
 
-if ((${#CONNECTED_PROTOCOLS[@]} == 0)); then
+if [[ -z "${CONNECTED_PROTOCOLS[*]-}" ]]; then
   observe campaign-stop campaign connection "no primary protocol connected"
   CAMPAIGN_RC=1
   exit 1
 fi
 
-for protocol in "${CONNECTED_PROTOCOLS[@]}"; do
+for protocol in "${CONNECTED_PROTOCOLS[@]+"${CONNECTED_PROTOCOLS[@]}"}"; do
   run_case "dns-$protocol-on" "$protocol" "$SEATTLE_REGION" true both tailscale-first 1 || true
   if ! run_case "region-$protocol-smart" "$protocol" smart false both tailscale-first 1; then
     if [[ "$protocol" == lightwayudp ]]; then
@@ -1362,12 +1362,12 @@ for protocol in "${CONNECTED_PROTOCOLS[@]}"; do
 done
 
 if [[ "$UDP_AMBIGUOUS" == yes ]] &&
-   printf '%s\n' "${CONNECTED_PROTOCOLS[@]}" | grep -qx lightwayudp; then
+   printf '%s\n' "${CONNECTED_PROTOCOLS[@]+"${CONNECTED_PROTOCOLS[@]}"}" | grep -qx lightwayudp; then
   run_case "region-lightwayudp-nearby" lightwayudp "$NEARBY_REGION" false both tailscale-first 1 || true
 fi
 
 declare -a FINALISTS=()
-for protocol in "${SURVIVORS[@]}"; do
+for protocol in "${SURVIVORS[@]+"${SURVIVORS[@]}"}"; do
   for split in extension-only app-only neither disabled; do
     run_case "split-$protocol-$split" "$protocol" "$SEATTLE_REGION" false "$split" tailscale-first 1 || true
   done
@@ -1378,7 +1378,7 @@ for protocol in "${SURVIVORS[@]}"; do
   fi
 done
 
-if ((${#FINALISTS[@]} == 0)); then
+if [[ -z "${FINALISTS[*]-}" ]]; then
   observe campaign-stop campaign repeatability "no repeatable finalist"
   CAMPAIGN_RC=1
   exit 1

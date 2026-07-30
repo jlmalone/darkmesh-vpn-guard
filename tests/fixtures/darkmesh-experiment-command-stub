@@ -134,6 +134,10 @@ case "$name" in
   vpn-guard.sh|transfer-vpn-doctor) exit 0 ;;
   curl)
     [[ "${TEST_INTERNET_FAILURE:-no}" != yes ]] || exit 1
+    if [[ "${TEST_VPN_STABILIZATION_FAILURE:-no}" == yes &&
+          "$(read_state vpn-state)" == Connected ]]; then
+      exit 1
+    fi
     if [[ "${TEST_CAPTIVE_PORTAL:-no}" == yes ]]; then
       output=""
       while (($#)); do

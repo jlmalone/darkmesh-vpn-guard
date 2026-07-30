@@ -211,6 +211,19 @@ fi
 flap_run="$(ls -1d "$flap/runs"/*)"
 grep -q '"event":"convergence-reset"' "$flap_run/observations.jsonl"
 
+echo "8b. no primary survivor ends cleanly under nounset"
+no_survivor="$(new_fixture no-survivor)"
+if run_experiment "$no_survivor" env TEST_VPN_STABILIZATION_FAILURE=yes \
+  TEST_UNSUPPORTED_PROTOCOLS=lightwaytcp,lightwayudp \
+  "$ROOT/scripts/darkmesh-experiment" run --profile staged >"$no_survivor/out" 2>&1; then
+  fail "campaign with no primary survivor unexpectedly passed"
+fi
+no_survivor_run="$(ls -1d "$no_survivor/runs"/*)"
+! grep -q 'unbound variable' "$no_survivor/out"
+grep -q '"event":"campaign-stop".*"no repeatable finalist"' \
+  "$no_survivor_run/observations.jsonl"
+grep -q '"restoration_verified": true' "$no_survivor_run/summary.json"
+
 echo "9. signal interruption runs exact restoration"
 signal="$(new_fixture signal)"
 if run_experiment "$signal" env DARKMESH_EXPERIMENT_TEST_SIGNAL_AFTER_SNAPSHOT=yes \
