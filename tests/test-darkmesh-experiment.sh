@@ -103,6 +103,23 @@ if run_experiment "$privilege" env TEST_PRIVILEGE_FAILURE=yes \
 fi
 grep -q $'containment.pf\tPRECONDITION' "$privilege/out"
 
+echo "3b. fresh enforced PF sidecar satisfies the installed privilege contract"
+sidecar="$(new_fixture sidecar)"
+sidecar_file="$sidecar/state/pf.json"
+cat >"$sidecar_file" <<EOF
+{
+  "pf_enabled": true,
+  "pf_anchor": "com.apple/vpn-guard",
+  "pf_anchor_evaluated": true,
+  "pf_kill_active": true,
+  "checked_at": "$(/bin/date -u +%FT%TZ)"
+}
+EOF
+run_experiment "$sidecar" env TEST_PF_RULE_READ_FAILURE=yes \
+  DARKMESH_PF_SIDECAR="$sidecar_file" \
+  "$ROOT/scripts/darkmesh-experiment" preflight >"$sidecar/out"
+grep -q $'containment.pf\tPASS' "$sidecar/out"
+
 echo "4. active transfer intent is rejected before any campaign mutation"
 intent="$(new_fixture intent)"
 printf 'active\n' >"$intent/state/transfer-intent"

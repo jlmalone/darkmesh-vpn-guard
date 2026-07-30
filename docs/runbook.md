@@ -162,6 +162,10 @@ identities reachable, and ordinary internet and DNS healthy. A privilege error,
 missing PF rule, unsupported split toggle, or pending extension approval is a
 `PRECONDITION`, never evidence against a protocol.
 
+PF containment accepts either a directly readable blocking anchor or the fresh
+guard sidecar produced after a successful anchor load. In both paths, PF itself
+must independently report enabled.
+
 Run the live campaign only with explicit authority for local network changes:
 
 ```bash

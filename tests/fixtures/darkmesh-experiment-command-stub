@@ -147,7 +147,10 @@ case "$name" in
   pfctl)
     case "$*" in
       *"-s info"*) printf 'Status: Enabled\n' ;;
-      *"-sr"*) printf 'block drop out proto tcp from any to any port 50000\n' ;;
+      *"-sr"*)
+        [[ "${TEST_PF_RULE_READ_FAILURE:-no}" != yes ]] || exit 1
+        printf 'block drop out proto tcp from any to any port 50000\n'
+        ;;
     esac
     ;;
   sudo)
