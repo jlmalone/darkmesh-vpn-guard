@@ -129,6 +129,30 @@ requires local approval.
 The concrete client config path and section name are derived by
 `transfer-vpn-doctor` at runtime from weakly encoded identifiers.
 
+## Bounded coexistence experiment
+
+Use the focused experiment only when plain internet, DNS, and an existing
+tailnet peer are initially healthy:
+
+```bash
+darkmesh coexistence-trial --peer <tailnet-host-or-IP> \
+  --ssh-target <private-ssh-alias>
+```
+
+The experiment performs one full ExpressVPN application-session recycle,
+brings up the existing Tailscale identity first, selects Lightway TCP, then
+tests ordinary internet, DNS, the named Tailscale peer, and optional private
+SSH. It does not run `tailscale login`, accept an authentication URL, create a
+node, change split-tunnel rules, or start a transfer.
+
+Cleanup is unconditional on success, failure, signal, and timeout. It leaves
+VPN intent off, ExpressVPN disconnected, Network Lock and autoconnect off,
+restores the previously selected VPN protocol, brings Tailscale up using its
+existing identity, and verifies ordinary internet and DNS. A detached deadline
+also requests the same recovery if the main process wedges. Results are written
+to `/tmp/darkmesh-coexistence-trial.log` and
+`/tmp/darkmesh-coexistence-trial-result`.
+
 ## Why The Client May Get "Stuck"
 
 The transfer-client binding is intentionally fail-closed.

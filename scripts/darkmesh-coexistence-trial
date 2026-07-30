@@ -1,0 +1,228 @@
+#!/bin/bash
+# Bounded ExpressVPN Lightway/Tailscale coexistence experiment.
+# Every exit path restores plain internet and brings the existing Tailscale
+# identity back up. It never authenticates or creates a Tailscale node.
+set -euo pipefail
+
+/usr/bin/renice 19 -p $$ >/dev/null 2>&1 || true
+
+EXPRESSVPN_CTL="${EXPRESSVPN_CTL:-/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl}"
+TAILSCALE_CLI="${TAILSCALE_CLI:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
+DARKMESH_CLI="${DARKMESH_CLI:-$(command -v darkmesh 2>/dev/null || true)}"
+OPEN_CMD="${OPEN_CMD:-/usr/bin/open}"
+OSASCRIPT="${OSASCRIPT:-/usr/bin/osascript}"
+CURL="${CURL:-/usr/bin/curl}"
+HOST="${HOST:-/usr/bin/host}"
+SSH="${SSH:-/usr/bin/ssh}"
+SLEEP="${SLEEP:-/bin/sleep}"
+DATE="${DATE:-/bin/date}"
+
+LOG="${DARKMESH_TRIAL_LOG:-/tmp/darkmesh-coexistence-trial.log}"
+RESULT="${DARKMESH_TRIAL_RESULT:-/tmp/darkmesh-coexistence-trial-result}"
+LOCK="${DARKMESH_TRIAL_LOCK:-${TMPDIR:-/tmp}/darkmesh-coexistence-trial.lock}"
+CONNECT_TIMEOUT="${DARKMESH_TRIAL_CONNECT_TIMEOUT:-75}"
+SETTLE_SECONDS="${DARKMESH_TRIAL_SETTLE_SECONDS:-20}"
+DEADMAN_SECONDS="${DARKMESH_TRIAL_DEADMAN_SECONDS:-180}"
+
+peer=""
+ssh_target=""
+while (($#)); do
+  case "$1" in
+    --peer)
+      (($# >= 2)) || { echo "ERROR: --peer requires a value" >&2; exit 2; }
+      peer="$2"; shift 2
+      ;;
+    --ssh-target)
+      (($# >= 2)) || { echo "ERROR: --ssh-target requires a value" >&2; exit 2; }
+      ssh_target="$2"; shift 2
+      ;;
+    -h|--help)
+      cat <<'EOF'
+Usage: darkmesh coexistence-trial --peer <tailnet-host-or-IP> [--ssh-target <ssh-alias>]
+
+Performs one bounded full-session reset and Lightway TCP coexistence test.
+It always finishes with ExpressVPN disconnected, VPN intent off, Tailscale
+brought up using its existing identity, and ordinary DNS/internet checked.
+
+Results:
+  /tmp/darkmesh-coexistence-trial.log
+  /tmp/darkmesh-coexistence-trial-result
+EOF
+      exit 0
+      ;;
+    *) printf 'unknown argument: %s\n' "$1" >&2; exit 2 ;;
+  esac
+done
+
+for seconds in "$CONNECT_TIMEOUT" "$SETTLE_SECONDS" "$DEADMAN_SECONDS"; do
+  [[ "$seconds" =~ ^[0-9]+$ ]] || { echo "ERROR: trial timeouts must be non-negative integers" >&2; exit 2; }
+done
+
+safe_token() {
+  [[ -n "$1" && "$1" != -* && "$1" != *$'\n'* && "$1" != *$'\r'* ]]
+}
+
+if ! safe_token "$peer"; then
+  echo "ERROR: --peer requires a tailnet hostname or address" >&2
+  exit 2
+fi
+if [[ -n "$ssh_target" ]] && ! safe_token "$ssh_target"; then
+  echo "ERROR: --ssh-target must be a single safe SSH host or alias" >&2
+  exit 2
+fi
+for required in "$EXPRESSVPN_CTL" "$TAILSCALE_CLI" "$DARKMESH_CLI" \
+  "$OPEN_CMD" "$OSASCRIPT" "$CURL" "$HOST"; do
+  [[ -x "$required" ]] || { echo "ERROR: required executable missing: $required" >&2; exit 1; }
+done
+
+if ! mkdir "$LOCK" 2>/dev/null; then
+  echo "ERROR: another coexistence trial is already running ($LOCK)" >&2
+  exit 1
+fi
+
+: >"$LOG"
+log() {
+  printf '%s %s\n' "$("$DATE" -u +%FT%TZ)" "$*" | tee -a "$LOG"
+}
+write_result() {
+  local value="$1" tmp="${RESULT}.tmp.$$"
+  printf '%s\n' "$value" >"$tmp" && mv "$tmp" "$RESULT"
+}
+vpn_state() {
+  "$EXPRESSVPN_CTL" --timeout 3 get connectionstate 2>/dev/null | head -1
+}
+internet_ok() {
+  "$CURL" -fsS --max-time 6 https://captive.apple.com/hotspot-detect.html >/dev/null 2>&1
+}
+dns_ok() {
+  "$HOST" -W 4 example.com >/dev/null 2>&1
+}
+tailscale_peer_ok() {
+  "$TAILSCALE_CLI" ping --c 1 "$peer" >/dev/null 2>&1
+}
+tailscale_up_existing() {
+  local output
+  if ! output="$("$TAILSCALE_CLI" up 2>&1)"; then
+    printf '%s' "$output" | grep -qiE 'login|auth' \
+      && log "SAFETY: Tailscale requested authentication; refusing to create or replace an identity"
+    return 1
+  fi
+  if printf '%s' "$output" | grep -qiE 'login|auth'; then
+    log "SAFETY: Tailscale requested authentication; refusing to create or replace an identity"
+    return 1
+  fi
+}
+
+original_protocol=""
+deadman_pid=""
+cleaning=no
+cleanup() {
+  local rc=$?
+  [[ "$cleaning" == yes ]] && return
+  cleaning=yes
+  trap - EXIT INT TERM HUP
+  [[ -n "$deadman_pid" ]] && kill "$deadman_pid" >/dev/null 2>&1 || true
+
+  log "SAFETY: restoring plain internet"
+  "$DARKMESH_CLI" panic >>"$LOG" 2>&1 || {
+    "$EXPRESSVPN_CTL" --timeout 8 set networklock false >>"$LOG" 2>&1 || true
+    "$EXPRESSVPN_CTL" --timeout 8 set autoconnect false >>"$LOG" 2>&1 || true
+    "$EXPRESSVPN_CTL" --timeout 10 disconnect >>"$LOG" 2>&1 || true
+  }
+  if [[ "$(vpn_state)" != Disconnected ]]; then
+    "$EXPRESSVPN_CTL" --timeout 8 set networklock false >>"$LOG" 2>&1 || true
+    "$EXPRESSVPN_CTL" --timeout 8 set autoconnect false >>"$LOG" 2>&1 || true
+    "$EXPRESSVPN_CTL" --timeout 10 disconnect >>"$LOG" 2>&1 || true
+  fi
+  if [[ -n "$original_protocol" ]]; then
+    "$EXPRESSVPN_CTL" --timeout 5 set protocol "$original_protocol" >>"$LOG" 2>&1 || true
+  fi
+  tailscale_up_existing >>"$LOG" 2>&1 || true
+
+  local net=no dns=no ts=no vpn
+  internet_ok && net=yes
+  dns_ok && dns=yes
+  tailscale_peer_ok && ts=yes
+  vpn="$(vpn_state || echo unknown)"
+  log "SAFETY RESULT: internet=$net dns=$dns tailscale_peer=$ts vpn=$vpn"
+  if [[ "$net" == yes && "$dns" == yes && "$vpn" == Disconnected ]]; then
+    write_result "finished; experiment_rc=$rc; internet=yes; dns=yes; tailscale_peer=$ts; vpn=off"
+  else
+    write_result "recovery-incomplete; experiment_rc=$rc; internet=$net; dns=$dns; tailscale_peer=$ts; vpn=$vpn"
+    rc=1
+  fi
+  rmdir "$LOCK" >/dev/null 2>&1 || true
+  exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM HUP
+
+spawn_deadman() {
+  [[ "${DARKMESH_TRIAL_DISABLE_DEADMAN:-no}" == yes ]] && return
+  (
+    "$SLEEP" "$DEADMAN_SECONDS"
+    log "DEADMAN: trial exceeded ${DEADMAN_SECONDS}s; forcing plain-network recovery"
+    "$DARKMESH_CLI" panic >>"$LOG" 2>&1 || true
+    "$TAILSCALE_CLI" up >>"$LOG" 2>&1 || true
+    kill -TERM $$ >/dev/null 2>&1 || true
+  ) </dev/null >/dev/null 2>&1 &
+  deadman_pid=$!
+}
+
+write_result "running"
+log "preflight: verifying ordinary internet, DNS, and existing Tailscale peer"
+internet_ok || { log "ERROR: internet is not healthy before the experiment"; exit 1; }
+dns_ok || { log "ERROR: DNS is not healthy before the experiment"; exit 1; }
+tailscale_peer_ok || { log "ERROR: peer is not reachable before the experiment"; exit 1; }
+
+original_protocol="$("$EXPRESSVPN_CTL" --timeout 3 get protocol 2>/dev/null | head -1)"
+original_protocol="${original_protocol##*: }"
+spawn_deadman
+
+log "phase 1: disarm Darkmesh and fully recycle the ExpressVPN app session"
+"$DARKMESH_CLI" panic >>"$LOG" 2>&1
+"$EXPRESSVPN_CTL" --timeout 8 background disable >>"$LOG" 2>&1 || true
+"$OSASCRIPT" -e 'tell application "ExpressVPN" to quit' >>"$LOG" 2>&1 || true
+"$SLEEP" 5
+
+log "phase 2: restore the existing Tailscale session before ExpressVPN"
+tailscale_up_existing || { log "ERROR: existing Tailscale identity did not come up"; exit 1; }
+tailscale_peer_ok || { log "ERROR: peer was not reachable after the session reset"; exit 1; }
+
+log "phase 3: launch ExpressVPN, enforce safe settings, and select Lightway TCP"
+"$OPEN_CMD" -gja /Applications/ExpressVPN.app >>"$LOG" 2>&1
+"$SLEEP" 6
+"$EXPRESSVPN_CTL" --timeout 8 background enable >>"$LOG" 2>&1
+"$EXPRESSVPN_CTL" --timeout 8 set networklock false >>"$LOG" 2>&1
+"$EXPRESSVPN_CTL" --timeout 8 set autoconnect false >>"$LOG" 2>&1
+"$EXPRESSVPN_CTL" --timeout 8 set protocol lightwaytcp >>"$LOG" 2>&1
+"$EXPRESSVPN_CTL" --timeout 8 get splittunnel 2>/dev/null | grep -qx true \
+  || { log "ERROR: ExpressVPN split tunneling is not enabled"; exit 1; }
+split_apps="$("$EXPRESSVPN_CTL" --timeout 8 get split-app 2>/dev/null)"
+printf '%s\n' "$split_apps" | grep -qi 'Tailscale.app' \
+  || { log "ERROR: Tailscale app bypass is missing"; exit 1; }
+printf '%s\n' "$split_apps" | grep -qi 'io.tailscale.ipn.macsys.network-extension' \
+  || { log "ERROR: Tailscale extension bypass is missing"; exit 1; }
+
+log "phase 4: arm Darkmesh and wait up to ${CONNECT_TIMEOUT}s for ExpressVPN"
+"$DARKMESH_CLI" up >>"$LOG" 2>&1
+connected=no
+for ((elapsed=0; elapsed<CONNECT_TIMEOUT; elapsed+=2)); do
+  if [[ "$(vpn_state)" == Connected ]]; then connected=yes; break; fi
+  "$SLEEP" 2
+done
+[[ "$connected" == yes ]] || { log "ERROR: ExpressVPN did not connect"; exit 1; }
+"$SLEEP" "$SETTLE_SECONDS"
+
+log "phase 5: test VPN internet, DNS, Tailscale peer, and optional SSH"
+internet_ok || { log "FAIL: ordinary internet failed with Lightway connected"; exit 1; }
+dns_ok || { log "FAIL: DNS failed with Lightway connected"; exit 1; }
+tailscale_peer_ok || { log "FAIL: the Tailscale peer failed with Lightway connected"; exit 1; }
+if [[ -n "$ssh_target" ]]; then
+  "$SSH" -o BatchMode=yes -o ConnectTimeout=10 "$ssh_target" 'nice -n 19 true' \
+    >>"$LOG" 2>&1 || { log "FAIL: private SSH failed with Lightway connected"; exit 1; }
+fi
+
+log "PASS: Lightway TCP, ordinary internet, DNS, Tailscale, and requested SSH coexisted"
+write_result "pass; cleanup=pending"
+exit 0

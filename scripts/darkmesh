@@ -34,6 +34,7 @@ Usage: darkmesh <command> [args]
   undo                emergency restore internet (legacy `darkmesh --undo`)
   doctor              transfer-client VPN-binding diagnostics
   apply | verify      darkmesh-expressvpn-tailscale apply / verify
+  coexistence-trial   bounded Lightway/Tailscale test; always restores plain internet
   help                this text
 
 Each subcommand is also available directly as `darkmesh-<command>`.
