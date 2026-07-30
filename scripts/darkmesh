@@ -34,7 +34,8 @@ Usage: darkmesh <command> [args]
   undo                emergency restore internet (legacy `darkmesh --undo`)
   doctor              transfer-client VPN-binding diagnostics
   apply | verify      darkmesh-expressvpn-tailscale apply / verify
-  experiment          staged coexistence preflight, campaign, and report
+  experiment start    guided configure, preflight, campaign, and report
+  experiment          advanced experiment commands and field profiles
   coexistence-trial   compatibility wrapper for `experiment run --profile staged`
   help                this text
 

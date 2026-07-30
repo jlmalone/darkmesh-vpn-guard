@@ -124,16 +124,14 @@ vpn-guard.sh
 adaptive staged campaign, and local report:
 
 ```bash
-darkmesh experiment plan --profile staged
-darkmesh-transfer pause
-darkmesh experiment preflight
-darkmesh experiment run --profile staged
-darkmesh experiment report
+darkmesh experiment start
 ```
 
 Peer addresses and SSH aliases come from the untracked mode-`0600`
-`~/.config/darkmesh/experiment.conf`; start with
-`experiment.conf.example`. The campaign never starts a transfer or changes
+`~/.config/darkmesh/experiment.conf`. The guided command creates that file
+interactively when needed, prints the plan, pauses transfers, runs preflight,
+requires an exact live-change confirmation, executes the campaign, and prints
+the report. The campaign never starts a transfer or changes
 ExpressVPN background mode. See
 [`docs/runbook.md`](docs/runbook.md#staged-coexistence-experiments) before any
 live run. The captive profile intentionally stops for portal sign-in and

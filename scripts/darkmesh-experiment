@@ -54,6 +54,7 @@ CAMPAIGN_DEADMAN="${DARKMESH_EXPERIMENT_CAMPAIGN_DEADMAN:-14400}"
 usage() {
   cat <<'EOF'
 Usage:
+  darkmesh experiment start [--config FILE] [--capture-path-metadata] [--reconfigure]
   darkmesh experiment preflight [--config FILE] [--capture-path-metadata]
   darkmesh experiment run --profile staged [--config FILE] [--capture-path-metadata]
   darkmesh experiment run --profile captive [--config FILE]
@@ -61,9 +62,11 @@ Usage:
   darkmesh experiment report [RUN_DIRECTORY]
   darkmesh experiment plan [--profile staged|captive] [--format text|json]
 
-preflight is read-only. run performs local network changes and always attempts
-exact restoration. plan is mutation-free and prints the adaptive case inventory
-plus a conservative maximum duration.
+start is the guided, one-command staged workflow: configure, plan, pause
+transfers, preflight, confirm, run, and report. preflight is read-only. run
+performs local network changes and always attempts exact restoration. plan is
+mutation-free and prints the adaptive case inventory plus a conservative
+maximum duration.
 
 Private peer addresses and SSH aliases must be stored in a mode-0600 config file.
 The staged profile never starts a transfer and never changes ExpressVPN
@@ -91,6 +94,7 @@ FORMAT=text
 CAPTURE_PATH_METADATA=no
 RUN_DIR=""
 RESUME_DIR=""
+RECONFIGURE=no
 ACTION="${1:-}"
 shift || true
 while (($#)); do
@@ -100,6 +104,7 @@ while (($#)); do
     --capture-path-metadata) CAPTURE_PATH_METADATA=yes; shift ;;
     --resume) (($# >= 2)) || die "--resume requires a run directory"; RESUME_DIR="$2"; shift 2 ;;
     --format) (($# >= 2)) || die "--format requires a value"; FORMAT="$2"; shift 2 ;;
+    --reconfigure) RECONFIGURE=yes; shift ;;
     -h|--help) usage; exit 0 ;;
     --*) die "unknown option: $1" ;;
     *) [[ "$ACTION" == report && -z "$RUN_DIR" ]] || die "unexpected argument: $1"; RUN_DIR="$1"; shift ;;
@@ -107,7 +112,7 @@ while (($#)); do
 done
 
 case "$ACTION" in
-  preflight|run|report|plan) ;;
+  start|preflight|run|report|plan) ;;
   -h|--help|"") usage; exit 0 ;;
   *) die "unknown experiment action: $ACTION" ;;
 esac
@@ -120,6 +125,8 @@ fi
 [[ -n "$PROFILE" ]] || PROFILE=staged
 [[ -z "$RESUME_DIR" || "$ACTION" == run && "$PROFILE" == captive ]] \
   || die "--resume is valid only with run --profile captive"
+[[ "$RECONFIGURE" != yes || "$ACTION" == start ]] \
+  || die "--reconfigure is valid only with start"
 
 for value in "$BASELINE_MAX" "$BASELINE_QUIET" "$CONNECT_MAX" "$STABILIZE_MIN" \
   "$STABILIZE_MAX" "$SAMPLE_INTERVAL" "$TAILSCALE_MAX" "$RECOVERY_MAX" \
@@ -161,6 +168,86 @@ load_config() {
   [[ "$SEATTLE_REGION" =~ ^[A-Za-z0-9._-]+$ &&
      "$NEARBY_REGION" =~ ^[A-Za-z0-9._-]+$ ]] \
     || die "region selections must be simple slugs"
+}
+
+read_config_defaults() {
+  [[ -f "$CONFIG" && ! -L "$CONFIG" ]] || return 0
+  local key value
+  while IFS='=' read -r key value; do
+    case "$key" in
+      PEER_A_ADDRESS|PEER_A_SSH|PEER_B_ADDRESS|PEER_B_SSH|SEATTLE_REGION|NEARBY_REGION)
+        printf -v "$key" '%s' "$value"
+        ;;
+    esac
+  done <"$CONFIG"
+}
+
+config_needs_input() {
+  [[ "$RECONFIGURE" == yes || ! -f "$CONFIG" ]] && return 0
+  [[ ! -L "$CONFIG" ]] || die "refusing symlinked private config: $CONFIG"
+  [[ "$(/usr/bin/stat -f %Lp "$CONFIG" 2>/dev/null || true)" == 600 ]] || return 0
+  read_config_defaults
+  [[ "$PEER_A_ADDRESS" == peer-a.example || "$PEER_A_SSH" == host-a ||
+     "$PEER_B_ADDRESS" == peer-b.example || "$PEER_B_SSH" == host-b ||
+     -z "$PEER_A_ADDRESS" || -z "$PEER_A_SSH" ||
+     -z "$PEER_B_ADDRESS" || -z "$PEER_B_SSH" ]] && return 0
+  [[ "$PEER_A_ADDRESS" =~ ^[A-Za-z0-9._:-]+$ &&
+     "$PEER_B_ADDRESS" =~ ^[A-Za-z0-9._:-]+$ &&
+     "$PEER_A_SSH" =~ ^[A-Za-z0-9._@-]+$ &&
+     "$PEER_B_SSH" =~ ^[A-Za-z0-9._@-]+$ &&
+     "$SEATTLE_REGION" =~ ^[A-Za-z0-9._-]+$ &&
+     "$NEARBY_REGION" =~ ^[A-Za-z0-9._-]+$ ]] || return 0
+  return 1
+}
+
+prompt_value() {
+  local variable="$1" label="$2" current="$3" entered
+  if [[ "$current" == peer-a.example || "$current" == host-a ||
+        "$current" == peer-b.example || "$current" == host-b ]]; then
+    current=""
+  fi
+  if [[ -n "$current" ]]; then
+    printf '%s [%s]: ' "$label" "$current"
+  else
+    printf '%s: ' "$label"
+  fi
+  IFS= read -r entered || die "configuration input ended before completion"
+  [[ -n "$entered" ]] || entered="$current"
+  printf -v "$variable" '%s' "$entered"
+}
+
+configure_private_targets() {
+  if ! config_needs_input; then
+    printf 'Using private experiment config: %s\n' "$CONFIG"
+    return
+  fi
+  read_config_defaults
+  printf 'Configure the two passive Tailscale and SSH targets.\n'
+  prompt_value PEER_A_ADDRESS "Peer A Tailscale address" "$PEER_A_ADDRESS"
+  prompt_value PEER_A_SSH "Peer A SSH alias" "$PEER_A_SSH"
+  prompt_value PEER_B_ADDRESS "Peer B Tailscale address" "$PEER_B_ADDRESS"
+  prompt_value PEER_B_SSH "Peer B SSH alias" "$PEER_B_SSH"
+  [[ "$SEATTLE_REGION" =~ ^[A-Za-z0-9._-]+$ ]] || SEATTLE_REGION=usa-seattle
+  [[ "$NEARBY_REGION" =~ ^[A-Za-z0-9._-]+$ ]] || NEARBY_REGION=canada-vancouver
+
+  local config_dir temp
+  config_dir="$(dirname "$CONFIG")"
+  mkdir -p "$config_dir"
+  [[ ! -L "$CONFIG" ]] || die "refusing to replace symlinked private config: $CONFIG"
+  temp="$(/usr/bin/mktemp "$config_dir/.experiment.conf.XXXXXX")"
+  chmod 600 "$temp"
+  {
+    printf 'PEER_A_ADDRESS=%s\n' "$PEER_A_ADDRESS"
+    printf 'PEER_A_SSH=%s\n' "$PEER_A_SSH"
+    printf 'PEER_B_ADDRESS=%s\n' "$PEER_B_ADDRESS"
+    printf 'PEER_B_SSH=%s\n' "$PEER_B_SSH"
+    printf 'SEATTLE_REGION=%s\n' "$SEATTLE_REGION"
+    printf 'NEARBY_REGION=%s\n' "$NEARBY_REGION"
+  } >"$temp"
+  mv "$temp" "$CONFIG"
+  chmod 600 "$CONFIG"
+  load_config
+  printf 'Saved private experiment config: %s\n' "$CONFIG"
 }
 
 plan_rows() {
@@ -224,6 +311,35 @@ PY
       "$((estimate / 3600))" "$(((estimate % 3600) / 60))"
   fi
 }
+
+guided_start() {
+  local -a common=()
+  local answer run_rc=0
+  [[ "$CONFIG" == "$HOME/.config/darkmesh/experiment.conf" ]] \
+    || common+=(--config "$CONFIG")
+  [[ "$CAPTURE_PATH_METADATA" != yes ]] || common+=(--capture-path-metadata)
+
+  configure_private_targets
+  printf '\nExperiment plan:\n'
+  "$0" plan --profile staged
+  printf '\nPausing transfers and checking every precondition.\n'
+  "$DARKMESH_TRANSFER" pause
+  "$0" preflight "${common[@]}"
+  printf '\nThis will now change VPN and Tailscale state on this Mac.\n'
+  printf 'Type RUN STAGED EXPERIMENT to continue: '
+  IFS= read -r answer || die "confirmation input ended"
+  [[ "$answer" == "RUN STAGED EXPERIMENT" ]] || die "live campaign cancelled"
+  printf '\nStarting staged campaign. Its deadmen will attempt exact restoration.\n'
+  "$0" run --profile staged "${common[@]}" || run_rc=$?
+  printf '\nLatest report:\n'
+  "$0" report || true
+  return "$run_rc"
+}
+
+if [[ "$ACTION" == start ]]; then
+  guided_start
+  exit $?
+fi
 
 if [[ "$ACTION" == plan ]]; then
   print_plan

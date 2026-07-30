@@ -132,21 +132,21 @@ The concrete client config path and section name are derived by
 ## Staged coexistence experiments
 
 The current experiment is an adaptive campaign, not a one-off protocol trial.
-Start by creating the private local target map:
+The normal entry point is one guided command:
 
 ```bash
-mkdir -p ~/.config/darkmesh
-cp "$(brew --prefix)/share/darkmesh/experiment.conf.example" \
-  ~/.config/darkmesh/experiment.conf
-chmod 600 ~/.config/darkmesh/experiment.conf
+darkmesh experiment start
 ```
 
-Replace the neutral peer addresses and SSH aliases in that file. The file is
-literal `KEY=value` data, is never sourced as shell, and must remain untracked.
-The peers are passive targets. The experiment changes network state only on the
-Mac where it runs.
+It creates the private mode-`0600` target map interactively when needed, prints
+the plan, pauses transfers, runs preflight, requires the operator to type an
+exact live-change confirmation, executes the campaign, and prints the report.
+Use `darkmesh experiment start --reconfigure` to replace existing target
+values. The file is literal `KEY=value` data, is never sourced as shell, and
+must remain untracked. The peers are passive targets. The experiment changes
+network state only on the Mac where it runs.
 
-Review the complete adaptive inventory without changing network state:
+The individual commands remain available for diagnostics and automation:
 
 ```bash
 darkmesh experiment plan --profile staged

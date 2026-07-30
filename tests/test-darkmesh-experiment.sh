@@ -235,4 +235,32 @@ grep -q 'is retired' "$TMP/protocol.out"
 "$ROOT/scripts/darkmesh-coexistence-trial" --help >"$TMP/wrapper.out" 2>&1
 grep -q 'darkmesh experiment preflight' "$TMP/wrapper.out"
 
+echo "14. guided start configures, gates, runs, and reports in one command"
+guided="$(new_fixture guided)"
+printf '%s\n' \
+  'peer-one.example' 'ssh-one' 'peer-two.example' 'ssh-two' \
+  'RUN STAGED EXPERIMENT' |
+  run_experiment "$guided" env TEST_UNSUPPORTED_PROTOCOLS=lightwaytcp,lightwayudp \
+    "$ROOT/scripts/darkmesh-experiment" start --reconfigure >"$guided/out"
+grep -q 'Saved private experiment config:' "$guided/out"
+grep -q 'Starting staged campaign' "$guided/out"
+grep -q 'Latest report:' "$guided/out"
+grep -q 'restoration verified: true' "$guided/out"
+grep -q '^PEER_A_ADDRESS=peer-one.example$' "$guided/config"
+grep -q '^PEER_A_SSH=ssh-one$' "$guided/config"
+grep -q '^PEER_B_ADDRESS=peer-two.example$' "$guided/config"
+grep -q '^PEER_B_SSH=ssh-two$' "$guided/config"
+[[ "$(stat -f %Lp "$guided/config")" == 600 ]]
+
+echo "15. guided start refuses the live campaign without exact confirmation"
+cancelled="$(new_fixture cancelled)"
+if printf '%s\n' \
+  'peer-one.example' 'ssh-one' 'peer-two.example' 'ssh-two' 'not approved' |
+  run_experiment "$cancelled" env "$ROOT/scripts/darkmesh-experiment" start \
+    >"$cancelled/out" 2>&1; then
+  fail "guided start ran without exact confirmation"
+fi
+grep -q 'live campaign cancelled' "$cancelled/out"
+! grep -q '^expressvpnctl --timeout 8 connect' "$cancelled/state/calls"
+
 echo "darkmesh experiment tests passed"
