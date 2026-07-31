@@ -153,7 +153,7 @@ override_dns() {
 
   if [[ ! -f "$JOURNAL" ]]; then
     current="$(networksetup -getdnsservers "$service" 2>&1 || true)"
-    if grep "aren't any DNS Servers set" >/dev/null <<<"$current"; then
+    if printf '%s' "$current" | grep -q "aren't any DNS Servers set"; then
       mode=dhcp
       values=
     else
