@@ -33,7 +33,7 @@ only as the explicit `darkmesh setup --legacy-agents` fallback.
 | `vpn-guard.sh` | Homebrew/darkmesh tool directory | The guard logic |
 | `unsafe.pf.conf` | `/usr/local/etc/vpn-guard/unsafe.pf.conf` | PF rules loaded into anchor `vpn-guard` |
 | `com.user.vpnguard.plist` | `~/Library/LaunchAgents/` | Legacy scheduler template |
-| `sudoers.d-vpn-guard` | `/etc/sudoers.d/vpn-guard` | NOPASSWD for the two specific `pfctl` invocations |
+| `sudoers.d-vpn-guard` | `/etc/sudoers.d/vpn-guard` | NOPASSWD for fixed PF status, enable, arm, and flush commands |
 | `hotspot-ssids.txt.example` | `~/.config/vpn-guard/hotspot-ssids.txt` | Editable SSID substring list |
 | `trusted-gateway-macs.txt.example` | `~/.config/vpn-guard/trusted-gateway-macs.txt` | Exact allowlist for stable non-hotspot gateways with ambiguous MACs |
 | `vpn-guard-install.sh` | - | One-shot installer |
@@ -88,7 +88,8 @@ tail -f ~/Library/Logs/vpn-guard/vpn-guard.log
 ```
 
 Expected behavior: when ExpressVPN is connected and SSID is not a hotspot, the
-anchor should be empty and the transfer client should be running normally.
+anchor should be empty. The transfer client runs only when its explicit intent
+is `active`; a manual `paused` intent is never overridden by the guard.
 Disconnect VPN and, within about 30 seconds or on the next network event, the
 client pauses and the anchor populates with block rules.
 
@@ -102,7 +103,7 @@ client pauses and the anchor populates with block rules.
   default while connected, but the PF layer remains useful defense in depth.
 - If you switch clients, the Web UI API call may not match, but the PF rules and
   `SIGSTOP` fallback still cut traffic for the configured process.
-- `sudoers.d-vpn-guard` whitelists exactly two `pfctl` argv variants. Anything
+- `sudoers.d-vpn-guard` whitelists only fixed `pfctl` argv variants. Anything
   else still requires interactive sudo.
 
 ## Tunables
@@ -114,6 +115,8 @@ In `vpn-guard.sh`:
 - `KEYCHAIN_SERVICE` (default `vpn-guard-client`)
 - `HOTSPOT_PATTERNS_FILE` (default `~/.config/vpn-guard/hotspot-ssids.txt`)
 - `TRUSTED_GATEWAY_MACS_FILE` (default `~/.config/vpn-guard/trusted-gateway-macs.txt`)
+- `DARKMESH_GUARD_REASSERT_SECONDS` (default `600`; unchanged states remain
+  quiet between bounded safety reassertions)
 
 In `unsafe.pf.conf`:
 

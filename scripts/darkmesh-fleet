@@ -94,7 +94,7 @@ while IFS= read -r node; do
     [[ "$attempt" -lt 3 ]] && ssh "$node" 'nice -n 19 sleep 10' >/dev/null 2>&1
   done
   ssh "$node" "nice -n 19 rm -rf '$remote_tmp'" >/dev/null 2>&1 || true
-  if [[ "$audit_rc" -eq 0 ]] && printf '%s' "$audit" | /usr/bin/plutil -extract ok raw -o - - 2>/dev/null | grep -q true; then
+  if [[ "$audit_rc" -eq 0 ]] && printf '%s' "$audit" | /usr/bin/plutil -extract ok raw -o - - 2>/dev/null | grep true >/dev/null; then
     printf 'PASS    %-24s helper=%s\n' "$node" "${EXPECTED_HELPER_HASH:0:12}"
     passed=$((passed + 1))
   else

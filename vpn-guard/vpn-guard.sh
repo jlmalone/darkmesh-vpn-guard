@@ -22,6 +22,9 @@ PF_RULES="${PF_RULES:-/usr/local/etc/vpn-guard/unsafe.pf.conf}"
 # traffic when the rules live here.
 PF_ANCHOR="${PF_ANCHOR:-com.apple/vpn-guard}"
 PF_SIDECAR="${PF_SIDECAR:-${DARKMESH_PF_SIDECAR:-/tmp/darkmesh-pf.json}}"
+GUARD_STATE_FILE="${DARKMESH_GUARD_STATE:-$HOME/.config/darkmesh/vpn-guard-state}"
+TRANSFER_DESIRED_FILE="${DARKMESH_TRANSFER_DESIRED:-$HOME/.config/darkmesh/transfer-desired}"
+REASSERT_SECONDS="${DARKMESH_GUARD_REASSERT_SECONDS:-600}"
 COOKIE_JAR="$(mktemp -t vpn-guard-client)"
 LOG_DIR="$HOME/Library/Logs/vpn-guard"
 LOG="$LOG_DIR/vpn-guard.log"
@@ -39,6 +42,32 @@ mkdir -p "$LOG_DIR"
 trap 'rm -f "$COOKIE_JAR"' EXIT
 
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOG" >&2; }
+
+state_value() {
+  local key="$1"
+  [[ -f "$GUARD_STATE_FILE" ]] || return 0
+  awk -F= -v key="$key" '$1 == key {print $2; exit}' "$GUARD_STATE_FILE" 2>/dev/null || true
+}
+
+write_guard_state() {
+  local mode="$1" transfer="$2" now="$3" tmp
+  mkdir -p "$(dirname "$GUARD_STATE_FILE")"
+  tmp="$(mktemp "${GUARD_STATE_FILE}.tmp.XXXXXX")" || return 1
+  {
+    printf 'mode=%s\n' "$mode"
+    printf 'transfer=%s\n' "$transfer"
+    printf 'last_action_at=%s\n' "$now"
+  } >"$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$GUARD_STATE_FILE"
+}
+
+transfer_desired() {
+  local desired=active
+  [[ ! -f "$TRANSFER_DESIRED_FILE" ]] || desired="$(tr -d '[:space:]' <"$TRANSFER_DESIRED_FILE" 2>/dev/null)"
+  [[ "$desired" == active ]] || desired=paused
+  printf '%s' "$desired"
+}
 
 is_vpn_connected() {
   # Strict: requires the daemon to report active tunnel, not "app running but disconnected".
@@ -104,7 +133,7 @@ gateway_mac_is_trusted() {
       gsub(/[[:space:]]/, "")
       if (length) print tolower($0)
     }
-  ' "$TRUSTED_GATEWAY_MACS_FILE" | grep -qxF "$mac"
+  ' "$TRUSTED_GATEWAY_MACS_FILE" | grep -xF "$mac" >/dev/null
 }
 
 is_hotspot() {
@@ -114,7 +143,7 @@ is_hotspot() {
     if [[ -s "$HOTSPOT_PATTERNS_FILE" ]]; then
       # Strip comments and blank lines; a blank grep pattern would match everything.
       grep -qiF -f <(grep -vE '^[[:space:]]*(#|$)' "$HOTSPOT_PATTERNS_FILE") <<<"$ssid" && return 0
-    elif printf '%s' "$ssid" | grep -qiE 'iphone|android|hotspot|tether|personal|pixel|galaxy'; then
+    elif grep -iE 'iphone|android|hotspot|tether|personal|pixel|galaxy' >/dev/null <<<"$ssid"; then
       return 0
     fi
   fi
@@ -127,14 +156,14 @@ is_hotspot() {
   [[ -n "$wifi" && "$(default_route_iface)" == "$wifi" ]] || return 1
 
   # iPhone personal hotspots always assign 172.20.10.0/28.
-  if ipconfig getifaddr "$wifi" 2>/dev/null | grep -q '^172\.20\.10\.'; then
+  if ipconfig getifaddr "$wifi" 2>/dev/null | grep '^172\.20\.10\.' >/dev/null; then
     log "hotspot signal: iPhone tether subnet (172.20.10.x)"
     return 0
   fi
 
   # Classic AOSP tether subnet. Android 10 and earlier used this fixed range
   # with a burned-in AP MAC, so the randomized-MAC signal below misses them.
-  if ipconfig getifaddr "$wifi" 2>/dev/null | grep -q '^192\.168\.43\.'; then
+  if ipconfig getifaddr "$wifi" 2>/dev/null | grep '^192\.168\.43\.' >/dev/null; then
     log "hotspot signal: legacy Android tether subnet (192.168.43.x)"
     return 0
   fi
@@ -241,12 +270,24 @@ client_resume_all() {
 # port-scoped rules ever block, and only while unsafe.
 
 pf_enabled_now() {
-  sudo -n /sbin/pfctl -s info 2>/dev/null | grep -q 'Status: Enabled'
+  # Do not use grep -q here. With pipefail, grep exits after the early match,
+  # pfctl receives SIGPIPE while printing counters, and the healthy probe is
+  # reported false. That caused a new pfctl -E reference every guard tick.
+  sudo -n /sbin/pfctl -s info 2>/dev/null | grep 'Status: Enabled' >/dev/null
+}
+
+run_pf_quiet() {
+  local output
+  if output="$(sudo -n /sbin/pfctl "$@" 2>&1)"; then
+    return 0
+  fi
+  [[ -z "$output" ]] || log "pfctl $*: ${output//$'\n'/; }"
+  return 1
 }
 
 ensure_pf_enabled() {
   pf_enabled_now && return 0
-  if sudo -n /sbin/pfctl -E >/dev/null 2>>"$LOG"; then
+  if run_pf_quiet -E; then
     log "pf enabled (was disabled)"
   else
     log "WARN: could not enable PF (need sudoers entry for 'pfctl -E'?)"
@@ -275,15 +316,15 @@ EOF
 
 apply_pf_unsafe() {
   [[ -r "$PF_RULES" ]] || { log "missing pf rules file: $PF_RULES"; return 1; }
-  sudo -n /sbin/pfctl -a "$PF_ANCHOR" -f "$PF_RULES" 2>>"$LOG" \
+  run_pf_quiet -a "$PF_ANCHOR" -f "$PF_RULES" \
     && log "pf anchor loaded (unsafe)" \
     || { log "pfctl load failed (need sudoers entry?)"; return 1; }
 }
 
 apply_pf_safe() {
-  sudo -n /sbin/pfctl -a "$PF_ANCHOR" -F all 2>>"$LOG" \
+  run_pf_quiet -a "$PF_ANCHOR" -F all \
     && log "pf anchor flushed (safe)" \
-    || log "pfctl flush failed"
+    || { log "pfctl flush failed"; return 1; }
 }
 
 main() {
@@ -298,23 +339,37 @@ main() {
   fi
   [[ $# -eq 0 ]] || { echo "Usage: vpn-guard.sh [--force-unsafe]" >&2; return 2; }
 
-  local vpn=no hot=no
+  local vpn=no hot=no mode transfer last_mode last_transfer last_action now reassert=no action_ok=yes
   is_vpn_connected && vpn=yes
   is_hotspot && hot=yes
-  log "state: vpn=$vpn hotspot=$hot ssid=$(current_ssid 2>/dev/null || echo -)"
+  if [[ "$vpn" == yes && "$hot" == no ]]; then mode=safe; else mode=unsafe; fi
+  if [[ "$mode" == unsafe || "$(transfer_desired)" == paused ]]; then transfer=paused; else transfer=active; fi
+  last_mode="$(state_value mode)"
+  last_transfer="$(state_value transfer)"
+  last_action="$(state_value last_action_at)"; [[ "$last_action" =~ ^[0-9]+$ ]] || last_action=0
+  now="$(date +%s)"
+  (( now - last_action >= REASSERT_SECONDS )) && reassert=yes
 
-  if [[ "$vpn" == yes && "$hot" == no ]]; then
-    apply_pf_safe
-    client_resume_all
-    write_pf_sidecar false
-    log "SAFE"
-  else
-    ensure_pf_enabled
-    apply_pf_unsafe
-    client_pause_all
-    write_pf_sidecar true
-    log "UNSAFE"
+  if [[ "$mode" != "$last_mode" || "$transfer" != "$last_transfer" || "$reassert" == yes ]]; then
+    if [[ "$mode" != "$last_mode" || "$transfer" != "$last_transfer" ]]; then
+      log "state changed: vpn=$vpn hotspot=$hot mode=$mode transfer=$transfer"
+    else
+      log "reasserting mode=$mode transfer=$transfer"
+    fi
+    if [[ "$mode" == safe ]]; then
+      apply_pf_safe || action_ok=no
+    else
+      ensure_pf_enabled && apply_pf_unsafe || action_ok=no
+    fi
+    if [[ "$transfer" == paused ]]; then
+      client_pause_all || action_ok=no
+    elif [[ "$transfer" != "$last_transfer" || "$mode" != "$last_mode" ]]; then
+      client_resume_all || action_ok=no
+    fi
+    [[ "$action_ok" != yes ]] || write_guard_state "$mode" "$transfer" "$now"
   fi
+
+  if [[ "$mode" == safe ]]; then write_pf_sidecar false; else write_pf_sidecar true; fi
 }
 
 # Run main only when executed directly; allows sourcing for tests.

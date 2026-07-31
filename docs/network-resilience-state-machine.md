@@ -25,6 +25,7 @@ autoconnect guidance are superseded here.
 | `captive-clear-wait` | Require stable exact success before a normal-region VPN attempt. | Required clear samples pass. |
 | `restricted-wait` | No positive portal evidence, but the normal probes are blocked or unavailable. | The initial plain-network window expires. |
 | `retrying` | One serialized VPN attempt failed. Restore plain networking and preserve the absolute retry deadline. | Deadline expires. |
+| `safety-standdown` | A connected tunnel failed the healthcheck safety gate. Prefer stable plain networking for one hour. | The standdown expires or the operator explicitly runs `darkmesh up`. |
 | `plain-cooldown` | Per-network restricted-attempt budget is exhausted. | Cooldown expires or the physical network changes. |
 | `connected` | Re-pin the transfer client to the live tunnel and resume only after containment is safe. | VPN or physical network changes. |
 
@@ -77,6 +78,11 @@ The long-running reconnect process is the only component allowed to issue VPN
 connection attempts or restart ExpressVPN. A network-change signal sets a dirty
 flag. Signals are coalesced before one reconcile pass and cannot interrupt an
 absolute retry deadline, a connection observation window, or restart wait.
+
+A healthcheck safety disconnect starts a one-hour automatic reconnect
+standdown. This prevents a bad tunnel from repeatedly interrupting healthy
+plain networking. `darkmesh up` records a fresh operator rearm and overrides
+that standdown immediately.
 
 The legacy `--once` path only forwards a signal to the long-running process.
 ExpressVPN built-in autoconnect is disabled, and the configuration command hands

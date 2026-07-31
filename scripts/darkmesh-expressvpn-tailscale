@@ -182,7 +182,7 @@ apply_setup() {
   split_apps="$("$EXPRESSVPN_CTL" get split-app 2>/dev/null)"
   local blocked_proc
   blocked_proc="$CLIENT_PROC"
-  if printf '%s\n' "$split_apps" | grep -qi "$blocked_proc"; then
+  if grep -i "$blocked_proc" >/dev/null <<<"$split_apps"; then
     die "transfer client is present in split-tunnel rules; remove it before continuing"
   fi
 
@@ -208,7 +208,7 @@ apply_setup() {
     if [[ -z "$match" ]]; then
       die "active Tailscale extension v$v is not on disk; cannot connect safely"
     fi
-    if ! printf '%s\n' "$split_apps" | grep -qF "bypass:$match"; then
+    if ! grep -F "bypass:$match" >/dev/null <<<"$split_apps"; then
       die "active Tailscale extension v$v ($match) is NOT in bypass list; aborting before connect"
     fi
     echo "Verified bypass for active Tailscale extension v$v"
@@ -236,7 +236,7 @@ apply_setup() {
     die "darkmesh-up not found; configuration applied but VPN intent was not armed"
   fi
 
-  if systemextensionsctl list 2>/dev/null | grep -q 'com.expressvpn.vpn.splittunnel.*waiting for user'; then
+  if systemextensionsctl list 2>/dev/null | grep 'com.expressvpn.vpn.splittunnel.*waiting for user' >/dev/null; then
     echo
     echo "macOS still needs user approval for ExpressVPN SplitTunnelProxyExtension."
     echo "Opening System Settings. Approve it under General > Login Items & Extensions > Network Extensions."
@@ -267,15 +267,15 @@ verify_setup() {
   fi
   [[ "$splittunnel" == "true" ]] || die "Split Tunnel is not true"
   [[ "$autoconnect" == "false" ]] || die "ExpressVPN autoconnect is not false; Darkmesh must own connection ordering"
-  printf '%s\n' "$split_apps" | grep -q 'bypass:.*Tailscale.app' || die "Tailscale app is not in bypass list"
-  printf '%s\n' "$split_apps" | grep -q 'bypass:.*io.tailscale.ipn.macsys.network-extension' || die "Tailscale network extension is not in bypass list"
+  grep 'bypass:.*Tailscale.app' >/dev/null <<<"$split_apps" || die "Tailscale app is not in bypass list"
+  grep 'bypass:.*io.tailscale.ipn.macsys.network-extension' >/dev/null <<<"$split_apps" || die "Tailscale network extension is not in bypass list"
   if [[ -d /Library/PrivilegedHelperTools/ChromeRemoteDesktopHost.app ]]; then
-    printf '%s\n' "$split_apps" | grep -q 'bypass:.*remoting_me2me_host' \
+    grep 'bypass:.*remoting_me2me_host' >/dev/null <<<"$split_apps" \
       || die "Chrome Remote Desktop is installed but its host is not in the bypass list — remote access will break when VPN connects"
   fi
   local blocked_proc
   blocked_proc="$CLIENT_PROC"
-  ! printf '%s\n' "$split_apps" | grep -qi "$blocked_proc" || die "transfer client is in bypass list"
+  ! grep -i "$blocked_proc" >/dev/null <<<"$split_apps" || die "transfer client is in bypass list"
 }
 
 cmd="${1:-}"

@@ -125,7 +125,7 @@ out="$(HOME="$ONE" PATH="$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" \
   DARKMESH_CRD_INSTALLED=no DARKMESH_RECONNECT_SIDECAR="$ONE/reconnect.json" TEST_APPLE_OK=1 TEST_GOOGLE_CODE=500 \
   TEST_ROOT_LOG="$ONE/root.log" TEST_TS_LOG="$ONE/ts.log" TEST_NOTIFY_LOG="$ONE/notify.log" TEST_PLAIN_LOG="$ONE/plain.log" \
   "$ROOT/scripts/darkmesh-healthcheck")"
-printf '%s' "$out" | grep -q '"inet_e2e_ok": true' || fail "Apple body probe did not pass"
+grep '"inet_e2e_ok": true' >/dev/null <<<"$out" || fail "Apple body probe did not pass"
 assert_absent "$ONE/.config"
 assert_absent "$ONE/Library"
 

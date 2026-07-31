@@ -73,4 +73,42 @@ main --force-unsafe
 [[ "$(tr '\n' ' ' < "$EVENTS")" == "pf-enable pf-unsafe client-pause sidecar-true " ]] \
   || fail "forced unsafe action sequence was incorrect"
 
+echo "7. a manual pause is honored and unchanged ticks are quiet"
+: > "$EVENTS"
+mkdir -p "$HOME/.config/darkmesh"
+printf 'paused\n' > "$HOME/.config/darkmesh/transfer-desired"
+GUARD_STATE_FILE="$HOME/.config/darkmesh/vpn-guard-state"
+TRANSFER_DESIRED_FILE="$HOME/.config/darkmesh/transfer-desired"
+REASSERT_SECONDS=600
+is_vpn_connected() { return 0; }
+is_hotspot() { return 1; }
+apply_pf_safe() { echo pf-safe >> "$EVENTS"; }
+client_pause_all() { echo client-pause >> "$EVENTS"; }
+client_resume_all() { fail "manual pause was overridden"; }
+write_pf_sidecar() { echo "sidecar-$1" >> "$EVENTS"; }
+main
+main
+[[ "$(tr '\n' ' ' < "$EVENTS")" == "pf-safe client-pause sidecar-false sidecar-false " ]] \
+  || fail "guard repeated unchanged enforcement or ignored manual pause"
+grep -q '^transfer=paused$' "$GUARD_STATE_FILE" || fail "paused guard state was not persisted"
+
+echo "8. PF status probing does not leak enable references under pipefail"
+: > "$EVENTS"
+sudo() {
+  shift 2
+  if [[ "$*" == "-s info" ]]; then
+    printf 'Status: Enabled\n'
+    for _ in {1..200}; do printf 'counter data that must be drained\n'; done
+    return 0
+  fi
+  [[ "$*" != "-E" ]] || echo pf-enable >> "$EVENTS"
+}
+ensure_pf_enabled() {
+  pf_enabled_now && return 0
+  run_pf_quiet -E
+}
+pf_enabled_now || fail "enabled PF was misclassified under pipefail"
+ensure_pf_enabled
+[[ ! -s "$EVENTS" ]] || fail "enabled PF acquired another enable reference"
+
 echo "PASS: vpn-guard hotspot tests"

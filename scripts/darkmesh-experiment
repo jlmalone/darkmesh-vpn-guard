@@ -386,7 +386,7 @@ dns_ok() { "$HOST_CMD" -W 5 example.com >/dev/null 2>&1; }
 ts_ping() {
   local peer="$1" output
   if output="$("$TAILSCALE_CLI" ping --c 1 "$peer" 2>&1)"; then return 0; fi
-  printf '%s\n' "$output" | grep -q '^pong from '
+  grep '^pong from ' >/dev/null <<<"$output"
 }
 tcp22_ok() { "$NC_CMD" -G 8 -z "$1" 22 >/dev/null 2>&1; }
 ssh_ok() {
@@ -411,8 +411,8 @@ raise SystemExit(0 if valid else 1)
 PY
 }
 pf_enforced() {
-  "$SUDO" -n "$PFCTL" -s info 2>/dev/null | grep -q 'Status: Enabled' || return 1
-  "$SUDO" -n "$PFCTL" -a com.apple/vpn-guard -sr 2>/dev/null | grep -qE 'block|drop' \
+  "$SUDO" -n "$PFCTL" -s info 2>/dev/null | grep 'Status: Enabled' >/dev/null || return 1
+  "$SUDO" -n "$PFCTL" -a com.apple/vpn-guard -sr 2>/dev/null | grep -E 'block|drop' >/dev/null \
     || pf_sidecar_enforced
 }
 extension_ready() {
@@ -677,7 +677,7 @@ tailscale_up_existing() {
     observe tailscale-up "${CURRENT_CASE:-campaign}" precondition "$output"
     return 1
   fi
-  if printf '%s' "$output" | grep -qiE 'login|authenticate|authorization|new identity'; then
+  if grep -iE 'login|authenticate|authorization|new identity' >/dev/null <<<"$output"; then
     observe tailscale-up "${CURRENT_CASE:-campaign}" precondition "authentication or identity replacement requested"
     return 1
   fi
@@ -1242,7 +1242,7 @@ run_captive_profile() {
   "$DARKMESH_CLI" captive >/dev/null 2>&1 \
     || { case_result captive-field FAIL recovery "portal standdown failed"; return 1; }
   iface="$("$NETSTAT" -rn -f inet 2>/dev/null | awk '$1=="default" {print $NF; exit}')"
-  if [[ -z "$iface" ]] || ! "$IPCONFIG" getpacket "$iface" 2>/dev/null | grep -q 'domain_name_server'; then
+  if [[ -z "$iface" ]] || ! "$IPCONFIG" getpacket "$iface" 2>/dev/null | grep 'domain_name_server' >/dev/null; then
     case_result captive-field PRECONDITION captive "portal detected but DHCP DNS evidence is unavailable"
     return 1
   fi
@@ -1362,7 +1362,7 @@ for protocol in "${CONNECTED_PROTOCOLS[@]+"${CONNECTED_PROTOCOLS[@]}"}"; do
 done
 
 if [[ "$UDP_AMBIGUOUS" == yes ]] &&
-   printf '%s\n' "${CONNECTED_PROTOCOLS[@]+"${CONNECTED_PROTOCOLS[@]}"}" | grep -qx lightwayudp; then
+   grep -x lightwayudp >/dev/null <<<"${CONNECTED_PROTOCOLS[@]+"${CONNECTED_PROTOCOLS[@]}"}"; then
   run_case "region-lightwayudp-nearby" lightwayudp "$NEARBY_REGION" false both tailscale-first 1 || true
 fi
 

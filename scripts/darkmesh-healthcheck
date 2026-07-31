@@ -159,10 +159,10 @@ probe_dns() {
   local i result
   for i in 1 2; do
     result="$(host -W 3 -t NS . 2>&1)"
-    printf '%s' "$result" | grep -qiE 'name server|NS record' && return 0
+    grep -iE 'name server|NS record' >/dev/null <<<"$result" && return 0
   done
   result="$(host -W 3 "$PROBE_NAME" 2>&1)"
-  printf '%s' "$result" | grep -qE 'has address|has IPv6 address' && return 0
+  grep -E 'has address|has IPv6 address' >/dev/null <<<"$result" && return 0
   return 1
 }
 
@@ -187,8 +187,8 @@ probe_tailscale() {
   if [[ ! -x "$TAILSCALE_CLI" ]]; then [[ "$PROTECT_TS" != yes ]]; return; fi
   local js
   js="$(run_with_deadline "$PROBE_DEADLINE" "$TAILSCALE_CLI" status --json)" || return 1
-  printf '%s' "$js" | grep -q '"BackendState": *"Running"' || return 1
-  printf '%s' "$js" | awk '/"Self": \{/{f=1} f&&/"Online"/{print; exit}' | grep -q true
+  grep '"BackendState": *"Running"' >/dev/null <<<"$js" || return 1
+  awk '/"Self": \{/{f=1} f&&/"Online"/{print; exit}' <<<"$js" | grep true >/dev/null
 }
 
 crd_required() {
@@ -511,7 +511,7 @@ status_json() {
   desired="$(desired_state)"
   local agent unified=vision.salient.InfrastructureAgent
   if launchctl print "gui/$(id -u)/$unified" >/dev/null 2>&1 && infrastructure_manages_darkmesh; then
-    launchctl print "gui/$(id -u)/$unified" 2>/dev/null | grep -qE 'state = running|pid = [0-9]+' || services=false
+    launchctl print "gui/$(id -u)/$unified" 2>/dev/null | grep -E 'state = running|pid = [0-9]+' >/dev/null || services=false
     infrastructure_healthy || services=false
   else
     for agent in com.user.darkmesh-healthcheck com.user.darkmesh-reconnect com.user.vpnguard; do

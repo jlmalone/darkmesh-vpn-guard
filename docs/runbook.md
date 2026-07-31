@@ -43,9 +43,12 @@ Current responsibilities:
 - Detect ExpressVPN connected/disconnected state.
 - Detect unsafe SSIDs / hotspots.
 - Pause or stop the transfer client when unsafe.
+- Honor explicit `transfer-desired=paused` intent even when the VPN is safe.
 - Load PF kill rules when unsafe (nested under `com.apple/vpn-guard` so the main
   ruleset's `com.apple/*` wildcard evaluates them); flush them when safe.
 - Ensure PF is enabled, and publish PF state to the status file.
+- Reassert unchanged state at a bounded cadence without repeating PF and client
+  mutations every polling tick.
 - Provide transfer-client VPN binding diagnostics.
 
 Current helper:

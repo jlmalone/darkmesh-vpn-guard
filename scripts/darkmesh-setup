@@ -168,7 +168,7 @@ protect_ts_repl() {
   local f="$HOME/.config/darkmesh/protect-tailscale" want
   if [ -f "$f" ]; then
     want="$(tr '[:upper:]' '[:lower:]' < "$f" | tr -d '[:space:]')"
-  elif /usr/bin/pmset -g batt 2>/dev/null | grep -qi 'InternalBattery'; then
+  elif /usr/bin/pmset -g batt 2>/dev/null | grep -i 'InternalBattery' >/dev/null; then
     want=off
   else
     want=on

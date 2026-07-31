@@ -30,7 +30,7 @@ record() {
 }
 have_tool() { command -v "$1" >/dev/null 2>&1 || [[ -x "$BIN_DIR/$1" ]]; }
 agent_loaded() { launchctl print "gui/$uid/$1" >/dev/null 2>&1; }
-agent_running() { launchctl print "gui/$uid/$1" 2>/dev/null | grep -qE 'state = running|pid = [0-9]+'; }
+agent_running() { launchctl print "gui/$uid/$1" 2>/dev/null | grep -E 'state = running|pid = [0-9]+' >/dev/null; }
 infrastructure_manages_darkmesh() {
   [[ -r "$INFRA_STATUS" ]] && /usr/bin/python3 - "$INFRA_STATUS" <<'PY' >/dev/null 2>&1
 import json, sys

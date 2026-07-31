@@ -227,3 +227,34 @@ grep -q '^restricted_attempts=2$' "$NO_ROUTE/state" \
   || { echo "missing route cleared the restricted-attempt budget" >&2; exit 1; }
 
 echo "PASS: incomplete fingerprints preserve the recovery budget"
+
+echo "6. safety disconnects stand down for an hour unless explicitly rearmed"
+SAFETY="$TMP/safety"; mkdir -p "$SAFETY/.config/darkmesh" "$SAFETY/Library/Logs/darkmesh"
+printf 'on\n' > "$SAFETY/.config/darkmesh/vpn-desired"
+auto_at="$(date -u +%FT%TZ)"
+printf '{"auto_disconnect_at":"%s"}\n' "$auto_at" > "$SAFETY/status.json"
+HOME="$SAFETY" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" CTL="$BIN/expressvpnctl" TS="$BIN/Tailscale" \
+  DARKMESH_PLAIN_RESTORE="$BIN/plain-restore" DARKMESH_RECONNECT_PID_FILE="$SAFETY/reconnect.pid" \
+  DARKMESH_RECONNECT_STATE="$SAFETY/state" DARKMESH_VPN_DESIRED="$SAFETY/.config/darkmesh/vpn-desired" \
+  DARKMESH_VPN_REARM="$SAFETY/.config/darkmesh/vpn-rearm" \
+  DARKMESH_STATUS_FILE="$SAFETY/status.json" DARKMESH_RECONNECT_SIDECAR="$SAFETY/sidecar.json" \
+  DARKMESH_MAX_TICKS=1 INTERVAL_RECOVER=0 DARKMESH_CLEAR_TICKS_REQUIRED=1 \
+  TEST_CTL_LOG="$SAFETY/ctl.log" TEST_ACTION_LOG="$SAFETY/action.log" \
+  TEST_RESTORE_LOG="$SAFETY/restore.log" \
+  bash "$ROOT/scripts/darkmesh-reconnect" >/dev/null 2>&1
+! grep -q -- '--timeout 30 connect' "$SAFETY/ctl.log" \
+  || { echo "recent safety disconnect was reconnected too soon" >&2; exit 1; }
+: > "$SAFETY/.config/darkmesh/vpn-rearm"
+HOME="$SAFETY" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" CTL="$BIN/expressvpnctl" TS="$BIN/Tailscale" \
+  DARKMESH_PLAIN_RESTORE="$BIN/plain-restore" DARKMESH_RECONNECT_PID_FILE="$SAFETY/reconnect.pid" \
+  DARKMESH_RECONNECT_STATE="$SAFETY/state" DARKMESH_VPN_DESIRED="$SAFETY/.config/darkmesh/vpn-desired" \
+  DARKMESH_VPN_REARM="$SAFETY/.config/darkmesh/vpn-rearm" \
+  DARKMESH_STATUS_FILE="$SAFETY/status.json" DARKMESH_RECONNECT_SIDECAR="$SAFETY/sidecar.json" \
+  DARKMESH_MAX_TICKS=1 INTERVAL_RECOVER=0 DARKMESH_CLEAR_TICKS_REQUIRED=1 DARKMESH_CONNECT_OBSERVE=0 \
+  TEST_CTL_LOG="$SAFETY/ctl.log" TEST_ACTION_LOG="$SAFETY/action.log" \
+  TEST_RESTORE_LOG="$SAFETY/restore.log" \
+  bash "$ROOT/scripts/darkmesh-reconnect" >/dev/null 2>&1
+grep -q -- '--timeout 30 connect' "$SAFETY/ctl.log" \
+  || { echo "explicit rearm did not override the safety standdown" >&2; exit 1; }
+
+echo "PASS: safety standdown and explicit rearm tests"

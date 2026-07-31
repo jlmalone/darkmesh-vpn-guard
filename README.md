@@ -39,7 +39,8 @@ hotspot state, client reachability, and PF rules.
 `--watch` instance probes every 20s: VPN state, raw IP, a real fetch by name,
 system DNS, Tailscale, and (when installed/required) Chrome Remote Desktop.
 When the connected VPN path fails after its grace window, it disconnects the
-VPN. When DNS remains dead off-tunnel, a bounded recovery ladder can temporarily
+VPN and automatic reconnect stands down for one hour unless the operator runs
+`darkmesh up`. When DNS remains dead off-tunnel, a bounded recovery ladder can temporarily
 promote the active service's working DHCP DNS through a fixed root helper. The
 helper records and restores the exact prior DNS configuration on network change.
 Per-fault circuit breakers stop repeated remedies and surface one alert instead
@@ -175,7 +176,8 @@ Expected (relaxed mode — connectivity is paramount; see `docs/availability-rec
 - `transfer-vpn-doctor` says the client binding matches the current ExpressVPN
   tunnel.
 - `vpn-guard.sh` reports `SAFE` when ExpressVPN is connected and the current
-  network is not a hotspot.
+  network is not a hotspot. A manual transfer intent of `paused` remains paused
+  even in that safe network state.
 
 ## Reproduce On Another Mac
 

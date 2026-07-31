@@ -43,6 +43,7 @@ CTL="${CTL:-/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl}"
 STATUS_FILE="${DARKMESH_STATUS_FILE:-/tmp/darkmesh-status.json}"
 SIDECAR="${DARKMESH_RECONNECT_SIDECAR:-/tmp/darkmesh-reconnect.json}"
 DESIRED_FILE="${DARKMESH_VPN_DESIRED:-$HOME/.config/darkmesh/vpn-desired}"
+REARM_FILE="${DARKMESH_VPN_REARM:-$HOME/.config/darkmesh/vpn-rearm}"
 RECONNECT_REQUEST="${DARKMESH_RECONNECT_REQUEST:-$HOME/.config/darkmesh/reconnect-request.json}"
 RECOVERY_STATE="${DARKMESH_RECONNECT_STATE:-$HOME/.config/darkmesh/reconnect-state}"
 PID_FILE="${DARKMESH_RECONNECT_PID_FILE:-$HOME/.config/darkmesh/reconnect.pid}"
@@ -54,7 +55,7 @@ PLAIN_RESTORE="${DARKMESH_PLAIN_RESTORE:-$(command -v darkmesh-restore-plain-net
 INTERVAL_OK="${INTERVAL_OK:-30}"            # poll cadence when healthy / idle
 INTERVAL_RECOVER="${INTERVAL_RECOVER:-10}"  # poll cadence while recovering
 MAX_BACKOFF="${MAX_BACKOFF:-300}"           # cap reconnect backoff
-SAFETY_WINDOW="${SAFETY_WINDOW:-180}"       # respect a healthcheck auto-disconnect this long
+SAFETY_WINDOW="${SAFETY_WINDOW:-3600}"      # prefer stable plain networking after a safety disconnect
 WEDGE_FAILS="${WEDGE_FAILS:-3}"             # failed connects before declaring the app wedged
 MAX_APP_RESTARTS="${MAX_APP_RESTARTS:-3}"   # app restarts allowed per RESTART_WINDOW
 RESTART_WINDOW="${RESTART_WINDOW:-3600}"
@@ -241,10 +242,14 @@ resume_when_green() {
 }
 
 recently_auto_disconnected() {
-  local at epoch now
+  local at epoch now rearm_at=0
   at="$(grep -oE '"auto_disconnect_at"[[:space:]]*:[[:space:]]*"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z"' "$STATUS_FILE" 2>/dev/null | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z')"
   [ -n "$at" ] || return 1
   epoch="$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%SZ" "$at" +%s 2>/dev/null)" || return 1
+  [[ ! -f "$REARM_FILE" ]] || rearm_at="$(stat -f %m "$REARM_FILE" 2>/dev/null || echo 0)"
+  # The health status timestamp has one-second precision. Treat an operator
+  # rearm in that same second as newer so `darkmesh up` always wins promptly.
+  (( rearm_at < epoch )) || return 1
   now="$(date +%s)"
   [ $(( now - epoch )) -lt "$SAFETY_WINDOW" ]
 }
@@ -399,6 +404,7 @@ trap 'exit 0' INT TERM
 log "reconnect watchdog start (interval ok=${INTERVAL_OK}s recover=${INTERVAL_RECOVER}s, desired-file=$DESIRED_FILE)"
 backoff="$INTERVAL_RECOVER"
 loop_ticks=0
+safety_standdown_announced=no
 
 deadline_wait() { # <seconds> <idle|backoff|observe>
   local seconds="$1" kind="$2" deadline now
@@ -504,11 +510,15 @@ while true; do
   # --- not connected: reasons to STAND DOWN (never fight) ---
   if recently_auto_disconnected; then
     clear_ticks=0
-    log "healthcheck auto-disconnected recently — standing down (safety)"
+    if [[ "$safety_standdown_announced" != yes ]]; then
+      log "healthcheck auto-disconnected recently; standing down for up to ${SAFETY_WINDOW}s"
+      safety_standdown_announced=yes
+    fi
     plain_class=restricted
     enter_plain_state safety-standdown "$s"
     write_sidecar "safety-standdown" "$s"; loop_sleep "$INTERVAL_RECOVER" backoff || break; continue
   fi
+  safety_standdown_announced=no
   plain_class="$(classify_plain_network)"
   case "$plain_class" in
     offline)
