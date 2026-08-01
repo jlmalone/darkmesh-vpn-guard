@@ -53,7 +53,12 @@ fi
 
 TAILSCALE_REPAIR="${DARKMESH_TAILSCALE_REPAIR:-$BIN_DIR/darkmesh-repair-tailscale}"
 if [[ -x "$TAILSCALE_REPAIR" ]]; then
-  "$TAILSCALE_REPAIR" || true
+  repair_rc=0
+  "$TAILSCALE_REPAIR" || repair_rc=$?
+  if [[ "$repair_rc" -ne 0 ]]; then
+    echo "darkmesh: Tailscale repair failed (exit $repair_rc)" >&2
+    exit "$repair_rc"
+  fi
 fi
 
 echo "darkmesh recovery re-armed"

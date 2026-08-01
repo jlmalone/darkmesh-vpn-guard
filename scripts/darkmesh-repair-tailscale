@@ -17,27 +17,65 @@ ROUTE="${DARKMESH_ROUTE:-/sbin/route}"
 OPEN="${DARKMESH_OPEN:-/usr/bin/open}"
 EXPRESSVPN_CTL="${EXPRESSVPN_CTL:-/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl}"
 STATE_FILE="${DARKMESH_TAILSCALE_REPAIR_STATE:-$HOME/.config/darkmesh/tailscale-repair-at}"
-CHECK_IP="${DARKMESH_TAILSCALE_CHECK_IP:-100.100.100.100}"
+LOCK_DIR="${DARKMESH_TAILSCALE_REPAIR_LOCK:-$HOME/.config/darkmesh/tailscale-repair.lock}"
+CHECK_IP="${DARKMESH_TAILSCALE_CHECK_IP:-100.64.0.1}"
 FAIL_SAMPLES="${DARKMESH_TAILSCALE_FAIL_SAMPLES:-3}"
 SAMPLE_INTERVAL="${DARKMESH_TAILSCALE_SAMPLE_INTERVAL:-2}"
 STOP_TIMEOUT="${DARKMESH_TAILSCALE_STOP_TIMEOUT:-15}"
 START_TIMEOUT="${DARKMESH_TAILSCALE_START_TIMEOUT:-60}"
 COOLDOWN="${DARKMESH_TAILSCALE_REPAIR_COOLDOWN:-3600}"
+CLI_TIMEOUT="${DARKMESH_TAILSCALE_CLI_TIMEOUT:-5}"
 
 umask 077
 prefs_before="$(mktemp -t darkmesh-tailscale-prefs)" || exit 1
-trap 'rm -f "$prefs_before"' EXIT
+lock_held=no
+service_stopped=no
+repair_complete=no
+
+cleanup() {
+  if [[ "$service_stopped" == yes && "$repair_complete" != yes ]]; then
+    "$OPEN" -a Tailscale >/dev/null 2>&1 || true
+    "$SCUTIL" --nc start Tailscale >/dev/null 2>&1 || true
+  fi
+  rm -f "$prefs_before"
+  [[ "$lock_held" != yes ]] || rm -rf "$LOCK_DIR"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+run_with_deadline() {
+  local seconds="$1" output pid started status=0 timed_out=no
+  shift
+  output="$(mktemp -t darkmesh-tailscale-command)" || return 1
+  "$@" >"$output" 2>/dev/null & pid=$!
+  started="$(date +%s)"
+  while kill -0 "$pid" 2>/dev/null && (( $(date +%s) - started < seconds )); do /bin/sleep 0.1; done
+  if kill -0 "$pid" 2>/dev/null; then
+    timed_out=yes
+    kill -TERM "$pid" 2>/dev/null || true
+    /bin/sleep 0.2
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+  wait "$pid" || status=$?
+  cat "$output"
+  rm -f "$output"
+  [[ "$timed_out" != yes ]] || return 124
+  return "$status"
+}
 
 tailscale_online() {
-  "$TS" status --json 2>/dev/null | /usr/bin/python3 -c \
+  run_with_deadline "$CLI_TIMEOUT" "$TS" status --json | /usr/bin/python3 -c \
     'import json,sys; d=json.load(sys.stdin); raise SystemExit(0 if d.get("BackendState")=="Running" and d.get("Self",{}).get("Online") is True else 1)' \
     >/dev/null 2>&1
 }
 
 route_healthy() {
-  local iface
+  local iface self_ip self_iface
+  self_ip="$(tailnet_ip)"; [[ -n "$self_ip" ]] || return 1
   iface="$("$ROUTE" -n get "$CHECK_IP" 2>/dev/null | awk '/interface:/{print $2; exit}')"
-  [[ "$iface" == utun* ]]
+  self_iface="$("$ROUTE" -n get "$self_ip" 2>/dev/null | awk '/interface:/{print $2; exit}')"
+  [[ "$iface" == utun* && "$iface" == "$self_iface" ]]
 }
 
 plain_network_present() {
@@ -47,7 +85,7 @@ plain_network_present() {
 }
 
 tailnet_ip() {
-  "$TS" ip -4 2>/dev/null | awk '/^100\./{print; exit}'
+  run_with_deadline "$CLI_TIMEOUT" "$TS" ip -4 | awk '/^100\./{print; exit}'
 }
 
 vpn_disconnected() {
@@ -67,6 +105,22 @@ wait_for_state() {
     elapsed=$((elapsed + 1))
   done
   return 1
+}
+
+acquire_lock() {
+  local holder=""
+  mkdir -p "$(dirname "$LOCK_DIR")"
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" >"$LOCK_DIR/pid"
+    lock_held=yes
+    return 0
+  fi
+  [[ ! -f "$LOCK_DIR/pid" ]] || holder="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
+  if [[ "$holder" =~ ^[0-9]+$ ]] && kill -0 "$holder" 2>/dev/null; then return 1; fi
+  rm -rf "$LOCK_DIR"
+  mkdir "$LOCK_DIR" 2>/dev/null || return 1
+  printf '%s\n' "$$" >"$LOCK_DIR/pid"
+  lock_held=yes
 }
 
 if tailscale_online && route_healthy; then
@@ -95,6 +149,16 @@ if ! plain_network_present; then
   exit 3
 fi
 
+if ! acquire_lock; then
+  [[ "$MODE" == auto ]] && exit 0
+  echo "darkmesh: another Tailscale repair is already running" >&2
+  exit 75
+fi
+if tailscale_online && route_healthy; then
+  [[ "$MODE" == auto ]] || echo "darkmesh: Tailscale route recovered before repair"
+  exit 0
+fi
+
 now="$(date +%s)"
 if [[ "$MODE" == auto && -f "$STATE_FILE" ]]; then
   last="$(stat -f %m "$STATE_FILE" 2>/dev/null || echo 0)"
@@ -103,7 +167,7 @@ fi
 
 identity_before="$(tailnet_ip)"
 [[ -n "$identity_before" ]] || { echo "darkmesh: existing Tailscale identity unavailable; refusing reset" >&2; exit 4; }
-"$TS" debug prefs >"$prefs_before" 2>/dev/null \
+run_with_deadline "$CLI_TIMEOUT" "$TS" debug prefs >"$prefs_before" \
   || { echo "darkmesh: Tailscale preferences unavailable; refusing reset" >&2; exit 4; }
 if ! /usr/bin/python3 - "$prefs_before" <<'PY' >/dev/null 2>&1
 import json, sys
@@ -121,12 +185,15 @@ mkdir -p "$(dirname "$STATE_FILE")"
 echo "darkmesh: restarting stale Tailscale VPN service (identity and preferences preserved)"
 "$SCUTIL" --nc stop Tailscale >/dev/null 2>&1 \
   || { echo "darkmesh: failed to stop Tailscale VPN service" >&2; exit 1; }
-wait_for_state Disconnected "$STOP_TIMEOUT" \
-  || { echo "darkmesh: Tailscale VPN service did not stop" >&2; exit 1; }
+service_stopped=yes
+if ! wait_for_state Disconnected "$STOP_TIMEOUT"; then
+  echo "darkmesh: Tailscale service did not report disconnected; forcing saved service start" >&2
+fi
 
 "$OPEN" -a Tailscale >/dev/null 2>&1 || true
 "$SCUTIL" --nc start Tailscale >/dev/null 2>&1 \
   || { echo "darkmesh: failed to start Tailscale VPN service" >&2; exit 1; }
+service_stopped=no
 
 elapsed=0
 while (( elapsed < START_TIMEOUT )); do
@@ -135,6 +202,7 @@ while (( elapsed < START_TIMEOUT )); do
   elapsed=$((elapsed + 1))
 done
 if ! tailscale_online || ! route_healthy; then
+  service_stopped=yes
   echo "darkmesh: Tailscale service restarted but route convergence failed" >&2
   exit 1
 fi
@@ -142,9 +210,10 @@ fi
 identity_after="$(tailnet_ip)"
 [[ "$identity_after" == "$identity_before" ]] \
   || { echo "darkmesh: Tailscale identity changed unexpectedly" >&2; exit 1; }
-prefs_after="$("$TS" debug prefs 2>/dev/null)" \
+prefs_after="$(run_with_deadline "$CLI_TIMEOUT" "$TS" debug prefs)" \
   || { echo "darkmesh: could not verify restored Tailscale preferences" >&2; exit 1; }
 cmp -s "$prefs_before" <(printf '%s\n' "$prefs_after") \
   || { echo "darkmesh: Tailscale preferences changed unexpectedly" >&2; exit 1; }
 
+repair_complete=yes
 echo "darkmesh: Tailscale route restored on $("$ROUTE" -n get "$CHECK_IP" 2>/dev/null | awk '/interface:/{print $2; exit}')"

@@ -185,12 +185,15 @@ probe_e2e() {
 
 probe_tailscale() {
   if [[ ! -x "$TAILSCALE_CLI" ]]; then [[ "$PROTECT_TS" != yes ]]; return; fi
-  local js iface
+  local js self_ip iface self_iface
   js="$(run_with_deadline "$PROBE_DEADLINE" "$TAILSCALE_CLI" status --json)" || return 1
   grep '"BackendState": *"Running"' >/dev/null <<<"$js" || return 1
   awk '/"Self": \{/{f=1} f&&/"Online"/{print; exit}' <<<"$js" | grep true >/dev/null || return 1
-  iface="$(route -n get 100.100.100.100 2>/dev/null | awk '/interface:/{print $2; exit}')"
-  [[ "$iface" == utun* ]]
+  self_ip="$(/usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((ip for ip in d.get("Self",{}).get("TailscaleIPs",[]) if ip.startswith("100.")), ""))' <<<"$js" 2>/dev/null)"
+  [[ -n "$self_ip" ]] || return 1
+  iface="$(route -n get 100.64.0.1 2>/dev/null | awk '/interface:/{print $2; exit}')"
+  self_iface="$(route -n get "$self_ip" 2>/dev/null | awk '/interface:/{print $2; exit}')"
+  [[ "$iface" == utun* && "$iface" == "$self_iface" ]]
 }
 
 crd_required() {
