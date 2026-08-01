@@ -16,7 +16,7 @@ class Darkmesh < Formula
 
     user_tools = %w[
       darkmesh darkmesh-setup darkmesh-audit darkmesh-healthcheck darkmesh-breaker
-      darkmesh-root-helper darkmesh-reconnect darkmesh-repair darkmesh-restore-plain-network
+      darkmesh-root-helper darkmesh-reconnect darkmesh-repair darkmesh-repair-tailscale darkmesh-restore-plain-network
       darkmesh-up darkmesh-panic darkmesh-captive darkmesh-diag darkmesh-experiment
       darkmesh-coexistence-trial darkmesh-transfer
       darkmesh-transfer-daemon

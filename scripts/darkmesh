@@ -31,6 +31,7 @@ Usage: darkmesh <command> [args]
   captive             get online behind a captive portal (drops guards safely)
   panic               restore plain connectivity without touching Tailscale routes
   repair              re-arm watchdogs and close recovery breakers
+  repair-tailscale    rebuild a stale macOS Tailscale VPN service safely
   undo                emergency restore internet (legacy `darkmesh --undo`)
   doctor              transfer-client VPN-binding diagnostics
   apply | verify      darkmesh-expressvpn-tailscale apply / verify

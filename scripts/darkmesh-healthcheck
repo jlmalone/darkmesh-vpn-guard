@@ -185,10 +185,12 @@ probe_e2e() {
 
 probe_tailscale() {
   if [[ ! -x "$TAILSCALE_CLI" ]]; then [[ "$PROTECT_TS" != yes ]]; return; fi
-  local js
+  local js iface
   js="$(run_with_deadline "$PROBE_DEADLINE" "$TAILSCALE_CLI" status --json)" || return 1
   grep '"BackendState": *"Running"' >/dev/null <<<"$js" || return 1
-  awk '/"Self": \{/{f=1} f&&/"Online"/{print; exit}' <<<"$js" | grep true >/dev/null
+  awk '/"Self": \{/{f=1} f&&/"Online"/{print; exit}' <<<"$js" | grep true >/dev/null || return 1
+  iface="$(route -n get 100.100.100.100 2>/dev/null | awk '/interface:/{print $2; exit}')"
+  [[ "$iface" == utun* ]]
 }
 
 crd_required() {

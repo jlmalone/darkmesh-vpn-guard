@@ -57,6 +57,10 @@ if [[ "$1" == --dns ]]; then
 fi
 exit 0'
 write_stub route '
+if [[ "$*" == *"100.100.100.100"* ]]; then
+  echo " interface: ${TEST_TS_INTERFACE:-utun9}"
+  exit 0
+fi
 echo "   gateway: ${TEST_GATEWAY:-192.168.1.1}"
 echo " interface: ${TEST_INTERFACE:-en0}"
 exit 0'
@@ -246,5 +250,11 @@ elapsed=$(( $(date +%s) - started ))
 assert_contains "$HANGHOME/status.json" '"tailscale_ok": false'
 assert_contains "$HANGHOME/status.json" '"schema": 4'
 assert_contains "$HANGHOME/status.json" '"max_age_seconds": 60'
+
+echo "9. an online Tailscale node without its utun route is unhealthy"
+ROUTEHOME="$TMP/tailscale-route"
+TEST_VPN_STATE=Disconnected TEST_SYSTEM_DNS_OK=1 TEST_APPLE_OK=1 TEST_GOOGLE_CODE=204 \
+  TEST_TS_ONLINE=true TEST_TS_INTERFACE=en0 DARKMESH_GRACE=0 run_healthcheck "$ROUTEHOME" 1 no
+assert_contains "$ROUTEHOME/status.json" '"tailscale_ok": false'
 
 echo "PASS: darkmesh healthcheck deterministic tests"

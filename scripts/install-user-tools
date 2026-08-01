@@ -10,7 +10,7 @@ SHARE_DIR="${DARKMESH_SHARE_DIR:-$HOME/.local/share/darkmesh}"
 mkdir -p "$BIN_DIR" "$SHARE_DIR"
 tools=(
   darkmesh darkmesh-setup darkmesh-audit darkmesh-healthcheck darkmesh-breaker
-  darkmesh-root-helper darkmesh-reconnect darkmesh-repair darkmesh-restore-plain-network darkmesh-up darkmesh-panic
+  darkmesh-root-helper darkmesh-reconnect darkmesh-repair darkmesh-repair-tailscale darkmesh-restore-plain-network darkmesh-up darkmesh-panic
   darkmesh-captive darkmesh-diag darkmesh-experiment darkmesh-coexistence-trial darkmesh-transfer darkmesh-fleet
   darkmesh-transfer-daemon
   darkmesh-expressvpn-tailscale darkmesh-migrate-agent install-root-helper.sh

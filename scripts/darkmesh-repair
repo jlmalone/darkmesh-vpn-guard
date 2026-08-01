@@ -51,4 +51,9 @@ if [[ -n "$VPN_GUARD" && -x "$VPN_GUARD" ]]; then
   "$VPN_GUARD" >/dev/null
 fi
 
+TAILSCALE_REPAIR="${DARKMESH_TAILSCALE_REPAIR:-$BIN_DIR/darkmesh-repair-tailscale}"
+if [[ -x "$TAILSCALE_REPAIR" ]]; then
+  "$TAILSCALE_REPAIR" || true
+fi
+
 echo "darkmesh recovery re-armed"

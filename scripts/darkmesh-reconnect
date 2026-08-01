@@ -51,6 +51,7 @@ LOG_DIR="$HOME/Library/Logs/darkmesh"; LOG="$LOG_DIR/reconnect.log"
 ACTION_LOG="$LOG_DIR/actions.log"
 DOCTOR="${DARKMESH_DOCTOR:-$(command -v transfer-vpn-doctor 2>/dev/null || echo "$HOME/.local/bin/transfer-vpn-doctor")}"
 PLAIN_RESTORE="${DARKMESH_PLAIN_RESTORE:-$(command -v darkmesh-restore-plain-network 2>/dev/null || echo "$HOME/.local/bin/darkmesh-restore-plain-network")}"
+TAILSCALE_REPAIR="${DARKMESH_TAILSCALE_REPAIR:-$(command -v darkmesh-repair-tailscale 2>/dev/null || echo "$(cd "$(dirname "$0")" && pwd)/darkmesh-repair-tailscale")}"
 
 INTERVAL_OK="${INTERVAL_OK:-30}"            # poll cadence when healthy / idle
 INTERVAL_RECOVER="${INTERVAL_RECOVER:-10}"  # poll cadence while recovering
@@ -266,8 +267,8 @@ rebind_client() {
   fi
 }
 
-# Restart a wedged ExpressVPN app. Tailscale is status-only here; it is never a
-# prerequisite for VPN recovery. Restarts remain capped per window.
+# Restart a wedged ExpressVPN app. Tailscale service repair is separate and
+# runs only while ExpressVPN is disconnected. ExpressVPN restarts remain capped.
 app_restarts=0; restart_window_start=0
 try_restart_app() {
   local now; now="$(date +%s)"
@@ -467,6 +468,10 @@ enter_plain_state() { # <phase> <vpn-state>
 while true; do
   s="$(vpn_state)"; d="$(desired)"; d="${d:-on}"
   now="$(date +%s)"
+
+  if [[ "$s" == Disconnected && -x "$TAILSCALE_REPAIR" ]]; then
+    "$TAILSCALE_REPAIR" --auto >>"$LOG" 2>&1 || true
+  fi
 
   key="$(network_fingerprint)"
   if [[ -z "$last_network_key" ]]; then

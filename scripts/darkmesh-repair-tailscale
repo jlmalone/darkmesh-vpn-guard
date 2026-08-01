@@ -1,0 +1,150 @@
+#!/bin/bash
+# Repair a macOS Tailscale network extension that reports healthy while its
+# 100.64/10 route is missing. Restart the saved VPN service without `tailscale
+# down`, preserving the existing identity and every stored preference.
+set -uo pipefail
+
+MODE=operator
+case "${1:-}" in
+  "") ;;
+  --auto) MODE=auto ;;
+  *) echo "Usage: darkmesh-repair-tailscale [--auto]" >&2; exit 2 ;;
+esac
+
+TS="${TAILSCALE_CLI:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
+SCUTIL="${DARKMESH_SCUTIL:-/usr/sbin/scutil}"
+ROUTE="${DARKMESH_ROUTE:-/sbin/route}"
+OPEN="${DARKMESH_OPEN:-/usr/bin/open}"
+EXPRESSVPN_CTL="${EXPRESSVPN_CTL:-/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl}"
+STATE_FILE="${DARKMESH_TAILSCALE_REPAIR_STATE:-$HOME/.config/darkmesh/tailscale-repair-at}"
+CHECK_IP="${DARKMESH_TAILSCALE_CHECK_IP:-100.100.100.100}"
+FAIL_SAMPLES="${DARKMESH_TAILSCALE_FAIL_SAMPLES:-3}"
+SAMPLE_INTERVAL="${DARKMESH_TAILSCALE_SAMPLE_INTERVAL:-2}"
+STOP_TIMEOUT="${DARKMESH_TAILSCALE_STOP_TIMEOUT:-15}"
+START_TIMEOUT="${DARKMESH_TAILSCALE_START_TIMEOUT:-60}"
+COOLDOWN="${DARKMESH_TAILSCALE_REPAIR_COOLDOWN:-3600}"
+
+umask 077
+prefs_before="$(mktemp -t darkmesh-tailscale-prefs)" || exit 1
+trap 'rm -f "$prefs_before"' EXIT
+
+tailscale_online() {
+  "$TS" status --json 2>/dev/null | /usr/bin/python3 -c \
+    'import json,sys; d=json.load(sys.stdin); raise SystemExit(0 if d.get("BackendState")=="Running" and d.get("Self",{}).get("Online") is True else 1)' \
+    >/dev/null 2>&1
+}
+
+route_healthy() {
+  local iface
+  iface="$("$ROUTE" -n get "$CHECK_IP" 2>/dev/null | awk '/interface:/{print $2; exit}')"
+  [[ "$iface" == utun* ]]
+}
+
+plain_network_present() {
+  local iface
+  iface="$("$ROUTE" -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
+  [[ -n "$iface" && "$iface" != utun* ]]
+}
+
+tailnet_ip() {
+  "$TS" ip -4 2>/dev/null | awk '/^100\./{print; exit}'
+}
+
+vpn_disconnected() {
+  [[ ! -x "$EXPRESSVPN_CTL" ]] || \
+    [[ "$("$EXPRESSVPN_CTL" --timeout 4 get connectionstate 2>/dev/null | head -1)" == Disconnected ]]
+}
+
+service_state() {
+  "$SCUTIL" --nc status Tailscale 2>/dev/null | head -1
+}
+
+wait_for_state() {
+  local wanted="$1" timeout="$2" elapsed=0
+  while (( elapsed < timeout )); do
+    [[ "$(service_state)" == "$wanted" ]] && return 0
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  return 1
+}
+
+if tailscale_online && route_healthy; then
+  [[ "$MODE" == auto ]] || echo "darkmesh: Tailscale route healthy; no repair needed"
+  exit 0
+fi
+
+sample=1
+while (( sample < FAIL_SAMPLES )); do
+  sleep "$SAMPLE_INTERVAL"
+  if tailscale_online && route_healthy; then
+    [[ "$MODE" == auto ]] || echo "darkmesh: Tailscale route recovered during convergence check"
+    exit 0
+  fi
+  sample=$((sample + 1))
+done
+
+if ! vpn_disconnected; then
+  [[ "$MODE" == auto ]] && exit 0
+  echo "darkmesh: refusing Tailscale service restart while ExpressVPN is connected" >&2
+  exit 3
+fi
+if ! plain_network_present; then
+  [[ "$MODE" == auto ]] && exit 0
+  echo "darkmesh: ordinary network unavailable; refusing Tailscale restart" >&2
+  exit 3
+fi
+
+now="$(date +%s)"
+if [[ "$MODE" == auto && -f "$STATE_FILE" ]]; then
+  last="$(stat -f %m "$STATE_FILE" 2>/dev/null || echo 0)"
+  if [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < COOLDOWN )); then exit 0; fi
+fi
+
+identity_before="$(tailnet_ip)"
+[[ -n "$identity_before" ]] || { echo "darkmesh: existing Tailscale identity unavailable; refusing reset" >&2; exit 4; }
+"$TS" debug prefs >"$prefs_before" 2>/dev/null \
+  || { echo "darkmesh: Tailscale preferences unavailable; refusing reset" >&2; exit 4; }
+if ! /usr/bin/python3 - "$prefs_before" <<'PY' >/dev/null 2>&1
+import json, sys
+raise SystemExit(0 if json.load(open(sys.argv[1])).get("WantRunning") is True else 1)
+PY
+then
+  [[ "$MODE" == auto ]] && exit 0
+  echo "darkmesh: Tailscale is intentionally down; refusing service restart" >&2
+  exit 3
+fi
+
+mkdir -p "$(dirname "$STATE_FILE")"
+: >"$STATE_FILE"
+
+echo "darkmesh: restarting stale Tailscale VPN service (identity and preferences preserved)"
+"$SCUTIL" --nc stop Tailscale >/dev/null 2>&1 \
+  || { echo "darkmesh: failed to stop Tailscale VPN service" >&2; exit 1; }
+wait_for_state Disconnected "$STOP_TIMEOUT" \
+  || { echo "darkmesh: Tailscale VPN service did not stop" >&2; exit 1; }
+
+"$OPEN" -a Tailscale >/dev/null 2>&1 || true
+"$SCUTIL" --nc start Tailscale >/dev/null 2>&1 \
+  || { echo "darkmesh: failed to start Tailscale VPN service" >&2; exit 1; }
+
+elapsed=0
+while (( elapsed < START_TIMEOUT )); do
+  if tailscale_online && route_healthy; then break; fi
+  sleep 1
+  elapsed=$((elapsed + 1))
+done
+if ! tailscale_online || ! route_healthy; then
+  echo "darkmesh: Tailscale service restarted but route convergence failed" >&2
+  exit 1
+fi
+
+identity_after="$(tailnet_ip)"
+[[ "$identity_after" == "$identity_before" ]] \
+  || { echo "darkmesh: Tailscale identity changed unexpectedly" >&2; exit 1; }
+prefs_after="$("$TS" debug prefs 2>/dev/null)" \
+  || { echo "darkmesh: could not verify restored Tailscale preferences" >&2; exit 1; }
+cmp -s "$prefs_before" <(printf '%s\n' "$prefs_after") \
+  || { echo "darkmesh: Tailscale preferences changed unexpectedly" >&2; exit 1; }
+
+echo "darkmesh: Tailscale route restored on $("$ROUTE" -n get "$CHECK_IP" 2>/dev/null | awk '/interface:/{print $2; exit}')"

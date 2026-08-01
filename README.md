@@ -78,6 +78,14 @@ Tailscale DNS acceptance is disabled, and DHCP DNS is preferred. Tailscale stays
 running but is never required for laptop internet or VPN recovery. See
 [`docs/network-resilience-state-machine.md`](docs/network-resilience-state-machine.md).
 
+On macOS, Tailscale can remain nominally online while the system silently loses
+its `100.64/10` tunnel route after a physical-network change. While ExpressVPN
+is disconnected, Darkmesh detects that exact condition and performs a bounded
+restart of the saved Tailscale VPN service after three failed samples. The
+repair preserves the existing identity and preferences and has a one-hour
+automatic retry cooldown. An operator can run `darkmesh repair-tailscale` for
+the same checked repair on demand.
+
 `server_monitor` should be a UI/status consumer only. It should not own network
 policy. Reading `/tmp/darkmesh-status.json` is sufficient to render a
 GO / DEGRADED / NO-GO indicator.

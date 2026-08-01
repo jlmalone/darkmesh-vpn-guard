@@ -33,6 +33,12 @@ The new darkmesh job is:
 - Bypass only Tailscale's app and network extension.
 - Keep MagicDNS working.
 - Never add the transfer client to ExpressVPN bypass rules.
+- While ExpressVPN is disconnected, detect a nominally online Tailscale service
+  whose `100.64/10` route has fallen back to the physical interface. After
+  three failures, restart only the saved macOS Tailscale VPN service, preserving
+  identity and preferences and enforcing a one-hour automatic cooldown.
+
+Operator repair for that condition is `darkmesh repair-tailscale`.
 
 ### vpn-guard
 

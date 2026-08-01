@@ -29,6 +29,12 @@ autoconnect guidance are superseded here.
 | `plain-cooldown` | Per-network restricted-attempt budget is exhausted. | Cooldown expires or the physical network changes. |
 | `connected` | Re-pin the transfer client to the live tunnel and resume only after containment is safe. | VPN or physical network changes. |
 
+While ExpressVPN is disconnected, each reconcile pass also checks that the
+Tailscale control state is online and the well-known `100.100.100.100` route is
+owned by a `utun` interface. Three consecutive failures trigger one saved VPN
+service stop/start without `tailscale down`, preserving identity and preferences.
+Automatic attempts are limited to one per hour.
+
 ## Classification
 
 A network is captive only when the Apple HTTP probe supplies positive evidence:

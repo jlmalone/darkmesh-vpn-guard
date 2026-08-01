@@ -18,6 +18,7 @@ printf "%s\n" "$*" >> "${TEST_CTL_LOG:?}"
 if [[ "$*" == *"get connectionstate"* ]]; then echo Disconnected; fi
 exit 0'
 stub Tailscale 'exit 0'
+stub darkmesh-repair-tailscale 'exit 0'
 stub curl '
 out=""; headers=""; prev=""
 for arg in "$@"; do
