@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""Versioned Darkmesh posture control. Read paths never mutate networking."""
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path(os.environ.get("HOME", str(Path.home())))
+CONFIG = Path(os.environ.get("DARKMESH_POSTURE_FILE", HOME / ".config/darkmesh/posture.json"))
+STATUS = Path(os.environ.get("DARKMESH_STATUS_FILE", "/tmp/darkmesh-status.json"))
+PEERS = Path(os.environ.get("DARKMESH_POSTURE_PEERS", HOME / ".config/darkmesh/posture-peers.conf"))
+LOCK = Path(os.environ.get("DARKMESH_POSTURE_LOCK", HOME / ".config/darkmesh/posture.apply.lock"))
+ROOT = Path(__file__).resolve().parent
+HEALTH = os.environ.get("DARKMESH_HEALTHCHECK", str(ROOT / "darkmesh-healthcheck"))
+UP = os.environ.get("DARKMESH_UP", str(ROOT / "darkmesh-up"))
+PANIC = os.environ.get("DARKMESH_PANIC", str(ROOT / "darkmesh-panic"))
+REPAIR = os.environ.get("DARKMESH_REPAIR_TAILSCALE", str(ROOT / "darkmesh-repair-tailscale"))
+TS = os.environ.get("DARKMESH_TAILSCALE", "/Applications/Tailscale.app/Contents/MacOS/Tailscale")
+ROUTE = os.environ.get("DARKMESH_ROUTE", "/sbin/route")
+IFCONFIG = os.environ.get("DARKMESH_IFCONFIG", "/sbin/ifconfig")
+NICE = os.environ.get("DARKMESH_NICE", "/usr/bin/nice")
+SSH = os.environ.get("DARKMESH_SSH", "/usr/bin/ssh")
+NC = os.environ.get("DARKMESH_NC", "/usr/bin/nc")
+REMOTE_DARKMESH = os.environ.get("DARKMESH_REMOTE_PATH", "/usr/local/bin/darkmesh")
+AUDIT = os.environ.get("DARKMESH_AUDIT", str(ROOT / "darkmesh-audit"))
+DOCTOR = os.environ.get("DARKMESH_TRANSFER_DOCTOR", str(ROOT / "transfer-vpn-doctor"))
+PROBE_TIMEOUT = max(1, int(os.environ.get("DARKMESH_POSTURE_PROBE_TIMEOUT", "3")))
+APPLY_DEADLINE = max(1, int(os.environ.get("DARKMESH_POSTURE_APPLY_DEADLINE", "60")))
+REMOTE_REPORT_TIMEOUT = max(12, int(os.environ.get("DARKMESH_POSTURE_REMOTE_REPORT_TIMEOUT", "30")))
+MAX_PEERS = max(1, min(32, int(os.environ.get("DARKMESH_POSTURE_MAX_PEERS", "8"))))
+MAX_OUTPUT = 32768
+
+PROFILES = [
+ {"id":"internet-plain-transfer-contained","title":"Plain internet with transfer containment","required":{"internet":True,"transferSafety":True},"preferred":{},"forbidden":{"vpn":True,"tailscale":True},"priority":["internet","transferSafety","vpn","tailscale"],"transition":{"vpn":"panic","tailscale":"down","attemptSecondary":False,"rollback":"panic"},"degraded":"VPN and Tailscale are explicitly disabled; transfer containment remains required."},
+ {"id":"tailscale-required-vpn-forbidden","title":"Tailscale required, VPN forbidden","required":{"internet":True,"tailscale":True,"transferSafety":True},"preferred":{},"forbidden":{"vpn":True},"priority":["internet","tailscale","transferSafety","vpn"],"transition":{"vpn":"panic","tailscale":"verify-or-guarded-repair","attemptSecondary":False,"rollback":"panic"},"degraded":"Required Tailscale failure or VPN presence is red."},
+ {"id":"tailscale-required-vpn-optional","title":"Tailscale required, VPN optional","required":{"internet":True,"tailscale":True,"transferSafety":True},"preferred":{"vpn":True},"forbidden":{},"priority":["internet","tailscale","transferSafety","vpn"],"transition":{"vpn":"panic-before-repair","tailscale":"verify-or-guarded-repair","attemptSecondary":False,"rollback":"panic"},"degraded":"VPN is a nice-to-have: absence is yellow and apply never starts it."},
+ {"id":"tailscale-required-vpn-preferred","title":"Tailscale required, VPN secondary-high","required":{"internet":True,"tailscale":True,"transferSafety":True},"preferred":{"vpn":True},"forbidden":{},"priority":["internet","tailscale","transferSafety","vpn"],"transition":{"vpn":"attempt-with-rollback","tailscale":"verify-or-guarded-repair","attemptSecondary":True,"rollback":"panic-if-tailscale-or-ssh-regresses"},"degraded":"VPN absence is yellow; one bounded attempt rolls back on Tailscale or SSH regression."},
+ {"id":"vpn-required-tailscale-forbidden","title":"VPN required, Tailscale forbidden","required":{"internet":True,"vpn":True,"transferSafety":True},"preferred":{},"forbidden":{"tailscale":True},"priority":["internet","vpn","transferSafety","tailscale"],"transition":{"vpn":"rearm","tailscale":"down","attemptSecondary":False,"rollback":"rearm-vpn"},"degraded":"Required VPN failure or Tailscale presence is red."},
+ {"id":"vpn-required-tailscale-optional","title":"VPN required, Tailscale optional","required":{"internet":True,"vpn":True,"transferSafety":True},"preferred":{"tailscale":True},"forbidden":{},"priority":["internet","vpn","transferSafety","tailscale"],"transition":{"vpn":"rearm","tailscale":"unchanged","attemptSecondary":False,"rollback":"rearm-vpn"},"degraded":"Tailscale is a nice-to-have: absence is yellow and apply never starts it."},
+ {"id":"vpn-required-tailscale-preferred","title":"VPN required, Tailscale secondary-high","required":{"internet":True,"vpn":True,"transferSafety":True},"preferred":{"tailscale":True},"forbidden":{},"priority":["internet","vpn","transferSafety","tailscale"],"transition":{"vpn":"rearm","tailscale":"guarded-repair-when-supported","attemptSecondary":True,"rollback":"rearm-vpn"},"degraded":"Tailscale absence is yellow; only a bounded safe repair may be attempted."},
+ {"id":"dual-required-zero-general-egress-leak","title":"Strict dual-required, zero general-egress leak","required":{"internet":True,"vpn":True,"tailscale":True,"ssh":True,"transferSafety":True,"zeroGeneralEgressLeak":True},"preferred":{},"forbidden":{},"capabilities":{"zeroGeneralEgressLeak":False},"priority":["internet","vpn","tailscale","ssh","transferSafety","zeroGeneralEgressLeak"],"transition":{"capability":"machine-wide-kill-switch","apply":"refuse"},"degraded":"Unavailable: this installation deliberately has no machine-wide kill switch."}
+]
+for profile in PROFILES:
+    # A transition can contain several 60-second primitives, convergence, and
+    # rollback. Consumers must not terminate it mid-rollback.
+    profile["timeout_seconds"] = 360
+
+def emit(value, code=0): print(json.dumps(value, separators=(",", ":"), sort_keys=True)); raise SystemExit(code)
+def now(): return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+def get_profile(value): return next((p for p in PROFILES if p["id"] == value), None)
+def run(argv, timeout=PROBE_TIMEOUT):
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+        return {"ok":p.returncode == 0,"code":p.returncode,"stdout":p.stdout[:MAX_OUTPUT],"stderr":p.stderr[:512]}
+    except FileNotFoundError: return {"ok":False,"code":None,"stdout":"","stderr":"unavailable"}
+    except subprocess.TimeoutExpired: return {"ok":False,"code":124,"stdout":"","stderr":"timeout"}
+def observed():
+    value={"available":False,"fresh":False,"reason":"status-unavailable","internet":None,"vpn":None,"tailscale":None,"transferSafety":None}
+    try:
+        data=json.loads(STATUS.read_text()); authored=dt.datetime.fromisoformat(data["timestamp"].replace("Z","+00:00")).timestamp()
+        limit=data.get("max_age_seconds",60); age=max(0,time.time()-authored,time.time()-STATUS.stat().st_mtime)
+        value.update({"available":True,"fresh":age <= limit,"reason":"ok" if age <= limit else "status-stale","ageSeconds":round(age,3),"maxAgeSeconds":limit,"statusSchema":data.get("schema"),"internet":data.get("internet_ok",data.get("inet_e2e_ok")),"vpn":data.get("vpn_state")=="Connected","vpnState":data.get("vpn_state"),"tailscale":data.get("tailscale_ok"),"transferSafety":(data.get("pf") or {}).get("pf_anchor_evaluated"),"verdict":data.get("verdict")})
+    except Exception as exc: value.update({"reason":"status-invalid","detail":str(exc).replace("\n"," ")[:160]})
+    return value
+def tailscale_status():
+    result=run([TS,"status","--json"])
+    if not result["ok"]: return {"available":False,"reason":result["stderr"] or "tailscale-status-failed","self":{},"peers":{}}
+    try:
+        data=json.loads(result["stdout"]); self_data=data.get("Self") or {}
+        return {"available":True,"backend":data.get("BackendState"),"selfOnline":self_data.get("Online"),"healthWarnings":data.get("Health") or [],"self":self_data,"peers":data.get("Peer") or {}}
+    except Exception: return {"available":False,"reason":"tailscale-status-invalid","self":{},"peers":{}}
+def route(target):
+    result=run([ROUTE,"-n","get",target]); interface=None; gateway=None
+    for line in result["stdout"].splitlines():
+        if "interface:" in line: interface=line.split("interface:",1)[1].strip().split()[0]
+        if "gateway:" in line: gateway=line.split("gateway:",1)[1].strip().split()[0]
+    return {"target":target,"interface":interface,"gateway":gateway,"available":result["ok"] and interface is not None,"reason":"ok" if interface else result["stderr"] or "route-unavailable"}
+def interfaces():
+    result=run([IFCONFIG,"-a"]); rows=[]; current=None
+    for line in result["stdout"].splitlines():
+        if line and not line[0].isspace():
+            name=line.split(":",1)[0]; current={"name":name,"state":"unknown","addresses":[]}; rows.append(current)
+        elif current and "status:" in line: current["state"]=line.split("status:",1)[1].strip()
+        elif current and line.strip().startswith(("inet ","inet6 ")): current["addresses"].append(line.strip().split()[1].split("%",1)[0])
+    return rows if result["ok"] else []
+def peer_record(peers, target):
+    normalized=target.rstrip(".").lower()
+    for key, record in peers.items():
+        candidates=[key,record.get("HostName"),record.get("DNSName")] + list(record.get("TailscaleIPs") or [])
+        if any(isinstance(item,str) and item.rstrip(".").lower()==normalized for item in candidates): return record
+    return {}
+def peers_config():
+    if not PEERS.is_file(): return []
+    rows=[]
+    for number, raw in enumerate(PEERS.read_text().splitlines(),1):
+        raw=raw.strip()
+        if not raw or raw.startswith("#"): continue
+        parts=raw.split()
+        remote_path=parts[3] if len(parts)==4 else REMOTE_DARKMESH
+        safe_tokens=all(re.fullmatch(r"[A-Za-z0-9_.:@-]+", part) for part in parts[:3])
+        safe_path=bool(re.fullmatch(r"/[A-Za-z0-9_./-]+", remote_path))
+        if len(parts) not in (2,3,4) or not safe_tokens or not safe_path or parts[1] == "-":
+            rows.append({"id":f"line-{number}","target":"","sshTarget":None,"valid":False,"reason":"invalid-peer-config"}); continue
+        rows.append({"id":parts[0],"target":parts[1],"sshTarget":parts[2] if len(parts)>=3 and parts[2] != "-" else None,"remoteDarkmeshPath":remote_path,"valid":True})
+        if len(rows) >= MAX_PEERS: break
+    return rows
+def topology():
+    ts=tailscale_status(); self_ips=(ts["self"].get("TailscaleIPs") or []); default=route("default")
+    local={"interfaces":interfaces(),"routes":{"physicalDefault":default,"internetEgress":route("1.1.1.1"),"tailscaleSentinel":route("100.64.0.1"),"tailscaleSelf":route(self_ips[0]) if self_ips else {"available":False,"reason":"self-address-unavailable"}},"tailscale":{"available":ts["available"],"backend":ts.get("backend"),"selfOnline":ts.get("selfOnline"),"controlHealthy":ts.get("backend")=="Running" and ts.get("selfOnline") is True,"healthWarnings":ts.get("healthWarnings",[]),"selfAddresses":self_ips}}
+    peer_rows=[]
+    for item in peers_config():
+        record=peer_record(ts["peers"], item["target"]) if item.get("valid") else {}
+        addresses=record.get("TailscaleIPs") or []
+        peer_rows.append({**item,"online":record.get("Online"),"active":record.get("Active"),"relay":record.get("Relay"),"directEndpoint":record.get("CurAddr"),"addresses":addresses,"lastSeen":record.get("LastSeen"),"route":route(addresses[0]) if addresses else {"available":False,"reason":"peer-address-unavailable"}})
+    emit({"schema":2,"kind":"darkmesh-posture-topology","generatedAt":now(),"local":local,"peersConfigured":len(peer_rows),"peers":peer_rows})
+def remote_report(target, remote_darkmesh=REMOTE_DARKMESH):
+    if not target: return {"available":False,"reason":"not-configured"}
+    if not re.fullmatch(r"/[A-Za-z0-9_./-]+", remote_darkmesh): return {"available":False,"reason":"invalid-remote-darkmesh-path"}
+    remote=f"/usr/bin/nice -n 19 {remote_darkmesh} posture report --json"
+    result=run([NICE,"-n","19",SSH,"-o","BatchMode=yes","-o",f"ConnectTimeout={PROBE_TIMEOUT}","-o","PasswordAuthentication=no",target,remote],REMOTE_REPORT_TIMEOUT)
+    if not result["ok"]: return {"available":False,"reason":result["stderr"] or "remote-unavailable"}
+    try: return {"available":True,"report":json.loads(result["stdout"])}
+    except Exception: return {"available":False,"reason":"remote-report-invalid"}
+def probe():
+    ts=tailscale_status(); output=[]
+    for item in peers_config():
+        record=peer_record(ts["peers"],item["target"]) if item.get("valid") else {}
+        if not item.get("valid"): output.append({**item,"tailscalePing":{"ok":False,"reason":"invalid-peer-config"},"tcp22":{"ok":False,"reason":"invalid-peer-config"},"ssh":{"available":False,"reason":"invalid-peer-config"}}); continue
+        ping=run([TS,"ping","--c","1","--until-direct=false","--timeout",f"{PROBE_TIMEOUT}s",item["target"]])
+        tcp=run([NC,"-z","-G",str(PROBE_TIMEOUT),"-w",str(PROBE_TIMEOUT),item["target"],"22"])
+        ping_output=ping["stdout"][:512]
+        latency_match=re.search(r"\bin\s+([0-9]+(?:\.[0-9]+)?)(ms|s)\b",ping_output)
+        path_match=re.search(r"\bvia\s+(.+?)\s+in\s+[0-9]",ping_output)
+        latency_ms=None
+        if latency_match:
+            latency_ms=float(latency_match.group(1))*(1000 if latency_match.group(2)=="s" else 1)
+        output.append({"id":item["id"],"target":item["target"],"online":record.get("Online"),"active":record.get("Active"),"relay":record.get("Relay"),"addresses":record.get("TailscaleIPs") or [],"tailscalePing":{"ok":ping["ok"],"reason":"ok" if ping["ok"] else ping["stderr"] or "failed","output":ping_output,"path":path_match.group(1) if path_match else None,"latencyMs":latency_ms},"tcp22":{"ok":tcp["ok"],"reason":"ok" if tcp["ok"] else tcp["stderr"] or "failed"},"ssh":remote_report(item.get("sshTarget"),item.get("remoteDarkmeshPath",REMOTE_DARKMESH))})
+    emit({"schema":2,"kind":"darkmesh-posture-probe","generatedAt":now(),"peers":output})
+def assess(p, obs, ssh=None):
+    values={k:obs.get(k) for k in ("internet","vpn","tailscale","transferSafety")}; values.update({"ssh":ssh,"zeroGeneralEgressLeak":None})
+    if not obs.get("available") or not obs.get("fresh"):
+        for key in ("internet","vpn","tailscale","transferSafety"): values[key]=None
+    required={key:values.get(key) for key,on in p["required"].items() if on}; preferred={key:values.get(key) for key,on in p["preferred"].items() if on}; forbidden={key:values.get(key) for key,on in p["forbidden"].items() if on}
+    if any(value is False for value in required.values()) or any(value is True for value in forbidden.values()): severity,state,reason="red","degraded","required-failure-or-forbidden-present"
+    elif any(value is None for value in list(required.values())+list(forbidden.values())): severity,state,reason="gray","unavailable","telemetry-unavailable"
+    elif any(value is not True for value in preferred.values()): severity,state,reason="yellow","degraded","preferred-unavailable"
+    else: severity,state,reason="green","healthy","profile-satisfied"
+    return {"severity":severity,"state":state,"reason":reason,"required":required,"preferred":preferred,"forbidden":forbidden}
+def read_desired():
+    try: return json.loads(CONFIG.read_text()).get("profile")
+    except Exception: return None
+def write_desired(profile_id):
+    CONFIG.parent.mkdir(parents=True,exist_ok=True); temp=CONFIG.with_name(CONFIG.name+f".tmp.{os.getpid()}"); temp.write_text(json.dumps({"schema":2,"profile":profile_id,"selectedAt":now()},separators=(",",":"))+"\n"); os.chmod(temp,0o600); temp.replace(CONFIG)
+def invoke(name, argv, evidence):
+    result=run(argv,APPLY_DEADLINE); evidence.append({"step":name,"command":Path(argv[0]).name,"ok":result["ok"],"code":result["code"],"detail":(result["stderr"] or result["stdout"])[:200]}); return result["ok"]
+def ssh_reachability():
+    values=[remote_report(row.get("sshTarget"),row.get("remoteDarkmeshPath",REMOTE_DARKMESH)) for row in peers_config() if row.get("sshTarget")]
+    return any(value.get("available") for value in values) if values else None
+def acquire_lock():
+    LOCK.parent.mkdir(parents=True,exist_ok=True)
+    try: return os.open(str(LOCK),os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+    except FileExistsError: return None
+def apply(profile_id):
+    p=get_profile(profile_id)
+    if not p: emit({"schema":2,"kind":"darkmesh-posture-apply","applied":False,"reason":"unknown-profile"},2)
+    if p["transition"].get("apply")=="refuse": emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"capability-unavailable","requiredCapability":"machine-wide-kill-switch","capabilities":p.get("capabilities",{}),"rollback":{"attempted":False,"reason":"no-action-taken"}},4)
+    handle=acquire_lock()
+    if handle is None: emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"apply-in-progress","rollback":{"attempted":False,"reason":"no-action-taken"}},5)
+    try:
+        initial=observed(); initial["vpnIntent"]=Path(os.environ.get("DARKMESH_VPN_DESIRED", HOME / ".config/darkmesh/vpn-desired")).read_text().strip() if Path(os.environ.get("DARKMESH_VPN_DESIRED", HOME / ".config/darkmesh/vpn-desired")).exists() else None
+        if initial.get("fresh") is not True or initial.get("transferSafety") is not True: emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"fresh-transfer-containment-required","initial":initial,"rollback":{"attempted":False,"reason":"preflight-failed"}},3)
+        evidence=[]; rollback=[]; transition=p["transition"]; initial_ssh=ssh_reachability() if transition.get("vpn")=="attempt-with-rollback" else None
+        def rollback_panic(reason):
+            ok=invoke("rollback-plain-network",[PANIC],rollback); rollback.append({"reason":reason,"restoredHigherPriority":"plain-internet-and-transfer-containment","ok":ok})
+        needs_plain_transition = transition.get("vpn") == "panic" or (transition.get("vpn") == "panic-before-repair" and initial.get("tailscale") is not True)
+        if needs_plain_transition and initial.get("vpn") is True and not invoke("plain-network-transition",[PANIC],evidence): emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"plain-network-transition-failed","initial":initial,"actions":evidence,"rollback":{"attempted":False}},3)
+        if transition.get("vpn")=="attempt-with-rollback" and initial.get("vpn") is True and initial.get("tailscale") is not True and not invoke("plain-network-transition",[PANIC],evidence): emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"plain-network-transition-failed","initial":initial,"actions":evidence,"rollback":{"attempted":False}},3)
+        if transition.get("tailscale")=="down" and initial.get("tailscale") is True and not invoke("tailscale-down",[TS,"down"],evidence): rollback_panic("tailscale-down-failed"); emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"tailscale-down-failed","actions":evidence,"rollback":{"attempted":True,"events":rollback}},3)
+        if transition.get("tailscale")=="verify-or-guarded-repair" and initial.get("tailscale") is not True and not invoke("guarded-tailscale-repair",[REPAIR],evidence): emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"tailscale-establishment-failed","actions":evidence,"rollback":{"attempted":False}},3)
+        needs_vpn_rearm = initial.get("vpn") is not True or (transition.get("vpn") == "attempt-with-rollback" and initial.get("tailscale") is not True)
+        if transition.get("vpn") in ("rearm","attempt-with-rollback") and needs_vpn_rearm and not invoke("vpn-rearm",[UP],evidence): rollback_panic("vpn-rearm-failed"); emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"vpn-rearm-failed","actions":evidence,"rollback":{"attempted":True,"events":rollback}},3)
+        if transition.get("tailscale")=="guarded-repair-when-supported" and initial.get("tailscale") is not True: evidence.append({"step":"guarded-tailscale-repair","ok":False,"code":None,"detail":"not-run: VPN-required path lacks plain-network preconditions"})
+        deadline=time.monotonic()+APPLY_DEADLINE; post=observed()
+        while time.monotonic()<deadline and assess(p,post)["severity"] in ("red","gray"): time.sleep(.2); post=observed()
+        post_ssh=ssh_reachability() if initial_ssh is True else None
+        regression=transition.get("vpn")=="attempt-with-rollback" and ((initial.get("tailscale") is True and post.get("tailscale") is not True) or (initial_ssh is True and post_ssh is not True))
+        final=assess(p,post,post_ssh)
+        if regression or final["severity"] in ("red","gray"):
+            if transition.get("vpn") in ("rearm","attempt-with-rollback"): rollback_panic("higher-priority-regression" if regression else "postcondition-failed")
+            emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"higher-priority-regression" if regression else "postcondition-failed","initial":initial,"postcondition":post,"assessment":final,"actions":evidence,"rollback":{"attempted":bool(rollback),"events":rollback}},3)
+        write_desired(profile_id); emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":True,"initial":initial,"postcondition":post,"assessment":final,"actions":evidence,"rollback":{"attempted":False,"reason":"not-needed"}})
+    finally:
+        os.close(handle)
+        try: LOCK.unlink()
+        except FileNotFoundError: pass
+def show():
+    desired=read_desired(); p=get_profile(desired); obs=observed(); emit({"schema":2,"kind":"darkmesh-posture","desiredProfile":desired,"profile":p,"observed":obs,"assessment":assess(p,obs) if p else {"severity":"gray","state":"unavailable","reason":"profile-unselected","required":{},"preferred":{},"forbidden":{}}})
+def report():
+    desired=read_desired(); p=get_profile(desired); obs=observed(); ts=tailscale_status()
+    audit=run([AUDIT,"--json"],max(12,PROBE_TIMEOUT+2)); doctor=run([DOCTOR,"--check"],max(12,PROBE_TIMEOUT+2))
+    def check(result, parse_json=False):
+        value={"ok":result["ok"],"code":result["code"],"stdout":result["stdout"][:4096],"stderr":result["stderr"][:1024]}
+        if parse_json:
+            try: value["result"]=json.loads(result["stdout"])
+            except Exception: pass
+        return value
+    emit({"schema":2,"kind":"darkmesh-posture-report","generatedAt":now(),"desiredProfile":desired,"observed":obs,"assessment":assess(p,obs) if p else {"severity":"gray","state":"unavailable","reason":"profile-unselected","required":{},"preferred":{},"forbidden":{}},"tailscale":{"backend":ts.get("backend"),"selfOnline":ts.get("selfOnline"),"warnings":ts.get("healthWarnings",[])},"audit":check(audit,True),"transferReadiness":check(doctor)})
+def health():
+    result=run([HEALTH], max(PROBE_TIMEOUT, 12))
+    if not result["ok"]: emit({"schema":2,"kind":"darkmesh-posture-health","available":False,"reason":result["stderr"] or "healthcheck-failed"},1)
+    try: data=json.loads(result["stdout"])
+    except Exception: emit({"schema":2,"kind":"darkmesh-posture-health","available":False,"reason":"healthcheck-invalid"},1)
+    emit({"schema":2,"kind":"darkmesh-posture-health","available":True,"health":data})
+def main():
+    args=sys.argv[1:]; command=args[0] if args else "help"
+    if command=="profiles" and len(args) in (1,2): emit({"schema":2,"kind":"darkmesh-posture-profiles","profiles":PROFILES})
+    if command=="set" and len(args)==2:
+        if not get_profile(args[1]): emit({"schema":2,"kind":"darkmesh-posture-selection","applied":False,"reason":"unknown-profile"},2)
+        write_desired(args[1]); emit({"schema":2,"kind":"darkmesh-posture-selection","profile":args[1],"applied":False,"reason":"desired-recorded"})
+    if command=="show" and len(args) in (1,2): show()
+    if command=="health" and len(args) in (1,2): health()
+    if command=="topology" and len(args) in (1,2): topology()
+    if command=="probe" and len(args) in (1,2): probe()
+    if command=="report" and len(args) in (1,2): report()
+    if command=="apply" and len(args) in (1,2): apply(args[1] if len(args)==2 else read_desired())
+    print("Usage: darkmesh posture {profiles|show|set <id>|topology|probe|report|apply [id]} [--json]",file=sys.stderr); raise SystemExit(2)
+if __name__=="__main__": main()

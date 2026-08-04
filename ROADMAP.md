@@ -1,5 +1,12 @@
 # Roadmap — darkmesh-vpn-guard
 
+> **Network posture update — 2026-08-04:** `darkmesh posture` now publishes a
+> schema-2 desired/observed contract, eight explicit Tailscale/VPN priority
+> profiles, passive topology, and bounded opt-in peer diagnostics for Server
+> Monitor. Profile changes remain explicit, transactional, and recovery-owned;
+> the strict zero-general-egress-leak profile remains capability-gated because
+> Darkmesh does not claim a machine-wide kill switch.
+
 > **Background architecture update — 2026-07-13:** the per-script LaunchAgents
 > described below are now a legacy fallback. Server Monitor bundles one Developer
 > ID-signed `SMAppService` infrastructure agent that supervises the healthcheck and

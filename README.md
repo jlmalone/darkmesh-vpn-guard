@@ -90,6 +90,11 @@ the same checked repair on demand.
 policy. Reading `/tmp/darkmesh-status.json` is sufficient to render a
 GO / DEGRADED / NO-GO indicator.
 
+For a versioned desired/observed profile surface and optional read-only peer
+health, use `darkmesh posture`. Its explicit `apply` boundary preserves the
+existing recovery owner and never enables Network Lock. See
+[`docs/network-posture-contract.md`](docs/network-posture-contract.md).
+
 ### Menu-bar status (SwiftBar)
 
 A SwiftBar plugin at `swiftbar/darkmesh.10s.sh` renders a glanceable status icon

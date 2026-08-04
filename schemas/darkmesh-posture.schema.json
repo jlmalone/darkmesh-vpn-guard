@@ -1,0 +1,168 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://darkmesh.example/schema/darkmesh-posture-2.json",
+  "title": "Darkmesh posture contract",
+  "type": "object",
+  "required": ["schema", "kind"],
+  "properties": {
+    "schema": { "const": 2 },
+    "kind": {
+      "enum": [
+        "darkmesh-posture-profiles",
+        "darkmesh-posture",
+        "darkmesh-posture-selection",
+        "darkmesh-posture-apply",
+        "darkmesh-posture-health",
+        "darkmesh-posture-topology",
+        "darkmesh-posture-probe",
+        "darkmesh-posture-report"
+      ]
+    },
+    "generatedAt": { "type": "string", "format": "date-time" },
+    "desiredProfile": { "type": ["string", "null"] },
+    "profile": { "oneOf": [{ "$ref": "#/$defs/profile" }, { "type": "null" }] },
+    "profiles": { "type": "array", "items": { "$ref": "#/$defs/profile" } },
+    "observed": { "$ref": "#/$defs/observed" },
+    "local": { "$ref": "#/$defs/localTopology" },
+    "peers": { "type": "array", "items": { "$ref": "#/$defs/peer" } },
+    "assessment": { "$ref": "#/$defs/assessment" },
+    "actions": { "type": "array", "items": { "$ref": "#/$defs/evidence" } },
+    "rollback": { "type": "object" },
+    "audit": { "$ref": "#/$defs/commandResult" },
+    "transferReadiness": { "$ref": "#/$defs/commandResult" }
+  },
+  "$defs": {
+    "booleanTelemetry": { "type": ["boolean", "null"] },
+    "profile": {
+      "type": "object",
+      "required": ["id", "title", "required", "preferred", "forbidden", "priority", "transition", "degraded", "timeout_seconds"],
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "required": { "type": "object", "additionalProperties": { "type": "boolean" } },
+        "preferred": { "type": "object", "additionalProperties": { "type": "boolean" } },
+        "forbidden": { "type": "object", "additionalProperties": { "type": "boolean" } },
+        "capabilities": { "type": "object", "additionalProperties": { "type": "boolean" } },
+        "priority": { "type": "array", "items": { "type": "string" } },
+        "transition": { "type": "object" },
+        "degraded": { "type": "string" },
+        "timeout_seconds": { "type": "number", "minimum": 1 }
+      },
+      "additionalProperties": true
+    },
+    "observed": {
+      "type": "object",
+      "required": ["available", "fresh", "reason"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "fresh": { "type": "boolean" },
+        "reason": { "type": "string" },
+        "internet": { "$ref": "#/$defs/booleanTelemetry" },
+        "vpn": { "$ref": "#/$defs/booleanTelemetry" },
+        "vpnState": { "type": ["string", "null"] },
+        "tailscale": { "$ref": "#/$defs/booleanTelemetry" },
+        "transferSafety": { "$ref": "#/$defs/booleanTelemetry" },
+        "verdict": { "type": ["string", "null"] },
+        "ageSeconds": { "type": "number", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "assessment": {
+      "type": "object",
+      "required": ["severity", "state", "reason"],
+      "properties": {
+        "severity": { "enum": ["green", "yellow", "red", "gray"] },
+        "state": { "type": "string" },
+        "reason": { "type": "string" },
+        "required": { "type": "object", "additionalProperties": { "$ref": "#/$defs/booleanTelemetry" } },
+        "preferred": { "type": "object", "additionalProperties": { "$ref": "#/$defs/booleanTelemetry" } },
+        "forbidden": { "type": "object", "additionalProperties": { "$ref": "#/$defs/booleanTelemetry" } }
+      },
+      "additionalProperties": true
+    },
+    "route": {
+      "type": "object",
+      "properties": {
+        "target": { "type": "string" },
+        "interface": { "type": ["string", "null"] },
+        "gateway": { "type": ["string", "null"] },
+        "available": { "type": "boolean" },
+        "reason": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "localTopology": {
+      "type": "object",
+      "required": ["interfaces", "routes", "tailscale"],
+      "properties": {
+        "interfaces": { "type": "array", "items": { "type": "object" } },
+        "routes": { "type": "object", "additionalProperties": { "$ref": "#/$defs/route" } },
+        "tailscale": {
+          "type": "object",
+          "properties": {
+            "available": { "type": "boolean" },
+            "backend": { "type": ["string", "null"] },
+            "selfOnline": { "$ref": "#/$defs/booleanTelemetry" },
+            "controlHealthy": { "type": "boolean" },
+            "healthWarnings": { "type": "array", "items": { "type": "string" } },
+            "selfAddresses": { "type": "array", "items": { "type": "string" } }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "peer": {
+      "type": "object",
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string" },
+        "target": { "type": "string" },
+        "online": { "$ref": "#/$defs/booleanTelemetry" },
+        "active": { "$ref": "#/$defs/booleanTelemetry" },
+        "relay": { "type": ["string", "null"] },
+        "directEndpoint": { "type": ["string", "null"] },
+        "addresses": { "type": "array", "items": { "type": "string" } },
+        "route": { "$ref": "#/$defs/route" },
+        "tailscalePing": { "$ref": "#/$defs/check" },
+        "tcp22": { "$ref": "#/$defs/check" },
+        "ssh": { "type": "object" }
+      },
+      "additionalProperties": true
+    },
+    "check": {
+      "type": "object",
+      "properties": {
+        "ok": { "type": "boolean" },
+        "reason": { "type": "string" },
+        "output": { "type": "string" },
+        "path": { "type": ["string", "null"] },
+        "latencyMs": { "type": ["number", "null"], "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "evidence": {
+      "type": "object",
+      "properties": {
+        "step": { "type": "string" },
+        "ok": { "type": "boolean" },
+        "code": { "type": ["integer", "null"] },
+        "detail": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "commandResult": {
+      "type": "object",
+      "required": ["ok", "code", "stdout", "stderr"],
+      "properties": {
+        "ok": { "type": "boolean" },
+        "code": { "type": ["integer", "null"] },
+        "stdout": { "type": "string" },
+        "stderr": { "type": "string" },
+        "result": { "type": "object" }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

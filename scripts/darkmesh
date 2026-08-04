@@ -34,6 +34,7 @@ Usage: darkmesh <command> [args]
   repair-tailscale    rebuild a stale macOS Tailscale VPN service safely
   undo                emergency restore internet (legacy `darkmesh --undo`)
   doctor              transfer-client VPN-binding diagnostics
+  posture <command>   versioned desired/observed posture and read-only peer health
   apply | verify      darkmesh-expressvpn-tailscale apply / verify
   experiment start    guided configure, preflight, campaign, and report
   experiment          advanced experiment commands and field profiles
