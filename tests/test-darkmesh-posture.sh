@@ -87,7 +87,11 @@ python3 -c 'import json,sys; p=json.load(sys.stdin)["peers"][0]["tailscalePing"]
 
 echo '4b. remote report carries audit and transfer doctor evidence'
 out="$(env "${env_base[@]}" "$ROOT/scripts/darkmesh-posture" report --json)"
-python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["audit"]["ok"] and d["audit"]["result"]["verdict"]=="GO" and d["transferReadiness"]["stdout"]=="binding-current\n"' <<<"$out" || fail "remote report evidence"
+python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["audit"]["ok"] and d["audit"]["result"]["verdict"]=="GO" and d["transferReadiness"]["stdout"]=="binding-current\n" and d["transferReadiness"]["state"]=="ready"' <<<"$out" || fail "remote report evidence"
+stub doctor 'echo "ERROR: missing: TransferClient.ini" >&2; exit 1'
+out="$(env "${env_base[@]}" "$ROOT/scripts/darkmesh-posture" report --json)"
+python3 -c 'import json,sys; d=json.load(sys.stdin); assert not d["transferReadiness"]["ok"] and d["transferReadiness"]["state"]=="unconfigured"' <<<"$out" || fail "unconfigured transfer client classification"
+stub doctor 'echo "binding-current"'
 [[ ! "$(cat "$TMP/actions.log")" =~ down ]] || fail "topology mutated Tailscale"
 
 echo '5. plain profile panics then explicitly stops Tailscale and writes desired only on success'

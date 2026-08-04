@@ -208,7 +208,9 @@ def report():
             try: value["result"]=json.loads(result["stdout"])
             except Exception: pass
         return value
-    emit({"schema":2,"kind":"darkmesh-posture-report","generatedAt":now(),"desiredProfile":desired,"observed":obs,"assessment":assess(p,obs) if p else {"severity":"gray","state":"unavailable","reason":"profile-unselected","required":{},"preferred":{},"forbidden":{}},"tailscale":{"backend":ts.get("backend"),"selfOnline":ts.get("selfOnline"),"warnings":ts.get("healthWarnings",[])},"audit":check(audit,True),"transferReadiness":check(doctor)})
+    transfer=check(doctor); detail=f"{transfer['stdout']}\n{transfer['stderr']}".lower()
+    transfer["state"]="ready" if transfer["ok"] else ("unconfigured" if "missing:" in detail or "not configured" in detail else "blocked")
+    emit({"schema":2,"kind":"darkmesh-posture-report","generatedAt":now(),"desiredProfile":desired,"observed":obs,"assessment":assess(p,obs) if p else {"severity":"gray","state":"unavailable","reason":"profile-unselected","required":{},"preferred":{},"forbidden":{}},"tailscale":{"backend":ts.get("backend"),"selfOnline":ts.get("selfOnline"),"warnings":ts.get("healthWarnings",[])},"audit":check(audit,True),"transferReadiness":transfer})
 def health():
     result=run([HEALTH], max(PROBE_TIMEOUT, 12))
     if not result["ok"]: emit({"schema":2,"kind":"darkmesh-posture-health","available":False,"reason":result["stderr"] or "healthcheck-failed"},1)
