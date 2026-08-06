@@ -53,9 +53,12 @@ client_login() {
 }
 client_reachable() { client_api GET /api/v2/app/version >/dev/null 2>&1 || { client_login && client_api GET /api/v2/app/version >/dev/null 2>&1; }; }
 
-# ExpressVPN tunnel IP (default-route utun), or empty.
+# ExpressVPN tunnel binding (default-route utun interface/address), or empty.
+tunnel_iface() {
+  netstat -rn -f inet 2>/dev/null | awk '$1 == "0/1" && $NF ~ /^utun[0-9]+$/ { print $NF; exit }'
+}
 tunnel_ip() {
-  local iface; iface="$(netstat -rn -f inet 2>/dev/null | awk '$1 == "0/1" && $NF ~ /^utun[0-9]+$/ { print $NF; exit }')"
+  local iface; iface="$(tunnel_iface)"
   [ -n "$iface" ] || return 0
   ifconfig "$iface" 2>/dev/null | awk '/inet /{print $2; exit}'
 }
@@ -89,9 +92,9 @@ do_resume() {
 
 # Build the runtime status JSON (server_monitor reads this) and echo it.
 write_status() {
-  local reachable=false want tip info prefs
+  local reachable=false want tif tip info prefs
   want="$(read_desired)"; want="${want:-active}"
-  tip="$(tunnel_ip)"
+  tif="$(tunnel_iface)"; tip="$(tunnel_ip)"
   client_reachable && reachable=true
   info="$(client_api GET "$TAPI/info" 2>/dev/null)"
   prefs="$(client_api GET /api/v2/app/preferences 2>/dev/null)"
@@ -99,7 +102,7 @@ write_status() {
   incident_pending && incident=true
   TRANSFER_REACHABLE="$reachable" TRANSFER_DESIRED="$want" TRANSFER_PORT="$WEB_PORT" \
   TRANSFER_INCIDENT="$incident" \
-  TRANSFER_TUNNEL="$tip" TRANSFER_INFO="$info" TRANSFER_PREFS="$prefs" \
+  TRANSFER_TUNNEL_IFACE="$tif" TRANSFER_TUNNEL="$tip" TRANSFER_INFO="$info" TRANSFER_PREFS="$prefs" \
   python3 - "$STATUS_JSON" <<'PY'
 import json,os,sys
 status_path=sys.argv[1]
@@ -112,7 +115,9 @@ from collections import Counter
 states=Counter(t.get('state','') for t in info)
 paused=sum(v for k,v in states.items() if any(x in k.lower() for x in ('paused','stopped')))
 total=len(info)
+bound_iface=prefs.get('current_network_interface','') if isinstance(prefs,dict) else ''
 bound=prefs.get('current_interface_address','') if isinstance(prefs,dict) else ''
+tunnel_iface=os.environ.get('TRANSFER_TUNNEL_IFACE','')
 tunnel=os.environ.get('TRANSFER_TUNNEL','')
 out={
  "schema":1,
@@ -121,9 +126,11 @@ out={
  "desired": os.environ.get('TRANSFER_DESIRED','active'),
  "incident_pending": os.environ.get('TRANSFER_INCIDENT')=='true',
  "web_port": int(os.environ.get('TRANSFER_PORT') or 0),
+ "bound_interface": bound_iface,
  "bound_address": bound,
+ "tunnel_interface": tunnel_iface,
  "tunnel_address": tunnel,
- "on_tunnel": bool(bound) and bound==tunnel,
+ "on_tunnel": bool(bound_iface) and bool(bound) and bound_iface==tunnel_iface and bound==tunnel,
  "total": total,
  "paused": paused,
  "active": total-paused,

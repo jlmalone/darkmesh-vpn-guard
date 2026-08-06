@@ -20,6 +20,16 @@ exit 0'
 stub Tailscale 'exit 0'
 stub darkmesh-repair-tailscale 'exit 0'
 stub curl '
+if [[ "${TEST_CLIENT_MODE:-0}" == 1 ]]; then
+  printf "%s\n" "$*" >> "${TEST_CLIENT_REQUESTS:?}"
+  [[ "$*" == *"/api/v2/app/version"* ]] && { echo 5.0; exit 0; }
+  [[ "$*" == *"/api/v2/app/preferences"* ]] && {
+    printf "%s\n" "{\"current_network_interface\":\"utun5\",\"current_interface_address\":\"100.64.100.6\"}"
+    exit 0
+  }
+  [[ "$*" == *"/api/v2/app/setPreferences"* ]] && exit 0
+  exit 1
+fi
 out=""; headers=""; prev=""
 for arg in "$@"; do
   [[ "$prev" == -o ]] && out="$arg"
@@ -259,3 +269,32 @@ grep -q -- '--timeout 30 connect' "$SAFETY/ctl.log" \
   || { echo "explicit rearm did not override the safety standdown" >&2; exit 1; }
 
 echo "PASS: safety standdown and explicit rearm tests"
+
+echo "7. a same-address tunnel-interface rotation is re-pinned live"
+stub connected-expressvpnctl '
+[[ "$*" == *"get connectionstate"* ]] && echo Connected
+exit 0'
+stub netstat 'printf "0/1 100.64.0.1 UGSc utun8\n"'
+stub ifconfig '
+[[ "${1:-}" == utun8 ]] && printf "\tinet 100.64.100.6 netmask 0xffffffff\n"
+exit 0'
+stub vpn-guard 'printf "guard\n" >> "${TEST_GUARD_LOG:?}"'
+ROTATED="$TMP/rotated"; mkdir -p "$ROTATED/.config/darkmesh" "$ROTATED/Library/Logs/darkmesh"
+printf 'on\n' > "$ROTATED/.config/darkmesh/vpn-desired"
+cat > "$ROTATED/.config/darkmesh/transfer-client.conf" <<'EOF'
+CLIENT_APP="TestTransferClient"
+CLIENT_WEB_HOST="http://127.0.0.1:18080"
+EOF
+HOME="$ROTATED" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" CTL="$BIN/connected-expressvpnctl" TS="$BIN/Tailscale" \
+  DARKMESH_CLIENT_CONF="$ROTATED/.config/darkmesh/transfer-client.conf" \
+  DARKMESH_PLAIN_RESTORE="$BIN/plain-restore" DARKMESH_RECONNECT_PID_FILE="$ROTATED/reconnect.pid" \
+  DARKMESH_RECONNECT_STATE="$ROTATED/state" DARKMESH_VPN_DESIRED="$ROTATED/.config/darkmesh/vpn-desired" \
+  DARKMESH_STATUS_FILE="$ROTATED/status.json" DARKMESH_RECONNECT_SIDECAR="$ROTATED/sidecar.json" \
+  DARKMESH_VPN_GUARD="$BIN/vpn-guard" DARKMESH_MAX_TICKS=1 INTERVAL_OK=0 \
+  TEST_CLIENT_MODE=1 TEST_CLIENT_REQUESTS="$ROTATED/client.log" TEST_GUARD_LOG="$ROTATED/guard.log" \
+  bash "$ROOT/scripts/darkmesh-reconnect" >/dev/null 2>&1
+grep '/api/v2/app/setPreferences' "$ROTATED/client.log" | grep -F 'current_network_interface' | grep -F 'utun8' >/dev/null \
+  || { echo "same-address interface rotation was not re-pinned" >&2; exit 1; }
+grep -q guard "$ROTATED/guard.log" || { echo "interface rotation did not trigger guard verification" >&2; exit 1; }
+
+echo "PASS: same-address interface rotation test"

@@ -187,20 +187,19 @@ tunnel_iface() {
   netstat -rn -f inet 2>/dev/null | awk '$1 == "0/1" && $NF ~ /^utun[0-9]+$/ {print $NF; exit}'
 }
 
-tunnel_ip() {
-  local iface
-  iface="$(tunnel_iface)"; [ -n "$iface" ] || return 1
-  ifconfig "$iface" 2>/dev/null | awk '/inet / {print $2; exit}'
-}
-
 vpn_recovery_verified() {
   if [ -n "${DARKMESH_VPN_VERIFY_CMD:-}" ]; then "$DARKMESH_VPN_VERIFY_CMD"; return; fi
-  local status tip bound code
+  local status tif tip bound code
   status="$("$EXPRESSVPN_CTL" --timeout 3 status 2>/dev/null | head -1)"
   [[ "$status" =~ ^Connected\ to\ [^[:space:]]+$ ]] || return 1
-  tip="$(tunnel_ip)"; [ -n "$tip" ] || return 1
-  bound="$(client_api GET /api/v2/app/preferences | python3 -c 'import json,sys; print(json.load(sys.stdin).get("current_interface_address", ""))' 2>/dev/null)"
-  [ "$bound" = "$tip" ] || return 1
+  tif="$(tunnel_iface)"; [ -n "$tif" ] || return 1
+  tip="$(ifconfig "$tif" 2>/dev/null | awk '/inet / {print $2; exit}')"; [ -n "$tip" ] || return 1
+  bound="$(client_api GET /api/v2/app/preferences | python3 -c '
+import json, sys
+prefs=json.load(sys.stdin)
+print("{}/{}".format(prefs.get("current_network_interface", ""), prefs.get("current_interface_address", "")))
+' 2>/dev/null)"
+  [ "$bound" = "$tif/$tip" ] || return 1
   python3 - "$HEALTH_STATUS_FILE" <<'PY' || return 1
 import datetime, json, os, sys, time
 path=sys.argv[1]

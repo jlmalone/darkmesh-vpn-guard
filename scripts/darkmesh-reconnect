@@ -189,7 +189,13 @@ client_login() {
     "$WEB_HOST/api/v2/auth/login" >/dev/null 2>&1
 }
 client_reachable() { client_api GET /api/v2/app/version >/dev/null 2>&1 || { client_login && client_api GET /api/v2/app/version >/dev/null 2>&1; }; }
-client_bound_addr() { client_api GET /api/v2/app/preferences | python3 -c "import json,sys;print(json.load(sys.stdin).get('current_interface_address',''))" 2>/dev/null; }
+client_binding() {
+  client_api GET /api/v2/app/preferences | python3 -c '
+import json, sys
+prefs=json.load(sys.stdin)
+print("{}/{}".format(prefs.get("current_network_interface", ""), prefs.get("current_interface_address", "")))
+' 2>/dev/null
+}
 client_repin() {  # <iface> <addr>
   client_api POST /api/v2/app/setPreferences --data-urlencode "json={\"current_network_interface\":\"$1\",\"current_interface_address\":\"$2\"}" >/dev/null 2>&1
 }
@@ -197,10 +203,10 @@ client_repin() {  # <iface> <addr>
 # (live, no restart). No-op when already correct; falls back to the doctor only
 # when the Web UI is unreachable. <iface> <addr>
 repin_only() {
-  local tif="$1" ip="$2" cur
+  local tif="$1" ip="$2" cur expected
   if client_reachable; then
-    cur="$(client_bound_addr)"
-    [ "$cur" = "$ip" ] && return 0
+    cur="$(client_binding)"; expected="$tif/$ip"
+    [ "$cur" = "$expected" ] && return 0
     if client_repin "$tif" "$ip"; then
       log "  re-pinned transfer client to ${tif:-?}/$ip via Web UI (was ${cur:-unset})"
     else
@@ -288,6 +294,7 @@ consume_reconnect_request() {
 consecutive_fails=0
 failing_since=0
 last_tunnel_ip=""
+last_tunnel_iface=""
 gave_up=false
 gave_up_at=0
 captive_ticks=0
@@ -352,7 +359,8 @@ write_sidecar() {  # <phase> <vpn_state>
     printf '  "gave_up": %s,\n' "$gave_up"
     printf '  "next_attempt_at": %s,\n' "$next_attempt_at"
     printf '  "restricted_attempts": %s,\n' "$restricted_attempts"
-    printf '  "tunnel_ip": "%s"\n' "$last_tunnel_ip"
+    printf '  "tunnel_ip": "%s",\n' "$last_tunnel_ip"
+    printf '  "tunnel_iface": "%s"\n' "$last_tunnel_iface"
     printf '}\n'
   } > "$tmp" 2>/dev/null && mv -f "$tmp" "$SIDECAR" 2>/dev/null || rm -f "$tmp" 2>/dev/null
   persist_recovery_state
@@ -475,8 +483,9 @@ while true; do
     [ -n "$tif" ] && ip="$(ifconfig "$tif" 2>/dev/null | awk '/inet /{print $2; exit}')"
     if [ -n "$ip" ]; then
       repin_only "$tif" "$ip"
-      if [ "$ip" != "$last_tunnel_ip" ]; then
-        log "tunnel up/changed (${last_tunnel_ip:-none} -> $ip on $tif)"; last_tunnel_ip="$ip"
+      if [ "$ip" != "$last_tunnel_ip" ] || [ "$tif" != "$last_tunnel_iface" ]; then
+        log "tunnel up/changed (${last_tunnel_iface:-none}/${last_tunnel_ip:-none} -> $tif/$ip)"
+        last_tunnel_ip="$ip"; last_tunnel_iface="$tif"
         guard_after_repin
       fi
     fi

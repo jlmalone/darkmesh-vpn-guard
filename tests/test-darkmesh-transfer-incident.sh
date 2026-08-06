@@ -42,12 +42,25 @@ stub trust-ok 'exit 0'
 stub trust-fail 'exit 1'
 stub vpn-ok 'exit 0'
 stub vpn-fail 'exit 1'
+stub incident-expressvpnctl '
+[[ "$*" == *"status"* ]] && echo "Connected to test-location"
+exit 0'
+stub netstat 'printf "0/1 100.64.0.1 UGSc utun8\n"'
+stub ifconfig '
+[[ "${1:-}" == utun8 ]] && printf "\tinet 100.64.100.6 netmask 0xffffffff\n"
+exit 0'
 stub networksetup 'printf "Hardware Port: Wi-Fi\nDevice: en0\n"'
 stub route 'printf "   gateway: 192.0.2.1\n interface: en0\n"'
 stub arp 'printf "? (192.0.2.1) at 00:11:22:33:44:55 on en0 ifscope [ethernet]\n"'
 stub curl '
 printf "%s\n" "$*" >> "${TEST_REQUESTS:?}"
 if [[ "$*" == *"/api/v2/app/version"* ]]; then echo 5.0; exit 0; fi
+if [[ "$*" == *"/api/v2/app/preferences"* ]]; then
+  printf "{\"current_network_interface\":\"%s\",\"current_interface_address\":\"100.64.100.6\"}\n" \
+    "${TEST_BOUND_INTERFACE:-utun8}"
+  exit 0
+fi
+if [[ "$*" == *"generate_204"* ]]; then echo 204; exit 0; fi
 if [[ "$*" == *"/api/v2/items/info"* ]]; then cat "${TEST_STATE:?}"; exit 0; fi
 if [[ "$*" == *"/api/v2/items/stop"* || "$*" == *"/api/v2/items/pause"* ]] && [[ "${TEST_STOP_FAIL:-0}" == 1 ]]; then exit 1; fi
 if [[ "$*" == *"/api/v2/items/stop"* && "${TEST_MODERN_FAIL:-0}" == 1 ]]; then exit 1; fi
@@ -74,8 +87,10 @@ run_incident() {
     DARKMESH_TRANSFER_INCIDENT_DIR="$HOME_DIR/.local/state/darkmesh/transfer-incidents" \
     DARKMESH_TRANSFER_DESIRED="$HOME_DIR/.config/darkmesh/transfer-desired" \
     DARKMESH_TRUST_VERIFY_CMD="${TEST_TRUST_CMD:-$BIN/trust-ok}" \
-    DARKMESH_VPN_VERIFY_CMD="${TEST_VPN_CMD:-$BIN/vpn-ok}" \
+    DARKMESH_VPN_VERIFY_CMD="${TEST_VPN_CMD-$BIN/vpn-ok}" \
+    DARKMESH_STATUS_FILE="$HOME_DIR/status.json" EXPRESSVPN_CTL="$BIN/incident-expressvpnctl" \
     TEST_REQUESTS="$REQUESTS" TEST_STATE="$STATE" TEST_STARTED="$STARTED" \
+    TEST_BOUND_INTERFACE="${TEST_BOUND_INTERFACE:-utun8}" \
     TEST_MODERN_FAIL="${TEST_MODERN_FAIL:-0}" \
     TEST_STOP_FAIL="${TEST_STOP_FAIL:-0}" \
     bash "$ROOT/scripts/darkmesh-transfer-incident" "$@"
@@ -193,5 +208,13 @@ python3 - "$JOURNAL" "$A" <<'PY'
 import json,sys
 assert json.load(open(sys.argv[1]))["active_hashes"] == [sys.argv[2]]
 PY
+
+echo "10. default recovery verification rejects a same-address stale interface"
+printf '{"timestamp":"%s","max_age_seconds":60,"vpn_state":"Connected","internet_ok":true,"dns_ok":true}\n' \
+  "$(date -u +%FT%TZ)" > "$HOME_DIR/status.json"
+TEST_STOP_FAIL=0; TEST_VPN_CMD=""; TEST_BOUND_INTERFACE=utun5
+if run_incident ready >/dev/null 2>&1; then fail "same-address stale interface passed recovery verification"; fi
+TEST_BOUND_INTERFACE=utun8
+run_incident ready >/dev/null || fail "matching interface and address did not pass recovery verification"
 
 echo "PASS: incident-scoped transfer recovery tests"
