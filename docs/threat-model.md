@@ -45,15 +45,17 @@ When safety and availability conflict, the transfer client should fail closed.
 ## Known Failure Mode
 
 ExpressVPN may reconnect with a different `utun` interface or tunnel-side IP.
+It can also reuse the same tunnel-side IP on a new `utun` interface.
 
-When that happens, the transfer client may appear stuck. This is safe if the
-saved binding no longer matches the current ExpressVPN tunnel. Use:
+The reconnect worker compares both values and re-pins the running client through
+its local API. Incident recovery remains contained until the interface and
+address both match. If the client still appears stuck, use:
 
 ```bash
 transfer-vpn-doctor
 ```
 
-Then refresh the binding only if the doctor says it is safe:
+Then refresh the saved binding only if the doctor says it is safe:
 
 ```bash
 transfer-vpn-doctor --fix

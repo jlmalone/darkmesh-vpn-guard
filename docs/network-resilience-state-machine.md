@@ -27,7 +27,7 @@ autoconnect guidance are superseded here.
 | `retrying` | One serialized VPN attempt failed. Restore plain networking and preserve the absolute retry deadline. | Deadline expires. |
 | `safety-standdown` | A connected tunnel failed the healthcheck safety gate. Prefer stable plain networking for one hour. | The standdown expires or the operator explicitly runs `darkmesh up`. |
 | `plain-cooldown` | Per-network restricted-attempt budget is exhausted. | Cooldown expires or the physical network changes. |
-| `connected` | Re-pin the transfer client to the live tunnel. The guard resumes only the hashes owned by the current incident after positive Wi-Fi trust, fresh internet and DNS health, tunnel-binding readback, and a direct tunnel probe all pass. | VPN or physical network changes. |
+| `connected` | Re-pin the transfer client to the live tunnel interface and address. The guard resumes only the hashes owned by the current incident after positive Wi-Fi trust, fresh internet and DNS health, exact tunnel-binding readback, and a direct tunnel probe all pass. | VPN or physical network changes. |
 
 While ExpressVPN is disconnected, each reconcile pass also checks that the
 Tailscale control state is online and a `100.64/10` sentinel route is owned by
@@ -92,7 +92,7 @@ pause fallback and stays fail-closed rather than guessing later.
 
 Automatic recovery requires operator intent `active`, an explicitly trusted
 current Wi-Fi gateway, fresh successful internet and DNS health, ExpressVPN's
-connected tunnel, matching transfer-client binding readback, and a direct fetch
+connected tunnel, matching interface-and-address binding readback, and a direct fetch
 bound to that tunnel. The guard keeps PF containment loaded through the first
 check, flushes it, then repeats the recovery checks immediately before starting
 only the journaled hashes. Failure re-arms PF. Successful targeted readback
