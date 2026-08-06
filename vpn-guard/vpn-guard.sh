@@ -2,11 +2,13 @@
 # vpn-guard.sh - pause the transfer client and apply PF kill rules unless safe.
 #
 # Safe = ExpressVPN connected AND not on a personal-hotspot SSID.
-# Otherwise: pause all client transfers via Web API and load a PF anchor that
-# blocks the configured transfer ports. Run from a LaunchAgent on network change.
+# Otherwise: journal and stop the incident's exact active set, with a
+# non-resumable pause-all fallback, and load a PF anchor that blocks the
+# configured transfer ports. Run from a LaunchAgent on network change.
 
 set -uo pipefail
 
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXPRESSVPN_CTL="${EXPRESSVPN_CTL:-/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl}"
 CLIENT_WEB_HOST="${CLIENT_WEB_HOST:-http://127.0.0.1:8080}"
 CLIENT_WEB_USER="${CLIENT_WEB_USER:-admin}"
@@ -37,6 +39,8 @@ CLIENT_CONF_FILE="${DARKMESH_CLIENT_CONF:-$HOME/.config/darkmesh/transfer-client
 CLIENT_PROC="${CLIENT_PROC:-TransferClient}"
 TRANSFER_ENDPOINT="${CLIENT_API_BASE:-transfers}"
 LEGACY_KEYCHAIN_SERVICE="${LEGACY_KEYCHAIN_SERVICE:-vpn-guard-legacy}"
+INCIDENT_CTL="${DARKMESH_TRANSFER_INCIDENT_CTL:-$SELF_DIR/darkmesh-transfer-incident}"
+if [[ ! -x "$INCIDENT_CTL" ]]; then INCIDENT_CTL="$(command -v darkmesh-transfer-incident 2>/dev/null || true)"; fi
 
 mkdir -p "$LOG_DIR"
 trap 'rm -f "$COOKIE_JAR"' EXIT
@@ -244,24 +248,31 @@ client_pause_all() {
   pkill -STOP -x "$CLIENT_PROC"
 }
 
-client_resume_all() {
+incident_pending() {
+  [[ -n "$INCIDENT_CTL" && -x "$INCIDENT_CTL" ]] && "$INCIDENT_CTL" pending
+}
+
+incident_contain() {
+  [[ -n "$INCIDENT_CTL" && -x "$INCIDENT_CTL" ]] || return 1
+  "$INCIDENT_CTL" contain "${1:-vpn-unsafe}" >>"$LOG" 2>&1
+}
+
+incident_ready() {
+  [[ -n "$INCIDENT_CTL" && -x "$INCIDENT_CTL" ]] || return 1
+  "$INCIDENT_CTL" ready >>"$LOG" 2>&1
+}
+
+incident_recover() {
+  [[ -n "$INCIDENT_CTL" && -x "$INCIDENT_CTL" ]] || return 1
+  "$INCIDENT_CTL" recover >>"$LOG" 2>&1
+}
+
+# A failed Web UI containment can leave the client process stopped with
+# SIGSTOP. Keep the PF anchor loaded while allowing it to run again so the
+# incident helper can verify the live binding and recover the exact owned set.
+client_thaw_for_recovery() {
   pgrep -x "$CLIENT_PROC" >/dev/null || return 0
   pkill -CONT -x "$CLIENT_PROC" 2>/dev/null || true
-  client_login || { log "WARN: client_login on resume failed (rc=$?)"; return 1; }
-  # Client API 2.11+ (app v5) renamed resume to start; try new then legacy.
-  local ep
-  for ep in start resume; do
-    if curl -fsS --max-time 5 \
-      -b "$COOKIE_JAR" \
-      -H "Referer: $CLIENT_WEB_HOST" \
-      --data "hashes=all" \
-      "$CLIENT_WEB_HOST/api/v2/$TRANSFER_ENDPOINT/$ep" >>"$LOG" 2>&1; then
-      log "client resume-all ok ($ep)"
-      return 0
-    fi
-  done
-  log "WARN: client resume-all failed"
-  return 1
 }
 
 # --- PF helpers --------------------------------------------------------------
@@ -288,9 +299,15 @@ run_pf_quiet() {
 ensure_pf_enabled() {
   pf_enabled_now && return 0
   if run_pf_quiet -E; then
-    log "pf enabled (was disabled)"
+    if pf_enabled_now; then
+      log "pf enabled (was disabled)"
+      return 0
+    fi
+    log "WARN: PF enable command returned without confirmed enforcement"
+    return 1
   else
     log "WARN: could not enable PF (need sudoers entry for 'pfctl -E'?)"
+    return 1
   fi
 }
 
@@ -329,13 +346,21 @@ apply_pf_safe() {
 
 main() {
   if [[ "${1:-}" == --force-unsafe ]]; then
+    local action_ok=yes
     log "forced unsafe: restoring transfer-client containment before network recovery"
-    ensure_pf_enabled
-    apply_pf_unsafe
-    client_pause_all
+    ensure_pf_enabled && apply_pf_unsafe || action_ok=no
+    if [[ "$(transfer_desired)" == active ]]; then
+      if ! incident_contain forced-unsafe; then
+        log "WARN: exact incident inventory unavailable; applying non-resumable pause-all fallback"
+        client_pause_all || action_ok=no
+      fi
+    else
+      client_pause_all || action_ok=no
+    fi
     write_pf_sidecar true
-    log "UNSAFE"
-    return 0
+    if [[ "$action_ok" == yes ]]; then log "UNSAFE"; return 0; fi
+    log "ERROR: forced unsafe containment could not be verified"
+    return 1
   fi
   [[ $# -eq 0 ]] || { echo "Usage: vpn-guard.sh [--force-unsafe]" >&2; return 2; }
 
@@ -356,20 +381,38 @@ main() {
     else
       log "reasserting mode=$mode transfer=$transfer"
     fi
-    if [[ "$mode" == safe ]]; then
-      apply_pf_safe || action_ok=no
-    else
+    if [[ "$mode" == unsafe ]]; then
       ensure_pf_enabled && apply_pf_unsafe || action_ok=no
-    fi
-    if [[ "$transfer" == paused ]]; then
+      if [[ "$(transfer_desired)" == paused ]]; then
+        client_pause_all || action_ok=no
+      elif ! incident_contain vpn-unsafe; then
+        log "WARN: exact incident inventory unavailable; applying non-resumable pause-all fallback"
+        client_pause_all || action_ok=no
+      fi
+    elif [[ "$transfer" == paused ]]; then
+      apply_pf_safe || action_ok=no
       client_pause_all || action_ok=no
-    elif [[ "$transfer" != "$last_transfer" || "$mode" != "$last_mode" ]]; then
-      client_resume_all || action_ok=no
+    elif incident_pending; then
+      # Reassert the port block before thawing a process that a failed Web UI
+      # containment may have left in SIGSTOP. The first readiness check can
+      # then inspect the live binding. After flushing PF, recover repeats the
+      # same checks immediately before starting only the journaled hashes. Any
+      # failure re-arms PF.
+      if ensure_pf_enabled && apply_pf_unsafe && client_thaw_for_recovery \
+          && incident_ready && apply_pf_safe && incident_recover; then
+        log "incident-owned transfer recovery complete"
+      else
+        log "incident recovery not ready; preserving transfer containment"
+        ensure_pf_enabled && apply_pf_unsafe || true
+        action_ok=no
+      fi
+    else
+      apply_pf_safe || action_ok=no
     fi
     [[ "$action_ok" != yes ]] || write_guard_state "$mode" "$transfer" "$now"
   fi
 
-  if [[ "$mode" == safe ]]; then write_pf_sidecar false; else write_pf_sidecar true; fi
+  if [[ "$mode" == safe && "$action_ok" == yes ]]; then write_pf_sidecar false; else write_pf_sidecar true; fi
 }
 
 # Run main only when executed directly; allows sourcing for tests.

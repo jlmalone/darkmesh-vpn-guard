@@ -66,11 +66,12 @@ EVENTS="$TMP/events.log"
 ensure_pf_enabled() { echo pf-enable >> "$EVENTS"; }
 apply_pf_unsafe() { echo pf-unsafe >> "$EVENTS"; }
 client_pause_all() { echo client-pause >> "$EVENTS"; }
+incident_contain() { echo incident-contain >> "$EVENTS"; }
 write_pf_sidecar() { echo "sidecar-$1" >> "$EVENTS"; }
 is_vpn_connected() { fail "forced unsafe unexpectedly probed VPN"; }
 is_hotspot() { fail "forced unsafe unexpectedly probed hotspot"; }
 main --force-unsafe
-[[ "$(tr '\n' ' ' < "$EVENTS")" == "pf-enable pf-unsafe client-pause sidecar-true " ]] \
+[[ "$(tr '\n' ' ' < "$EVENTS")" == "pf-enable pf-unsafe incident-contain sidecar-true " ]] \
   || fail "forced unsafe action sequence was incorrect"
 
 echo "7. a manual pause is honored and unchanged ticks are quiet"
@@ -84,7 +85,7 @@ is_vpn_connected() { return 0; }
 is_hotspot() { return 1; }
 apply_pf_safe() { echo pf-safe >> "$EVENTS"; }
 client_pause_all() { echo client-pause >> "$EVENTS"; }
-client_resume_all() { fail "manual pause was overridden"; }
+incident_pending() { return 1; }
 write_pf_sidecar() { echo "sidecar-$1" >> "$EVENTS"; }
 main
 main
@@ -110,5 +111,48 @@ ensure_pf_enabled() {
 pf_enabled_now || fail "enabled PF was misclassified under pipefail"
 ensure_pf_enabled
 [[ ! -s "$EVENTS" ]] || fail "enabled PF acquired another enable reference"
+
+echo "9. incident recovery verifies, flushes, re-verifies, and targets the journal owner"
+: > "$EVENTS"
+printf 'active\n' > "$TRANSFER_DESIRED_FILE"
+cat > "$GUARD_STATE_FILE" <<EOF
+mode=unsafe
+transfer=paused
+last_action_at=$(date +%s)
+EOF
+incident_pending() { return 0; }
+incident_ready() { echo incident-ready >> "$EVENTS"; }
+incident_recover() { echo incident-recover >> "$EVENTS"; }
+client_thaw_for_recovery() { echo client-thaw >> "$EVENTS"; }
+ensure_pf_enabled() { echo pf-enable >> "$EVENTS"; }
+apply_pf_unsafe() { echo pf-unsafe >> "$EVENTS"; }
+apply_pf_safe() { echo pf-safe >> "$EVENTS"; }
+write_pf_sidecar() { echo "sidecar-$1" >> "$EVENTS"; }
+main
+[[ "$(tr '\n' ' ' < "$EVENTS")" == "pf-enable pf-unsafe client-thaw incident-ready pf-safe incident-recover sidecar-false " ]] \
+  || fail "incident recovery ordering was incorrect"
+
+echo "10. failed post-flush recovery immediately re-arms containment"
+: > "$EVENTS"
+cat > "$GUARD_STATE_FILE" <<EOF
+mode=unsafe
+transfer=paused
+last_action_at=$(date +%s)
+EOF
+incident_recover() { echo incident-recover-failed >> "$EVENTS"; return 1; }
+ensure_pf_enabled() { echo pf-enable >> "$EVENTS"; }
+apply_pf_unsafe() { echo pf-unsafe >> "$EVENTS"; }
+main
+[[ "$(tr '\n' ' ' < "$EVENTS")" == "pf-enable pf-unsafe client-thaw incident-ready pf-safe incident-recover-failed pf-enable pf-unsafe sidecar-true " ]] \
+  || fail "failed recovery did not restore PF containment"
+grep -q '^mode=unsafe$' "$GUARD_STATE_FILE" || fail "failed recovery persisted a false safe state"
+
+echo "11. forced unsafe reports PF enforcement failure to plain-network recovery"
+: > "$EVENTS"
+ensure_pf_enabled() { echo pf-enable-failed >> "$EVENTS"; return 1; }
+incident_contain() { echo incident-contain >> "$EVENTS"; }
+if main --force-unsafe >/dev/null 2>&1; then fail "forced unsafe hid PF enforcement failure"; fi
+[[ "$(tr '\n' ' ' < "$EVENTS")" == "pf-enable-failed incident-contain sidecar-true " ]] \
+  || fail "forced unsafe failure path did not retain app containment evidence"
 
 echo "PASS: vpn-guard hotspot tests"

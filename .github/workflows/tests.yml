@@ -22,7 +22,11 @@ jobs:
       - name: Check shell syntax
         run: |
           find scripts tests vpn-guard -type f \( -name '*.sh' -o -perm -u+x \) -print0 |
-            while IFS= read -r -d '' file; do bash -n "$file"; done
+            while IFS= read -r -d '' file; do
+              case "$(head -n 1 "$file")" in
+                *bash*) bash -n "$file" ;;
+              esac
+            done
       - name: Run mocked tests
         run: |
           for test in tests/*.sh; do

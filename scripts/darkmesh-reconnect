@@ -51,7 +51,9 @@ LOG_DIR="$HOME/Library/Logs/darkmesh"; LOG="$LOG_DIR/reconnect.log"
 ACTION_LOG="$LOG_DIR/actions.log"
 DOCTOR="${DARKMESH_DOCTOR:-$(command -v transfer-vpn-doctor 2>/dev/null || echo "$HOME/.local/bin/transfer-vpn-doctor")}"
 PLAIN_RESTORE="${DARKMESH_PLAIN_RESTORE:-$(command -v darkmesh-restore-plain-network 2>/dev/null || echo "$HOME/.local/bin/darkmesh-restore-plain-network")}"
-TAILSCALE_REPAIR="${DARKMESH_TAILSCALE_REPAIR:-$(command -v darkmesh-repair-tailscale 2>/dev/null || echo "$(cd "$(dirname "$0")" && pwd)/darkmesh-repair-tailscale")}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TAILSCALE_REPAIR="${DARKMESH_TAILSCALE_REPAIR:-$(command -v darkmesh-repair-tailscale 2>/dev/null || echo "$SCRIPT_DIR/darkmesh-repair-tailscale")}"
+VPN_GUARD="${DARKMESH_VPN_GUARD:-$(command -v vpn-guard.sh 2>/dev/null || echo "$SCRIPT_DIR/vpn-guard.sh")}"
 
 INTERVAL_OK="${INTERVAL_OK:-30}"            # poll cadence when healthy / idle
 INTERVAL_RECOVER="${INTERVAL_RECOVER:-10}"  # poll cadence while recovering
@@ -167,17 +169,11 @@ CLIENT_CONF_FILE="${DARKMESH_CLIENT_CONF:-$HOME/.config/darkmesh/transfer-client
 [ -r "$CLIENT_CONF_FILE" ] && . "$CLIENT_CONF_FILE"
 CLIENT_APP="${CLIENT_APP:-TransferClient}"
 CLIENT_CONF="${CLIENT_CONF:-$HOME/.config/$CLIENT_APP/$CLIENT_APP.ini}"
-TAPI="/api/v2/${CLIENT_API_BASE:-transfers}"   # the transfer-list API base
 # Read the Web UI port from the client config so the watchdog always targets the
 # live port and can never silently drift onto another local service's port again.
 client_web_port() { grep -E '^WebUI\\Port=' "$CLIENT_CONF" 2>/dev/null | head -1 | cut -d= -f2 | tr -d '[:space:]'; }
 WEB_PORT="$(client_web_port)"; WEB_PORT="${WEB_PORT:-8080}"
 WEB_HOST="${CLIENT_WEB_HOST:-http://127.0.0.1:$WEB_PORT}"
-# Manual-override intent for the transfer client: "active" (default) or "paused".
-# The server_monitor Pause/Resume buttons and darkmesh-transfer write this; the
-# resume-when-green path below honors it so a manual pause is never overridden.
-TRANSFER_DESIRED_FILE="${DARKMESH_TRANSFER_DESIRED:-$HOME/.config/darkmesh/transfer-desired}"
-[ -f "$TRANSFER_DESIRED_FILE" ] || printf 'active\n' > "$TRANSFER_DESIRED_FILE" 2>/dev/null
 WEB_USER="${CLIENT_WEB_USER:-admin}"
 WEB_KEYCHAIN="${KEYCHAIN_SERVICE:-vpn-guard-client}"
 WEB_COOKIE="$(mktemp -t darkmesh-client 2>/dev/null || echo "/tmp/darkmesh-client.$$")"
@@ -197,18 +193,6 @@ client_bound_addr() { client_api GET /api/v2/app/preferences | python3 -c "impor
 client_repin() {  # <iface> <addr>
   client_api POST /api/v2/app/setPreferences --data-urlencode "json={\"current_network_interface\":\"$1\",\"current_interface_address\":\"$2\"}" >/dev/null 2>&1
 }
-# Count transfers the engine treats as paused/stopped (4.x "paused*", 5.x "stopped*").
-client_paused_count() {
-  client_api GET "$TAPI/info" 2>/dev/null | python3 -c "import json,sys
-data=json.load(sys.stdin)
-print(sum(1 for t in data if any(k in t.get('state','').lower() for k in ('paused','stopped'))))" 2>/dev/null
-}
-# Resume every transfer, live, no restart (5.x /start, 4.x /resume alias).
-client_resume_all() {
-  client_api POST "$TAPI/start" --data 'hashes=all' >/dev/null 2>&1 \
-    || client_api POST "$TAPI/resume" --data 'hashes=all' >/dev/null 2>&1
-}
-
 # Re-pin the transfer client's listen binding to the live tunnel via the Web UI
 # (live, no restart). No-op when already correct; falls back to the doctor only
 # when the Web UI is unreachable. <iface> <addr>
@@ -226,20 +210,9 @@ repin_only() {
     rebind_client   # client/Web UI not up; doctor check (no-op if current)
   fi
 }
-# Resume-when-green: tunnel is up and we are bound to it, so un-pause whatever a
-# VPN-down or tunnel flap left paused. Respects a manual pause: if the operator set
-# transfer-desired=paused (e.g. via the server_monitor Pause button) we stand down.
-# Idempotent: a no-op when nothing is paused. <reason>
-resume_when_green() {
-  local n want
-  want="active"; [ -f "$TRANSFER_DESIRED_FILE" ] && want="$(tr -d '[:space:]' < "$TRANSFER_DESIRED_FILE" 2>/dev/null)"; want="${want:-active}"
-  if [ "$want" != "active" ]; then
-    log "  transfer desired=$want (manual override): not auto-resuming"; return 0
-  fi
-  client_reachable || return 0
-  n="$(client_paused_count)"; [ -n "$n" ] || return 0
-  [ "$n" -gt 0 ] || return 0
-  if client_resume_all; then log "  resumed $n paused transfer(s) [$1]"; fi
+guard_after_repin() {
+  [ -x "$VPN_GUARD" ] || { log "  vpn-guard unavailable; transfer containment remains unchanged"; return 0; }
+  "$VPN_GUARD" >>"$LOG" 2>&1 || log "  vpn-guard kept transfer containment active"
 }
 
 recently_auto_disconnected() {
@@ -504,7 +477,7 @@ while true; do
       repin_only "$tif" "$ip"
       if [ "$ip" != "$last_tunnel_ip" ]; then
         log "tunnel up/changed (${last_tunnel_ip:-none} -> $ip on $tif)"; last_tunnel_ip="$ip"
-        resume_when_green "tunnel-change"
+        guard_after_repin
       fi
     fi
     consecutive_fails=0; failing_since=0; gave_up=false; gave_up_at=0; captive_ticks=0; clear_ticks=0; backoff="$INTERVAL_RECOVER"

@@ -50,6 +50,10 @@ Current responsibilities:
 - Detect unsafe SSIDs / hotspots.
 - Pause or stop the transfer client when unsafe.
 - Honor explicit `transfer-desired=paused` intent even when the VPN is safe.
+- Keep operator pause distinct from automatic containment. Automatic recovery
+  may start only hashes recorded as active in the current incident journal.
+- Require an explicitly enrolled Wi-Fi identity plus fresh VPN, internet, DNS,
+  tunnel, and client-binding evidence before incident recovery.
 - Load PF kill rules when unsafe (nested under `com.apple/vpn-guard` so the main
   ruleset's `com.apple/*` wildcard evaluates them); flush them when safe.
 - Ensure PF is enabled, and publish PF state to the status file.

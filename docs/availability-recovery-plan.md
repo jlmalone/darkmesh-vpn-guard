@@ -263,6 +263,12 @@ reconnect, attempts capped, escalation logged, Tailscale never lost.
 
 ## 8. Phase 2 — Auto-rebind the transfer client after (re)connect
 
+> **Incident recovery superseded 2026-08-04:** the historical broad-resume
+> mechanism described in this section has been removed. `vpn-guard` now owns an
+> exact-hash incident journal and resumes only that set after positive Wi-Fi
+> trust plus fresh VPN, internet, DNS, tunnel, and binding verification. See
+> [`network-resilience-state-machine.md`](./network-resilience-state-machine.md#transfer-incident-ownership).
+
 **Fix:** `--fix --quit` quits + edits but **does not relaunch**, and vpn-guard
 `client_resume_all()` **returns early if the client isn't running** (`vpn-guard.sh:133-134`).
 So the v1 "fix then resume" chain is broken.

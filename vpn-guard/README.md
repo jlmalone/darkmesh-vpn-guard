@@ -17,8 +17,9 @@ Detection uses deterministic ground truth instead of fragile signals:
 
 Defense in depth:
 
-1. App-level: pause all transfers via the client's local Web UI API, with a
-   `pkill -STOP` fallback if the API is unreachable.
+1. App-level: atomically journal and stop the exact hashes active at incident
+   entry. If inventory is unavailable, use a non-resumable pause-all or
+   `pkill -STOP` fallback and never guess what to restart.
 2. Network-level: PF anchor `vpn-guard` blocks the configured listen port
    `56378` and the legacy peer-transfer range on every interface, IPv4 + IPv6.
 
@@ -92,6 +93,13 @@ anchor should be empty. The transfer client runs only when its explicit intent
 is `active`; a manual `paused` intent is never overridden by the guard.
 Disconnect VPN and, within about 30 seconds or on the next network event, the
 client pauses and the anchor populates with block rules.
+
+Automatic recovery is stricter than ordinary safe classification. It requires
+the current Wi-Fi gateway in a separate positive trust file, fresh internet and
+DNS health, a direct tunnel probe, and verified client binding. Enroll a
+known-safe current Wi-Fi with `darkmesh-transfer trust-current`. Incident state
+lives under `~/.local/state/darkmesh/transfer-incidents/` with mode `0700`; its
+journals and retained recovery receipts use mode `0600`.
 
 ## Caveats
 

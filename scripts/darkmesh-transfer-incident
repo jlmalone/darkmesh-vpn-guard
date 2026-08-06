@@ -1,0 +1,371 @@
+#!/bin/bash
+# Incident-scoped transfer containment. Network automation records and stops only
+# transfers that were active when an unsafe incident began, then starts exactly
+# that set after the trusted-network and recovered-VPN gates pass.
+set -uo pipefail
+
+umask 077
+
+CLIENT_CONF_FILE="${DARKMESH_CLIENT_CONF:-$HOME/.config/darkmesh/transfer-client.conf}"
+[ -r "$CLIENT_CONF_FILE" ] && . "$CLIENT_CONF_FILE"
+
+CLIENT_APP="${CLIENT_APP:-TransferClient}"
+CLIENT_CONF="${CLIENT_CONF:-$HOME/.config/$CLIENT_APP/$CLIENT_APP.ini}"
+CLIENT_PROC="${CLIENT_PROC:-TransferClient}"
+CLIENT_WEB_USER="${CLIENT_WEB_USER:-admin}"
+CLIENT_WEB_HOST="${CLIENT_WEB_HOST:-}"
+CLIENT_API_BASE="${CLIENT_API_BASE:-transfers}"
+KEYCHAIN_SERVICE="${KEYCHAIN_SERVICE:-vpn-guard-client}"
+LEGACY_KEYCHAIN_SERVICE="${LEGACY_KEYCHAIN_SERVICE:-vpn-guard-legacy}"
+EXPRESSVPN_CTL="${EXPRESSVPN_CTL:-/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl}"
+TRUSTED_NETWORKS_FILE="${DARKMESH_TRUSTED_TRANSFER_NETWORKS:-$HOME/.config/darkmesh/trusted-transfer-networks}"
+HEALTH_STATUS_FILE="${DARKMESH_STATUS_FILE:-/tmp/darkmesh-status.json}"
+DESIRED_FILE="${DARKMESH_TRANSFER_DESIRED:-$HOME/.config/darkmesh/transfer-desired}"
+STATE_DIR="${DARKMESH_TRANSFER_INCIDENT_DIR:-$HOME/.local/state/darkmesh/transfer-incidents}"
+ACTIVE_JOURNAL="${DARKMESH_TRANSFER_INCIDENT_JOURNAL:-$STATE_DIR/active.json}"
+HISTORY_DIR="${DARKMESH_TRANSFER_INCIDENT_HISTORY:-$STATE_DIR/history}"
+LOCK_DIR="${DARKMESH_TRANSFER_INCIDENT_LOCK:-$STATE_DIR/.lock}"
+LOCK_STALE_SECONDS="${DARKMESH_TRANSFER_INCIDENT_LOCK_STALE:-120}"
+[[ "$LOCK_STALE_SECONDS" =~ ^[0-9]+$ ]] || LOCK_STALE_SECONDS=120
+VPN_PROBE_URL="${DARKMESH_VPN_PROBE_URL:-https://www.google.com/generate_204}"
+TAPI="/api/v2/$CLIENT_API_BASE"
+COOKIE_JAR="$(mktemp -t darkmesh-incident 2>/dev/null || printf '/tmp/darkmesh-incident.%s' "$$")"
+LOCK_HELD=no
+
+cleanup() {
+  rm -f "$COOKIE_JAR" 2>/dev/null || true
+  if [ "$LOCK_HELD" = yes ]; then
+    rm -f "$LOCK_DIR/pid" 2>/dev/null || true
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+
+log() { printf '%s\n' "$*" >&2; }
+
+client_web_port() {
+  grep -E '^WebUI\\Port=' "$CLIENT_CONF" 2>/dev/null | head -1 | cut -d= -f2 | tr -d '[:space:]'
+}
+
+if [ -z "$CLIENT_WEB_HOST" ]; then
+  WEB_PORT="$(client_web_port)"; WEB_PORT="${WEB_PORT:-8080}"
+  CLIENT_WEB_HOST="http://127.0.0.1:$WEB_PORT"
+fi
+
+client_password() {
+  if [ -n "${DARKMESH_CLIENT_PASSWORD:-}" ]; then printf '%s' "$DARKMESH_CLIENT_PASSWORD"; return 0; fi
+  security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null && return 0
+  security find-generic-password -s "$LEGACY_KEYCHAIN_SERVICE" -w 2>/dev/null
+}
+
+client_api() { # METHOD PATH [curl arguments]
+  local method="$1" path="$2"; shift 2
+  curl -fsS --max-time 5 -X "$method" -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -H "Referer: $CLIENT_WEB_HOST" "$CLIENT_WEB_HOST$path" "$@" 2>/dev/null
+}
+
+client_login() {
+  local password
+  password="$(client_password)" || return 1
+  curl -fsS --max-time 5 -c "$COOKIE_JAR" -H "Referer: $CLIENT_WEB_HOST" \
+    --data-urlencode "username=$CLIENT_WEB_USER" --data-urlencode "password=$password" \
+    "$CLIENT_WEB_HOST/api/v2/auth/login" >/dev/null 2>&1
+}
+
+client_reachable() {
+  client_api GET /api/v2/app/version >/dev/null 2>&1 \
+    || { client_login && client_api GET /api/v2/app/version >/dev/null 2>&1; }
+}
+
+acquire_lock() {
+  local owner modified=0 now age=0
+  mkdir -p "$STATE_DIR" "$HISTORY_DIR" || return 1
+  chmod 700 "$STATE_DIR" "$HISTORY_DIR" 2>/dev/null || true
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" > "$LOCK_DIR/pid"
+    LOCK_HELD=yes
+    return 0
+  fi
+  owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+  modified="$(stat -f %m "$LOCK_DIR" 2>/dev/null || echo 0)"
+  now="$(date +%s)"
+  [[ "$modified" =~ ^[0-9]+$ ]] || modified=0
+  age=$((now - modified))
+  if { [ -z "$owner" ] || ! kill -0 "$owner" 2>/dev/null || [ "$age" -gt "$LOCK_STALE_SECONDS" ]; }; then
+    rm -f "$LOCK_DIR/pid" 2>/dev/null || return 1
+    rmdir "$LOCK_DIR" 2>/dev/null || return 1
+    mkdir "$LOCK_DIR" 2>/dev/null || return 1
+    printf '%s\n' "$$" > "$LOCK_DIR/pid"
+    LOCK_HELD=yes
+    return 0
+  fi
+  log "transfer incident operation already in progress"
+  return 1
+}
+
+desired_is_active() {
+  local desired=active
+  [ ! -f "$DESIRED_FILE" ] || desired="$(tr -d '[:space:]' < "$DESIRED_FILE" 2>/dev/null)"
+  [ "$desired" = active ]
+}
+
+active_hashes() {
+  client_api GET "$TAPI/info" | python3 -c '
+import json, re, sys
+items=json.load(sys.stdin)
+for item in items:
+    state=str(item.get("state", "")).lower()
+    value=str(item.get("hash", "")).lower()
+    if any(word in state for word in ("paused", "stopped")):
+        continue
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value):
+        raise SystemExit(2)
+    print(value)
+' | sort -u
+}
+
+write_open_journal() { # hash-file reason
+  local hashes="$1" reason="$2" tmp
+  tmp="$(mktemp "$STATE_DIR/.active.XXXXXX")" || return 1
+  INCIDENT_REASON="$reason" python3 - "$hashes" > "$tmp" <<'PY'
+import datetime, json, os, sys
+hashes=[line.strip() for line in open(sys.argv[1]) if line.strip()]
+now=datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+print(json.dumps({
+    "schema": 1,
+    "component": "darkmesh-transfer-incident",
+    "status": "contained",
+    "opened_at": now,
+    "reason": os.environ.get("INCIDENT_REASON", "network-unsafe"),
+    "active_hashes": hashes,
+}, indent=2, sort_keys=True))
+PY
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$ACTIVE_JOURNAL"
+}
+
+journal_hashes() {
+  python3 - "$ACTIVE_JOURNAL" <<'PY'
+import json, re, sys
+data=json.load(open(sys.argv[1]))
+if data.get("schema") != 1 or data.get("status") != "contained": raise SystemExit(2)
+for value in data.get("active_hashes", []):
+    value=str(value).lower()
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value): raise SystemExit(2)
+    print(value)
+PY
+}
+
+journal_is_secure() {
+  local mode owner
+  mode="$(stat -f %Lp "$ACTIVE_JOURNAL" 2>/dev/null || true)"
+  owner="$(stat -f %u "$ACTIVE_JOURNAL" 2>/dev/null || true)"
+  [ "$mode" = 600 ] && [ "$owner" = "$(id -u)" ]
+}
+
+trusted_file_is_secure() {
+  local mode owner
+  mode="$(stat -f %Lp "$TRUSTED_NETWORKS_FILE" 2>/dev/null || true)"
+  owner="$(stat -f %u "$TRUSTED_NETWORKS_FILE" 2>/dev/null || true)"
+  [ "$mode" = 600 ] && [ "$owner" = "$(id -u)" ]
+}
+
+post_hashes() { # action hash-file
+  local action="$1" hashes="$2" joined endpoint
+  joined="$(paste -sd '|' "$hashes")"
+  [ -n "$joined" ] || return 0
+  case "$action" in
+    stop) for endpoint in stop pause; do client_api POST "$TAPI/$endpoint" --data-urlencode "hashes=$joined" >/dev/null && return 0; done ;;
+    start) for endpoint in start resume; do client_api POST "$TAPI/$endpoint" --data-urlencode "hashes=$joined" >/dev/null && return 0; done ;;
+    *) return 2 ;;
+  esac
+  return 1
+}
+
+tunnel_iface() {
+  netstat -rn -f inet 2>/dev/null | awk '$1 == "0/1" && $NF ~ /^utun[0-9]+$/ {print $NF; exit}'
+}
+
+tunnel_ip() {
+  local iface
+  iface="$(tunnel_iface)"; [ -n "$iface" ] || return 1
+  ifconfig "$iface" 2>/dev/null | awk '/inet / {print $2; exit}'
+}
+
+vpn_recovery_verified() {
+  if [ -n "${DARKMESH_VPN_VERIFY_CMD:-}" ]; then "$DARKMESH_VPN_VERIFY_CMD"; return; fi
+  local status tip bound code
+  status="$("$EXPRESSVPN_CTL" --timeout 3 status 2>/dev/null | head -1)"
+  [[ "$status" =~ ^Connected\ to\ [^[:space:]]+$ ]] || return 1
+  tip="$(tunnel_ip)"; [ -n "$tip" ] || return 1
+  bound="$(client_api GET /api/v2/app/preferences | python3 -c 'import json,sys; print(json.load(sys.stdin).get("current_interface_address", ""))' 2>/dev/null)"
+  [ "$bound" = "$tip" ] || return 1
+  python3 - "$HEALTH_STATUS_FILE" <<'PY' || return 1
+import datetime, json, os, sys, time
+path=sys.argv[1]
+data=json.load(open(path))
+stamp=datetime.datetime.fromisoformat(data["timestamp"].replace("Z", "+00:00")).timestamp()
+age=max(time.time()-stamp, time.time()-os.path.getmtime(path))
+if age > min(int(data.get("max_age_seconds", 60)), 60): raise SystemExit(1)
+if data.get("vpn_state") != "Connected": raise SystemExit(1)
+if data.get("internet_ok") is not True or data.get("dns_ok") is not True: raise SystemExit(1)
+PY
+  code="$(curl -4 -sS --max-time 8 --interface "$tip" -o /dev/null -w '%{http_code}' "$VPN_PROBE_URL" 2>/dev/null)"
+  [ "$code" = 204 ] || [ "$code" = 200 ]
+}
+
+active_wifi_iface() {
+  networksetup -listallhardwareports 2>/dev/null | awk '/Hardware Port: Wi-Fi/{getline; print $2; exit}'
+}
+
+trusted_wifi() {
+  if [ -n "${DARKMESH_TRUST_VERIFY_CMD:-}" ]; then "$DARKMESH_TRUST_VERIFY_CMD"; return; fi
+  local mac
+  mac="$(current_wifi_identity)" || return 1
+  [ -n "$mac" ] && [ -s "$TRUSTED_NETWORKS_FILE" ] || return 1
+  trusted_file_is_secure || return 1
+  awk '{sub(/[[:space:]]*#.*/,""); gsub(/[[:space:]]/,""); if(length) print tolower($0)}' \
+    "$TRUSTED_NETWORKS_FILE" | grep -xF "$mac" >/dev/null
+}
+
+current_wifi_identity() {
+  local wifi route_iface gateway mac
+  wifi="$(active_wifi_iface)"; [ -n "$wifi" ] || return 1
+  route_iface="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
+  [ "$route_iface" = "$wifi" ] || return 1
+  gateway="$(route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}')"
+  mac="$(arp -n "$gateway" 2>/dev/null | sed -nE 's/.* at ([0-9a-fA-F:]+) on .*/\1/p' | head -1 | tr '[:upper:]' '[:lower:]')"
+  [[ "$mac" =~ ^([0-9a-f]{1,2}:){5}[0-9a-f]{1,2}$ ]] || return 1
+  printf '%s' "$mac"
+}
+
+trust_current() {
+  local mac tmp
+  mac="$(current_wifi_identity)" || { log "no stable current Wi-Fi gateway identity is available"; return 1; }
+  mkdir -p "$(dirname "$TRUSTED_NETWORKS_FILE")" || return 1
+  if [ -s "$TRUSTED_NETWORKS_FILE" ] && awk '{sub(/[[:space:]]*#.*/,""); gsub(/[[:space:]]/,""); if(length) print tolower($0)}' \
+      "$TRUSTED_NETWORKS_FILE" | grep -xF "$mac" >/dev/null; then
+    chmod 600 "$TRUSTED_NETWORKS_FILE" 2>/dev/null || true
+    log "current Wi-Fi is already trusted for incident recovery"
+    return 0
+  fi
+  tmp="$(mktemp "${TRUSTED_NETWORKS_FILE}.tmp.XXXXXX")" || return 1
+  [ ! -f "$TRUSTED_NETWORKS_FILE" ] || cat "$TRUSTED_NETWORKS_FILE" > "$tmp"
+  printf '%s\n' "$mac" >> "$tmp"
+  chmod 600 "$tmp" && mv -f "$tmp" "$TRUSTED_NETWORKS_FILE"
+  log "current Wi-Fi trusted for incident recovery"
+}
+
+verify_started_or_absent() { # expected hash-file
+  local expected="$1" observed
+  observed="$(mktemp "$STATE_DIR/.observed.XXXXXX")" || return 1
+  client_api GET "$TAPI/info" | python3 -c '
+import json, sys
+for item in json.load(sys.stdin):
+    print("%s\t%s" % (str(item.get("hash", "")).lower(), str(item.get("state", "")).lower()))
+' > "$observed" || { rm -f "$observed"; return 1; }
+  python3 - "$expected" "$observed" <<'PY'
+import sys
+expected={line.strip() for line in open(sys.argv[1]) if line.strip()}
+states={}
+for line in open(sys.argv[2]):
+    value, _, state=line.rstrip("\n").partition("\t")
+    states[value]=state
+bad=[value for value in expected if value in states and any(word in states[value] for word in ("paused", "stopped"))]
+raise SystemExit(1 if bad else 0)
+PY
+  local rc=$?
+  rm -f "$observed"
+  return "$rc"
+}
+
+archive_journal() {
+  local stamp target tmp
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  target="$HISTORY_DIR/$stamp-$$.json"
+  tmp="$(mktemp "$HISTORY_DIR/.closed.XXXXXX")" || return 1
+  python3 - "$ACTIVE_JOURNAL" > "$tmp" <<'PY'
+import datetime, json, sys
+data=json.load(open(sys.argv[1]))
+data["status"]="recovered"
+data["recovered_at"]=datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+print(json.dumps(data, indent=2, sort_keys=True))
+PY
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$target" && rm -f "$ACTIVE_JOURNAL"
+}
+
+contain() {
+  local reason="${1:-network-unsafe}" hashes
+  acquire_lock || return 1
+  desired_is_active || { log "operator pause is active; no automatic incident ownership recorded"; return 0; }
+  if [ -f "$ACTIVE_JOURNAL" ]; then
+    journal_is_secure || { log "transfer incident journal permissions or ownership are unsafe"; return 2; }
+    client_reachable || { log "cannot reassert the journaled transfer set"; return 1; }
+    hashes="$(mktemp "$STATE_DIR/.reassert.XXXXXX")" || return 1
+    journal_hashes > "$hashes" || { rm -f "$hashes"; log "invalid transfer incident journal"; return 2; }
+    post_hashes stop "$hashes" || { rm -f "$hashes"; log "failed to reassert the journaled transfer set"; return 1; }
+    rm -f "$hashes"
+    log "transfer incident already contained; exact stop reasserted"
+    return 0
+  fi
+  pgrep -x "$CLIENT_PROC" >/dev/null || { log "transfer client not running; no active set to journal"; return 0; }
+  client_reachable || { log "cannot inventory transfer client; refusing resumable containment"; return 1; }
+  hashes="$(mktemp "$STATE_DIR/.hashes.XXXXXX")" || return 1
+  active_hashes > "$hashes" || { rm -f "$hashes"; log "cannot inventory active transfer hashes"; return 1; }
+  write_open_journal "$hashes" "$reason" || { rm -f "$hashes"; return 1; }
+  if ! post_hashes stop "$hashes"; then
+    rm -f "$hashes"
+    log "failed to stop the journaled transfer set"
+    return 1
+  fi
+  log "contained $(wc -l < "$hashes" | tr -d '[:space:]') incident-owned transfer(s)"
+  rm -f "$hashes"
+}
+
+recover() {
+  local hashes
+  acquire_lock || return 1
+  [ -f "$ACTIVE_JOURNAL" ] || { log "no pending transfer incident"; return 0; }
+  journal_is_secure || { log "transfer incident journal permissions or ownership are unsafe"; return 2; }
+  desired_is_active || { log "operator pause is active; incident recovery standing down"; return 3; }
+  trusted_wifi || { log "current Wi-Fi is not explicitly trusted; incident recovery standing down"; return 4; }
+  client_reachable || { log "transfer client unavailable; incident recovery standing down"; return 5; }
+  vpn_recovery_verified || { log "VPN recovery is not verified; incident recovery standing down"; return 6; }
+  hashes="$(mktemp "$STATE_DIR/.recover.XXXXXX")" || return 1
+  journal_hashes > "$hashes" || { rm -f "$hashes"; log "invalid transfer incident journal"; return 2; }
+  post_hashes start "$hashes" || { rm -f "$hashes"; log "failed to start the incident-owned transfer set"; return 1; }
+  verify_started_or_absent "$hashes" || { rm -f "$hashes"; log "incident-owned transfer set did not converge"; return 1; }
+  archive_journal || { rm -f "$hashes"; return 1; }
+  log "recovered $(wc -l < "$hashes" | tr -d '[:space:]') incident-owned transfer(s)"
+  rm -f "$hashes"
+}
+
+ready() {
+  desired_is_active || { log "operator pause is active; incident recovery standing down"; return 3; }
+  trusted_wifi || { log "current Wi-Fi is not explicitly trusted; incident recovery standing down"; return 4; }
+  client_reachable || { log "transfer client unavailable; incident recovery standing down"; return 5; }
+  vpn_recovery_verified || { log "VPN recovery is not verified; incident recovery standing down"; return 6; }
+}
+
+status() {
+  if [ ! -f "$ACTIVE_JOURNAL" ]; then printf 'transfer incident: none\n'; return 1; fi
+  python3 - "$ACTIVE_JOURNAL" <<'PY'
+import json, sys
+data=json.load(open(sys.argv[1]))
+print("transfer incident: pending hashes=%d opened_at=%s reason=%s" % (
+    len(data.get("active_hashes", [])), data.get("opened_at", "?"), data.get("reason", "?")))
+PY
+}
+
+cmd="${1:-status}"; shift 2>/dev/null || true
+case "$cmd" in
+  contain) contain "${1:-network-unsafe}" ;;
+  recover) recover ;;
+  ready) ready ;;
+  trust-current) trust_current ;;
+  pending) [ -f "$ACTIVE_JOURNAL" ] ;;
+  status) status ;;
+  *) echo "usage: darkmesh-transfer-incident {contain [reason]|ready|recover|pending|status|trust-current}" >&2; exit 2 ;;
+esac

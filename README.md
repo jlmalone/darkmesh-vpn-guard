@@ -35,6 +35,11 @@ falling back to Wi-Fi or Tailscale.
 `vpn-guard` remains the safety layer for unsafe states. It checks ExpressVPN,
 hotspot state, client reachability, and PF rules.
 
+Network containment is incident-scoped. The guard journals the exact hashes
+that were active before it stops them, without changing the operator's separate
+`transfer-desired` pause intent. After recovery it starts only that journaled
+set. A transfer that was already paused is never auto-started.
+
 `darkmesh-healthcheck` is the remote-access safety net. One launchd-owned
 `--watch` instance probes every 20s: VPN state, raw IP, a real fetch by name,
 system DNS, Tailscale, and (when installed/required) Chrome Remote Desktop.
@@ -271,6 +276,27 @@ placeholder. Nothing in it is a secret (the WebUI password stays in the macOS Ke
 under `vpn-guard-client`); the values are simply environment specific, so they live out
 of version control. If the file is absent the scripts still run, against the neutral
 defaults.
+
+Automatic incident recovery also requires positive trust for the current Wi-Fi.
+While connected to a network you explicitly trust, enroll its gateway identity:
+
+```bash
+darkmesh-transfer trust-current
+```
+
+The untracked mode-`0600` allowlist is
+`~/.config/darkmesh/trusted-transfer-networks`. Trust is not inferred from the
+absence of hotspot evidence. Until a network is enrolled, containment remains
+active and the incident journal is preserved.
+
+If operator intent was left paused but the existing stopped set must remain
+unchanged, repair only the intent before selecting items in the client:
+
+```bash
+darkmesh-transfer activate
+```
+
+Unlike `resume`, `activate` never starts the full stopped set.
 
 **Contributors:** please never commit a real transfer-client product name, a host name,
 or file-distribution vocabulary specific to one workload. This repo and its full git

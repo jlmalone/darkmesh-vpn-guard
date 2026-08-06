@@ -1,17 +1,21 @@
 #!/bin/bash
 # darkmesh-transfer: live, no-restart control + status for the transfer client via
 # its localhost Web UI. Backs the server_monitor transfer panel + Pause/Resume
-# buttons, and is the same lever darkmesh-reconnect's resume-when-green uses.
+# buttons. Automatic network recovery is owned separately by the incident journal.
 #
 #   darkmesh-transfer status [--json]   print state + write /tmp/darkmesh-transfer.json
 #   darkmesh-transfer pause             desired=paused + stop every transfer (no restart)
-#   darkmesh-transfer resume            desired=active + start every transfer (no restart)
+#   darkmesh-transfer activate          desired=active without starting stopped transfers
+#   darkmesh-transfer resume            desired=active; recover an incident exactly,
+#                                       otherwise explicitly start every transfer
 #   darkmesh-transfer toggle            flip paused <-> active
+#   darkmesh-transfer trust-current     allow incident recovery on this Wi-Fi
 #
 # Manual intent lives in ~/.config/darkmesh/transfer-desired ("active"|"paused").
-# reconnect's resume-when-green honors it, so a manual pause is never overridden by
-# the network-change auto-resume. Nothing here ever restarts the client.
+# incident recovery honors it, so a manual pause is never overridden by a
+# network-change recovery. Nothing here ever restarts the client.
 set -uo pipefail
+umask 077
 
 # Real transfer-client specifics (app / process / .ini section / API base) load
 # from untracked local config; this public repo ships only neutral fallbacks.
@@ -19,9 +23,12 @@ CLIENT_CONF_FILE="${DARKMESH_CLIENT_CONF:-$HOME/.config/darkmesh/transfer-client
 [ -r "$CLIENT_CONF_FILE" ] && . "$CLIENT_CONF_FILE"
 CLIENT_APP="${CLIENT_APP:-TransferClient}"
 CLIENT_CONF="${CLIENT_CONF:-$HOME/.config/$CLIENT_APP/$CLIENT_APP.ini}"
+CLIENT_PROC="${CLIENT_PROC:-TransferClient}"
 TAPI="/api/v2/${CLIENT_API_BASE:-transfers}"   # the transfer-list API base
 DESIRED_FILE="${DARKMESH_TRANSFER_DESIRED:-$HOME/.config/darkmesh/transfer-desired}"
 STATUS_JSON="${DARKMESH_TRANSFER_STATUS:-/tmp/darkmesh-transfer.json}"
+INCIDENT_CTL="${DARKMESH_TRANSFER_INCIDENT_CTL:-$(cd "$(dirname "$0")" && pwd)/darkmesh-transfer-incident}"
+[ -x "$INCIDENT_CTL" ] || INCIDENT_CTL="$(command -v darkmesh-transfer-incident 2>/dev/null || true)"
 
 client_web_port() { grep -E '^WebUI\\Port=' "$CLIENT_CONF" 2>/dev/null | head -1 | cut -d= -f2 | tr -d '[:space:]'; }
 WEB_PORT="$(client_web_port)"; WEB_PORT="${WEB_PORT:-8080}"
@@ -53,9 +60,32 @@ tunnel_ip() {
   ifconfig "$iface" 2>/dev/null | awk '/inet /{print $2; exit}'
 }
 
-set_desired() { printf '%s\n' "$1" > "$DESIRED_FILE"; }
-do_pause()  { set_desired paused; client_api POST "$TAPI/stop"  --data 'hashes=all' >/dev/null 2>&1 || client_api POST "$TAPI/pause"  --data 'hashes=all' >/dev/null 2>&1; }
-do_resume() { set_desired active; client_api POST "$TAPI/start" --data 'hashes=all' >/dev/null 2>&1 || client_api POST "$TAPI/resume" --data 'hashes=all' >/dev/null 2>&1; }
+set_desired() {
+  local tmp
+  tmp="$(mktemp "${DESIRED_FILE}.tmp.XXXXXX")" || return 1
+  printf '%s\n' "$1" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$DESIRED_FILE"
+}
+pause_all_api() {
+  client_reachable || return 1
+  client_api POST "$TAPI/stop" --data 'hashes=all' >/dev/null 2>&1 \
+    || client_api POST "$TAPI/pause" --data 'hashes=all' >/dev/null 2>&1
+}
+resume_all_api() {
+  # Explicit operator recovery also clears a prior SIGSTOP fallback. Starting
+  # transfers remains an API action, so already stopped items change only when
+  # this explicit broad-resume command is used.
+  pkill -CONT -x "$CLIENT_PROC" 2>/dev/null || true
+  client_reachable || return 1
+  client_api POST "$TAPI/start" --data 'hashes=all' >/dev/null 2>&1 \
+    || client_api POST "$TAPI/resume" --data 'hashes=all' >/dev/null 2>&1
+}
+incident_pending() { [ -n "$INCIDENT_CTL" ] && [ -x "$INCIDENT_CTL" ] && "$INCIDENT_CTL" pending; }
+do_pause() { set_desired paused && pause_all_api; }
+do_activate() { set_desired active; }
+do_resume() {
+  do_activate || return 1
+  if incident_pending; then "$INCIDENT_CTL" recover; else resume_all_api; fi
+}
 
 # Build the runtime status JSON (server_monitor reads this) and echo it.
 write_status() {
@@ -65,7 +95,10 @@ write_status() {
   client_reachable && reachable=true
   info="$(client_api GET "$TAPI/info" 2>/dev/null)"
   prefs="$(client_api GET /api/v2/app/preferences 2>/dev/null)"
+  local incident=false
+  incident_pending && incident=true
   TRANSFER_REACHABLE="$reachable" TRANSFER_DESIRED="$want" TRANSFER_PORT="$WEB_PORT" \
+  TRANSFER_INCIDENT="$incident" \
   TRANSFER_TUNNEL="$tip" TRANSFER_INFO="$info" TRANSFER_PREFS="$prefs" \
   python3 - "$STATUS_JSON" <<'PY'
 import json,os,sys
@@ -86,6 +119,7 @@ out={
  "component":"darkmesh-transfer",
  "reachable": os.environ.get('TRANSFER_REACHABLE')=='true',
  "desired": os.environ.get('TRANSFER_DESIRED','active'),
+ "incident_pending": os.environ.get('TRANSFER_INCIDENT')=='true',
  "web_port": int(os.environ.get('TRANSFER_PORT') or 0),
  "bound_address": bound,
  "tunnel_address": tunnel,
@@ -114,19 +148,46 @@ case "$cmd" in
     write_status
     ;;
   pause)
-    do_pause; write_status >/dev/null
-    echo "transfer client: PAUSED (desired=paused; auto-resume will stand down until you resume)"
+    if do_pause; then
+      write_status >/dev/null
+      echo "transfer client: PAUSED (operator intent=paused; incident recovery will stand down)"
+    else
+      echo "transfer client: pause requested but client confirmation failed" >&2; exit 1
+    fi
     ;;
   resume)
-    do_resume; write_status >/dev/null
-    echo "transfer client: RESUMED (desired=active)"
+    if do_resume; then
+      write_status >/dev/null
+      echo "transfer client: RESUMED (operator intent=active)"
+    else
+      echo "transfer client: active requested; recovery remains contained until its safety gates pass" >&2; exit 1
+    fi
+    ;;
+  activate)
+    if do_activate; then
+      write_status >/dev/null
+      echo "transfer client: ACTIVE intent set (existing stopped items unchanged)"
+    else
+      echo "transfer client: active intent could not be persisted" >&2; exit 1
+    fi
     ;;
   toggle)
     want="$(read_desired)"
-    if [ "$want" = "paused" ]; then do_resume; echo "transfer client: RESUMED"; else do_pause; echo "transfer client: PAUSED"; fi
+    if [ "$want" = "paused" ]; then
+      do_resume || { echo "transfer client: active requested; recovery remains contained" >&2; exit 1; }
+      echo "transfer client: RESUMED"
+    else
+      do_pause || { echo "transfer client: pause confirmation failed" >&2; exit 1; }
+      echo "transfer client: PAUSED"
+    fi
     write_status >/dev/null
     ;;
+  trust-current)
+    [ -n "$INCIDENT_CTL" ] && [ -x "$INCIDENT_CTL" ] \
+      || { echo "transfer incident helper unavailable" >&2; exit 1; }
+    "$INCIDENT_CTL" trust-current
+    ;;
   *)
-    echo "usage: darkmesh-transfer {status [--json]|pause|resume|toggle}" >&2; exit 2
+    echo "usage: darkmesh-transfer {status [--json]|pause|activate|resume|toggle|trust-current}" >&2; exit 2
     ;;
 esac
