@@ -475,7 +475,16 @@ recover_crd_tick() {
 
 valid_json_or_null() {
   local file="$1"
-  if [[ -s "$file" ]] && /usr/bin/plutil -p "$file" >/dev/null 2>&1; then cat "$file"; else printf 'null'; fi
+  if [[ -s "$file" ]] && /usr/bin/python3 - "$file" <<'PY' >/dev/null 2>&1
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    json.load(stream)
+PY
+  then
+    cat "$file"
+  else
+    printf 'null'
+  fi
 }
 
 infrastructure_healthy() {
