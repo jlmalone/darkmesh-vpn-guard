@@ -114,8 +114,11 @@ fi
 
 if [[ -x "$ROOT_HELPER" ]]; then
   record root_helper.present true "root helper present"
+  root_helper_hash="$(LC_ALL=C /usr/bin/shasum -a 256 "$ROOT_HELPER" 2>/dev/null | awk 'NF {print $1; exit}')"
+  installed_helper_hash="$(LC_ALL=C /usr/bin/shasum -a 256 "$BIN_DIR/darkmesh-root-helper" 2>/dev/null | awk 'NF {print $1; exit}')"
   if [[ -f "$BIN_DIR/darkmesh-root-helper" ]] \
-      && [[ "$(shasum -a 256 "$ROOT_HELPER" | awk '{print $1}')" == "$(shasum -a 256 "$BIN_DIR/darkmesh-root-helper" | awk '{print $1}')" ]]; then
+      && [[ -n "$root_helper_hash" ]] \
+      && [[ "$root_helper_hash" == "$installed_helper_hash" ]]; then
     record root_helper.hash true "root helper hash matches deployed user tools"
   else
     record root_helper.hash false "root helper hash mismatch"
