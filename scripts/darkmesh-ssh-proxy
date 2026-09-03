@@ -1,0 +1,66 @@
+#!/bin/bash
+# Stable OpenSSH ProxyCommand transport for a private Tailscale destination.
+# Selects a transport before SSH starts; it never replays an SSH command.
+set -uo pipefail
+
+usage() {
+  echo "Usage: darkmesh-ssh-proxy <host> <port>" >&2
+  exit 2
+}
+
+[[ $# -eq 2 ]] || usage
+host="$1"
+port="$2"
+[[ -n "$host" && "$host" != -* ]] || usage
+[[ "$port" =~ ^[0-9]+$ ]] && (( port > 0 && port <= 65535 )) || usage
+
+TAILSCALE_CLI="${TAILSCALE_CLI:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
+STATUS_DEADLINE="${DARKMESH_SSH_STATUS_DEADLINE:-5}"
+DIRECT_DEADLINE="${DARKMESH_SSH_DIRECT_DEADLINE:-8}"
+[[ "$STATUS_DEADLINE" =~ ^[0-9]+$ ]] && (( STATUS_DEADLINE > 0 && STATUS_DEADLINE <= 30 )) || STATUS_DEADLINE=5
+[[ "$DIRECT_DEADLINE" =~ ^[0-9]+$ ]] && (( DIRECT_DEADLINE > 0 && DIRECT_DEADLINE <= 30 )) || DIRECT_DEADLINE=8
+
+status_file="$(mktemp -t darkmesh-ssh-status)" || exit 1
+status_pid=""
+cleanup() {
+  [[ -n "$status_pid" ]] && kill -TERM "$status_pid" 2>/dev/null || true
+  rm -f "$status_file"
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+tailscale_ready() {
+  local started status=0
+  [[ -x "$TAILSCALE_CLI" ]] || return 1
+  "$TAILSCALE_CLI" status --json >"$status_file" 2>/dev/null &
+  status_pid=$!
+  started="$(date +%s)"
+  while kill -0 "$status_pid" 2>/dev/null && (( $(date +%s) - started < STATUS_DEADLINE )); do
+    sleep 0.1
+  done
+  if kill -0 "$status_pid" 2>/dev/null; then
+    kill -TERM "$status_pid" 2>/dev/null || true
+    sleep 1
+    kill -KILL "$status_pid" 2>/dev/null || true
+  fi
+  wait "$status_pid" || status=$?
+  status_pid=""
+  [[ "$status" -eq 0 ]] || return 1
+  grep -Eq '"BackendState"[[:space:]]*:[[:space:]]*"Running"' "$status_file" || return 1
+  awk '/"Self"[[:space:]]*:/ { self=1 } self && /"Online"[[:space:]]*:/ { print; exit }' "$status_file" \
+    | grep -Eq '"Online"[[:space:]]*:[[:space:]]*true'
+}
+
+if tailscale_ready; then
+  rm -f "$status_file"
+  trap - EXIT INT TERM
+  exec "$TAILSCALE_CLI" nc "$host" "$port"
+fi
+
+# The ordinary socket path is useful when the daemon transport is unavailable
+# but the OS still owns a working route. Keep it bounded and do not retry after
+# a connection begins, because replaying SSH could duplicate a remote command.
+rm -f "$status_file"
+trap - EXIT INT TERM
+exec /usr/bin/nc -G "$DIRECT_DEADLINE" "$host" "$port"

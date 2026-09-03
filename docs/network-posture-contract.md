@@ -64,6 +64,13 @@ settings flags, then verifies that identity and saved preferences did not
 change. A host with `protect-tailscale=on` refuses profiles that forbid
 Tailscale.
 
+VPN-forbidden profiles are durable contracts as well. The reconnect owner
+atomically restores desired VPN state to `off`, contains the transfer client,
+and restores plain networking whenever ExpressVPN reappears. The healthcheck
+reports `GO` for that intentional disconnected state only after Internet, DNS,
+required Tailscale, required remote desktop, and other safety checks have
+passed. A connected VPN under the same contract is `NO-GO`.
+
 The two `optional` profiles never start their optional component and its
 absence is yellow. The two `preferred` profiles are secondary-high: absence
 is yellow and an explicit apply may make one bounded attempt. A Tailscale-first
@@ -120,6 +127,13 @@ remote `report` combines desired posture, observed
 Internet/VPN/Tailscale state, Tailscale warnings, audit verdict, and transfer
 readiness. These commands never write status, change Tailscale, or read
 credentials.
+
+Operators may use `darkmesh-ssh-proxy` as an OpenSSH `ProxyCommand`. It prefers
+the running Tailscale daemon's `nc` transport, which avoids a stale or competing
+system route, and uses one bounded direct socket only when that daemon is not
+healthy. Selection occurs before the SSH protocol begins, so remote commands
+are never replayed. SSH authentication and host-key verification remain owned
+by OpenSSH.
 
 `report` also executes bounded read-only `darkmesh-audit --json` and
 `transfer-vpn-doctor --check`, returning their status, capped stdout, and capped

@@ -205,6 +205,14 @@ tailscale_required() {
   grep -Eq '"profile"[[:space:]]*:[[:space:]]*"(tailscale-required-[^"]+|dual-required-zero-general-egress-leak)"' "$ENFORCED_POSTURE_FILE" 2>/dev/null
 }
 
+vpn_forbidden() {
+  grep -Eq '"profile"[[:space:]]*:[[:space:]]*"(internet-plain-transfer-contained|tailscale-required-vpn-forbidden)"' "$ENFORCED_POSTURE_FILE" 2>/dev/null
+}
+
+tailscale_forbidden() {
+  grep -Eq '"profile"[[:space:]]*:[[:space:]]*"internet-plain-transfer-contained"' "$ENFORCED_POSTURE_FILE" 2>/dev/null
+}
+
 crd_required() {
   local configured=""
   [ -f "$CRD_REQUIRED_FILE" ] && configured="$(tr -d '[:space:]' < "$CRD_REQUIRED_FILE")"
@@ -337,7 +345,15 @@ plain_hold() {
   [[ -f "$RECONNECT_SIDECAR" ]] || return 1
   local age=$(( $(now_epoch) - $(stat -f %m "$RECONNECT_SIDECAR" 2>/dev/null || echo 0) ))
   (( age < 90 )) || return 1
-  grep -Eq '"phase"[[:space:]]*:[[:space:]]*"(captive-standdown|captive-clear-wait|offline|restricted-wait|restricted-plain|plain-cooldown|retry-wait|safety-standdown|desired-off)"' "$RECONNECT_SIDECAR" 2>/dev/null
+  grep -Eq '"phase"[[:space:]]*:[[:space:]]*"(captive-standdown|captive-clear-wait|offline|restricted-wait|restricted-plain|plain-cooldown|retry-wait|safety-standdown|desired-off|posture-vpn-forbidden)"' "$RECONNECT_SIDECAR" 2>/dev/null
+}
+
+intentional_vpn_forbidden_hold() {
+  vpn_forbidden || return 1
+  case "$1" in
+    desired-off|posture-vpn-forbidden) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 restore_plain_network() {
@@ -639,7 +655,7 @@ probe_and_decide() {
   if [[ "$hold_phase" == captive-standdown || "$hold_phase" == captive-clear-wait ]]; then
     verdict=CAPTIVE
     VPN_PATH_FAIL_TICKS=0
-  elif [[ -n "$hold_phase" ]]; then
+  elif [[ -n "$hold_phase" ]] && ! intentional_vpn_forbidden_hold "$hold_phase"; then
     verdict=DEGRADED
     VPN_PATH_FAIL_TICKS=0
   elif [[ "$in_grace" == yes ]]; then
@@ -680,9 +696,12 @@ probe_and_decide() {
   elif [[ "$ts" == false ]] && tailscale_required; then
     VPN_PATH_FAIL_TICKS=0
     verdict=NO-GO
-  elif [[ "$ts" == false ]]; then
+  elif [[ "$ts" == false ]] && ! tailscale_forbidden; then
     VPN_PATH_FAIL_TICKS=0
     verdict=DEGRADED
+  elif vpn_forbidden; then
+    VPN_PATH_FAIL_TICKS=0
+    if [[ "$state" == Disconnected ]]; then verdict=GO; else verdict=NO-GO; fi
   elif [[ "$(desired_state)" != on ]]; then
     VPN_PATH_FAIL_TICKS=0
     verdict=OFF

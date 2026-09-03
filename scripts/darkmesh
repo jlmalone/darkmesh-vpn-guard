@@ -32,6 +32,7 @@ Usage: darkmesh <command> [args]
   panic               restore plain connectivity without touching Tailscale routes
   repair              re-arm watchdogs and close recovery breakers
   repair-tailscale    rebuild a stale macOS Tailscale VPN service safely
+  ssh-proxy HOST PORT stable SSH transport: Tailscale daemon, then direct fallback
   undo                emergency restore internet (legacy `darkmesh --undo`)
   doctor              transfer-client VPN-binding diagnostics
   posture <command>   versioned desired/observed posture and read-only peer health

@@ -114,6 +114,19 @@ existing recovery owner and never enables Network Lock. See
 records the continuously enforced profile separately, so a failed transition
 cannot silently replace the last working contract.
 
+A VPN-forbidden profile is also continuous policy. The reconnect owner keeps
+VPN intent off and restores the contained plain path if another command later
+requests or reconnects ExpressVPN. Healthy plain networking with every required
+service available reports `GO`, rather than treating the intentional VPN-off
+state as degradation.
+
+For private SSH aliases, `darkmesh-ssh-proxy` removes the installed Tailscale
+app path from per-host configuration. It checks the local Tailscale backend,
+uses `tailscale nc` when that private transport is online, and otherwise makes
+one bounded ordinary socket connection. Transport is selected before SSH starts;
+the helper never retries or replays a remote command. Keep normal SSH host-key
+checking and a stable `HostKeyAlias` in each private mode-`0600` SSH config.
+
 ### Menu-bar status (SwiftBar)
 
 A SwiftBar plugin at `swiftbar/darkmesh.10s.sh` renders a glanceable status icon
@@ -147,6 +160,7 @@ panel that renders the same data natively. It requires Xcode to build; see
 /Applications/Tailscale.app/Contents/MacOS/Tailscale netcheck
 transfer-vpn-doctor
 darkmesh-healthcheck                     # read-only one-shot JSON on stdout
+darkmesh ssh-proxy <private-host> 22     # OpenSSH ProxyCommand transport
 cat /tmp/darkmesh-status.json            # current verdict (LaunchAgent updates every 30s)
 vpn-guard.sh
 ```

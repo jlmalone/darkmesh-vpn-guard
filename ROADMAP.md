@@ -207,6 +207,10 @@ when convenient. Future sessions can pick any of these up.
   `/etc/hosts` sync so `ssh headless-node` keeps working even with
   accept-dns off. Optional; the user accepted IP-based ssh as the
   short-term trade-off.
+- **Stable SSH transport (completed 2026-09-03):** packaged
+  `darkmesh-ssh-proxy` keeps private aliases independent of the Tailscale app
+  path, prefers the daemon transport, and has a bounded existing-route fallback.
+  It selects once before SSH begins and never replays commands.
 - **Stale 1.86.2 Tailscale extension cleanup on reboot**: macOS will
   finish uninstalling the old extension on next reboot, after which
   the `find_tailscale_extensions` helper will no longer find a stale

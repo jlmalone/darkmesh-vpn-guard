@@ -99,6 +99,15 @@ tailscale_required() {
   case "$value" in on|yes|1|true) return 0 ;; esac
   grep -Eq '"profile"[[:space:]]*:[[:space:]]*"(tailscale-required-[^"]+|dual-required-zero-general-egress-leak)"' "$ENFORCED_POSTURE_FILE" 2>/dev/null
 }
+vpn_forbidden() {
+  grep -Eq '"profile"[[:space:]]*:[[:space:]]*"(internet-plain-transfer-contained|tailscale-required-vpn-forbidden)"' "$ENFORCED_POSTURE_FILE" 2>/dev/null
+}
+set_desired_off() {
+  local tmp="${DESIRED_FILE}.tmp.$$"
+  printf 'off\n' > "$tmp" \
+    && chmod 0600 "$tmp" \
+    && mv -f "$tmp" "$DESIRED_FILE"
+}
 tailscale_ready() {
   [[ -x "$TAILSCALE_REPAIR" ]] && "$TAILSCALE_REPAIR" --check >/dev/null 2>&1
 }
@@ -506,6 +515,25 @@ while true; do
     last_restore_marker=""
   else
     tailscale_fail_samples=0
+  fi
+
+  # A successfully applied VPN-forbidden posture is continuous policy, not a
+  # one-time transition. Reassert it if an operator command or stale process
+  # requests the VPN later.
+  if vpn_forbidden; then
+    if [[ "$d" != off ]]; then
+      if set_desired_off; then
+        d=off
+        log "enforced posture forbids ExpressVPN; restored desired=off"
+      else
+        log "could not persist enforced VPN-forbidden desired state"
+      fi
+    fi
+    enter_plain_state posture-vpn-forbidden "$s"
+    s="$(vpn_state)"; s="${s:-Disconnected}"
+    write_sidecar "posture-vpn-forbidden" "$s"
+    loop_sleep "$INTERVAL_OK" idle || break
+    continue
   fi
 
   if [[ "$s" == Disconnected && "$ts_required" != yes && -x "$TAILSCALE_REPAIR" ]]; then

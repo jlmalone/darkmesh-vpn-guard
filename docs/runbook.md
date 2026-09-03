@@ -94,6 +94,32 @@ writes `~/.config/darkmesh/posture-enforced.json` and changes continuous
 supervision. On a host with `protect-tailscale=on`, a posture that forbids
 Tailscale is rejected before any network action.
 
+The `tailscale-required-vpn-forbidden` profile is the recovery-host posture when
+private-overlay reachability has priority over the commercial VPN. Its
+prohibition is continuously reconciled: if another command requests or starts
+ExpressVPN, Darkmesh restores desired-off and the contained plain path. Apply a
+different compatible posture to permit VPN recovery again.
+
+### Stable private SSH transport
+
+Use the packaged proxy instead of embedding the Tailscale application path in
+every private alias:
+
+```sshconfig
+Host recovery-host
+  HostName <private-tailnet-target>
+  User <account>
+  ProxyCommand /opt/homebrew/bin/darkmesh-ssh-proxy %h %p
+  HostKeyAlias recovery-host
+```
+
+Keep this configuration private and mode `0600`. The helper prefers
+`tailscale nc` while the backend is running and online. If that backend is
+unavailable, it tries the existing system route once with a bounded connect
+deadline. It selects before SSH starts and never retries the SSH command, which
+prevents duplicated remote mutations. `darkmesh audit` fails when the packaged
+helper is missing.
+
 ## Current working state
 
 ExpressVPN:

@@ -23,6 +23,7 @@ autoconnect guidance are superseded here.
 |---|---|---|
 | `settling` | Coalesce network notifications and restore plain networking once for a new physical-network fingerprint. | Classify the plain path. |
 | `desired-off` | Force transfer containment and restore plain networking. | `darkmesh-up` sets desired on. |
+| `posture-vpn-forbidden` | Reassert desired-off, contain transfers, and restore plain networking. | A different compatible posture is successfully applied. |
 | `offline` | Leave VPN down. | A default interface and gateway appear. |
 | `captive-standdown` | Leave VPN down and DHCP DNS in control. | Exact open-internet evidence appears. |
 | `captive-clear-wait` | Require stable exact success before a normal-region VPN attempt. | Required clear samples pass. |
@@ -47,6 +48,11 @@ until an explicit `darkmesh up` rearm. A stopped
 Logout, reset, reauthentication, and application quit are never automatic. A
 host-level Tailscale requirement also refuses any posture that forbids
 Tailscale.
+
+An enforced VPN-forbidden posture supersedes a later desired-on request. Every
+reconcile pass atomically restores desired-off and keeps the contained plain
+path active. This differs from a temporary safety standdown: only successfully
+applying another compatible posture removes the prohibition.
 
 ## Classification
 
@@ -140,3 +146,5 @@ Observer liveness is a separate state dimension. Each tick writes a progress
 heartbeat before any probe or recovery action. The supervisor marks the child
 unresponsive after 90 seconds of silence, force-recycles it, and restarts it.
 Status older than its published 60-second maximum is `STALE`, never GO or NO-GO.
+An intentional VPN-off state is `GO` only when an enforced VPN-forbidden posture
+exists and all required connectivity and safety probes pass.

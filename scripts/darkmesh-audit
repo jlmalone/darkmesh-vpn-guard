@@ -42,7 +42,7 @@ PY
 
 [[ "$JSON" == yes ]] || echo "darkmesh-audit @ $(scutil --get LocalHostName 2>/dev/null || hostname) $(date -u +%FT%TZ)"
 
-for tool in darkmesh-healthcheck darkmesh-breaker darkmesh-reconnect darkmesh-repair-tailscale darkmesh-restore-plain-network transfer-vpn-doctor darkmesh-panic darkmesh-repair darkmesh-up; do
+for tool in darkmesh-healthcheck darkmesh-breaker darkmesh-reconnect darkmesh-repair-tailscale darkmesh-restore-plain-network darkmesh-ssh-proxy transfer-vpn-doctor darkmesh-panic darkmesh-repair darkmesh-up; do
   have_tool "$tool" && record "binary.$tool" true "binary $tool" || record "binary.$tool" false "binary $tool missing"
 done
 
