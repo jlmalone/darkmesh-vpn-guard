@@ -91,6 +91,16 @@ repair preserves the existing identity and preferences and has a one-hour
 automatic retry cooldown. An operator can run `darkmesh repair-tailscale` for
 the same checked repair on demand.
 
+An applied Tailscale-required posture, or `protect-tailscale=on` on a headless
+host, is continuously enforced. After three confirmed misses, Darkmesh contains
+the transfer client, lets ExpressVPN yield, restores Tailscale, and blocks an
+optional VPN reconnect until the operator explicitly runs `darkmesh up`. If
+`WantRunning` was cleared, the guarded repair uses settings-free `tailscale up`
+and verifies the saved
+identity and preferences afterward. It never logs out, resets, runs
+`tailscale down`, or quits Tailscale. A protected host refuses a posture that
+forbids Tailscale.
+
 `server_monitor` should be a UI/status consumer only. It should not own network
 policy. Reading `/tmp/darkmesh-status.json` is sufficient to render a
 GO / DEGRADED / NO-GO indicator.
@@ -99,6 +109,10 @@ For a versioned desired/observed profile surface and optional read-only peer
 health, use `darkmesh posture`. Its explicit `apply` boundary preserves the
 existing recovery owner and never enables Network Lock. See
 [`docs/network-posture-contract.md`](docs/network-posture-contract.md).
+
+`posture set` changes only the selected profile. A successful `posture apply`
+records the continuously enforced profile separately, so a failed transition
+cannot silently replace the last working contract.
 
 ### Menu-bar status (SwiftBar)
 
@@ -305,10 +319,12 @@ setup is not baked into a public tool. Use the neutral `CLIENT_*` tokens in code
 them resolve from the untracked config. ExpressVPN and Tailscale are named openly
 throughout: they are the subject of the toolkit, not the sensitive part.
 
-One other per-host knob: the healthcheck's `--protect-tailscale` (drop the VPN when
-Tailscale fails) is decided at setup by chassis, on for a headless node where the tailnet
-is the only way in, off for a laptop where the operator is present and it would just flap
-the VPN. Override with `~/.config/darkmesh/protect-tailscale` containing `on` or `off`.
+One other per-host knob: `protect-tailscale` makes Tailscale the required
+remote-access path. It is decided at setup by chassis, on for a headless node
+where the tailnet is the command lifeline and off for a laptop where an operator
+is present. On a confirmed failure, the reconnect owner contains transfers,
+lets the optional VPN yield, and runs guarded Tailscale recovery. Override with
+`~/.config/darkmesh/protect-tailscale` containing `on` or `off`.
 
 See [`docs/TRUSTED_MACHINE_CONTEXT.md`](docs/TRUSTED_MACHINE_CONTEXT.md) for keeping
 private agent context, runtime configuration, credentials, and operational data in the

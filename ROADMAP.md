@@ -7,6 +7,13 @@
 > the strict zero-general-egress-leak profile remains capability-gated because
 > Darkmesh does not claim a machine-wide kill switch.
 
+> **Posture enforcement update:** a successful Apply records a separate
+> enforced profile consumed by both long-running supervisors. Required
+> Tailscale makes the optional commercial VPN yield after confirmed failures,
+> repairs stopped intent without resetting identity, and gates VPN recovery
+> behind an explicit rearm. Large Tailscale peer maps are parsed before
+> display output is capped.
+
 > **Background architecture update — 2026-07-13:** the per-script LaunchAgents
 > described below are now a legacy fallback. Server Monitor bundles one Developer
 > ID-signed `SMAppService` infrastructure agent that supervises the healthcheck and
@@ -165,14 +172,16 @@ when convenient. Future sessions can pick any of these up.
   block the VPN (connectivity is paramount, §1). Optionally publish `expressvpn_version`
   to the status file so `server_monitor` can show it.
 
-- **`--protect-tailscale` per-host: RESOLVED 2026-06-24.** The healthcheck plist template
-  no longer hardcodes the flag; it carries a `__PROTECT_TS__` placeholder, and both
-  `darkmesh-setup` and `install-user-tools` decide per host: a Tailscale-down auto-disconnect
-  is right for a headless node (the tailnet is the only way in) but flaps the VPN on a laptop
-  where the operator is present. Default is by chassis (an internal battery means laptop, so
-  off; no battery means headless, so on), overridable with `~/.config/darkmesh/protect-tailscale`
-  containing `on` or `off`. So the full installer is now safe to re-run on any node without
-  reintroducing the flapping. Background: the 2026-06-23 entry in `docs/investigation-log.md`.
+- **`--protect-tailscale` per-host: RESOLVED 2026-06-24; hardened 2026-09-03.** The
+  healthcheck plist template no longer hardcodes the flag; it carries a
+  `__PROTECT_TS__` placeholder, and both `darkmesh-setup` and
+  `install-user-tools` decide per host. Default is by chassis (an internal
+  battery means laptop, so off; no battery means headless, so on), overridable
+  with `~/.config/darkmesh/protect-tailscale` containing `on` or `off`. On a
+  headless node the reconnect owner now confirms failure, contains transfers,
+  yields the optional VPN, restores required Tailscale, and prevents VPN
+  re-entry until explicit operator rearm. Background: the 2026-06-23 entry in
+  `docs/investigation-log.md`.
 
 - **SSH over Chrome Remote Desktop (investigate + set up).** Chrome Remote Desktop is
   already governing invariant #2 (always reachable, in the VPN bypass list), so a remote

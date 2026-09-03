@@ -11,8 +11,10 @@ from pathlib import Path
 
 HOME = Path(os.environ.get("HOME", str(Path.home())))
 CONFIG = Path(os.environ.get("DARKMESH_POSTURE_FILE", HOME / ".config/darkmesh/posture.json"))
+ENFORCED_CONFIG = Path(os.environ.get("DARKMESH_ENFORCED_POSTURE_FILE", HOME / ".config/darkmesh/posture-enforced.json"))
 STATUS = Path(os.environ.get("DARKMESH_STATUS_FILE", "/tmp/darkmesh-status.json"))
 PEERS = Path(os.environ.get("DARKMESH_POSTURE_PEERS", HOME / ".config/darkmesh/posture-peers.conf"))
+PROTECT_TAILSCALE = Path(os.environ.get("DARKMESH_PROTECT_TAILSCALE_FILE", HOME / ".config/darkmesh/protect-tailscale"))
 LOCK = Path(os.environ.get("DARKMESH_POSTURE_LOCK", HOME / ".config/darkmesh/posture.apply.lock"))
 ROOT = Path(__file__).resolve().parent
 HEALTH = os.environ.get("DARKMESH_HEALTHCHECK", str(ROOT / "darkmesh-healthcheck"))
@@ -33,6 +35,7 @@ APPLY_DEADLINE = max(1, int(os.environ.get("DARKMESH_POSTURE_APPLY_DEADLINE", "6
 REMOTE_REPORT_TIMEOUT = max(12, int(os.environ.get("DARKMESH_POSTURE_REMOTE_REPORT_TIMEOUT", "30")))
 MAX_PEERS = max(1, min(32, int(os.environ.get("DARKMESH_POSTURE_MAX_PEERS", "8"))))
 MAX_OUTPUT = 32768
+MAX_JSON_OUTPUT = 1048576
 
 PROFILES = [
  {"id":"internet-plain-transfer-contained","title":"Plain internet with transfer containment","required":{"internet":True,"transferSafety":True},"preferred":{},"forbidden":{"vpn":True,"tailscale":True},"priority":["internet","transferSafety","vpn","tailscale"],"transition":{"vpn":"panic","tailscale":"down","attemptSecondary":False,"rollback":"panic"},"degraded":"VPN and Tailscale are explicitly disabled; transfer containment remains required."},
@@ -52,10 +55,10 @@ for profile in PROFILES:
 def emit(value, code=0): print(json.dumps(value, separators=(",", ":"), sort_keys=True)); raise SystemExit(code)
 def now(): return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 def get_profile(value): return next((p for p in PROFILES if p["id"] == value), None)
-def run(argv, timeout=PROBE_TIMEOUT):
+def run(argv, timeout=PROBE_TIMEOUT, max_output=MAX_OUTPUT):
     try:
         p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
-        return {"ok":p.returncode == 0,"code":p.returncode,"stdout":p.stdout[:MAX_OUTPUT],"stderr":p.stderr[:512]}
+        return {"ok":p.returncode == 0,"code":p.returncode,"stdout":p.stdout[:max_output],"stderr":p.stderr[:512]}
     except FileNotFoundError: return {"ok":False,"code":None,"stdout":"","stderr":"unavailable"}
     except subprocess.TimeoutExpired: return {"ok":False,"code":124,"stdout":"","stderr":"timeout"}
 def observed():
@@ -67,7 +70,9 @@ def observed():
     except Exception as exc: value.update({"reason":"status-invalid","detail":str(exc).replace("\n"," ")[:160]})
     return value
 def tailscale_status():
-    result=run([TS,"status","--json"])
+    # The peer map can legitimately exceed the human-output cap. Parse the
+    # complete bounded contract, then cap only fields emitted to consumers.
+    result=run([TS,"status","--json"], max_output=MAX_JSON_OUTPUT)
     if not result["ok"]: return {"available":False,"reason":result["stderr"] or "tailscale-status-failed","self":{},"peers":{}}
     try:
         data=json.loads(result["stdout"]); self_data=data.get("Self") or {}
@@ -153,8 +158,18 @@ def assess(p, obs, ssh=None):
 def read_desired():
     try: return json.loads(CONFIG.read_text()).get("profile")
     except Exception: return None
+def host_protects_tailscale():
+    try: return PROTECT_TAILSCALE.read_text().strip().lower() in ("on","yes","1","true")
+    except Exception: return False
+def host_policy_conflict(profile):
+    return host_protects_tailscale() and profile.get("forbidden",{}).get("tailscale") is True
 def write_desired(profile_id):
     CONFIG.parent.mkdir(parents=True,exist_ok=True); temp=CONFIG.with_name(CONFIG.name+f".tmp.{os.getpid()}"); temp.write_text(json.dumps({"schema":2,"profile":profile_id,"selectedAt":now()},separators=(",",":"))+"\n"); os.chmod(temp,0o600); temp.replace(CONFIG)
+def write_enforced(profile_id):
+    ENFORCED_CONFIG.parent.mkdir(parents=True,exist_ok=True); temp=ENFORCED_CONFIG.with_name(ENFORCED_CONFIG.name+f".tmp.{os.getpid()}"); temp.write_text(json.dumps({"schema":1,"profile":profile_id,"appliedAt":now()},separators=(",",":"))+"\n"); os.chmod(temp,0o600); temp.replace(ENFORCED_CONFIG)
+def read_enforced():
+    try: return json.loads(ENFORCED_CONFIG.read_text()).get("profile")
+    except Exception: return None
 def invoke(name, argv, evidence):
     result=run(argv,APPLY_DEADLINE); evidence.append({"step":name,"command":Path(argv[0]).name,"ok":result["ok"],"code":result["code"],"detail":(result["stderr"] or result["stdout"])[:200]}); return result["ok"]
 def ssh_reachability():
@@ -167,6 +182,7 @@ def acquire_lock():
 def apply(profile_id):
     p=get_profile(profile_id)
     if not p: emit({"schema":2,"kind":"darkmesh-posture-apply","applied":False,"reason":"unknown-profile"},2)
+    if host_policy_conflict(p): emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"host-policy-conflict","requiredByHost":"tailscale","rollback":{"attempted":False,"reason":"no-action-taken"}},4)
     if p["transition"].get("apply")=="refuse": emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"capability-unavailable","requiredCapability":"machine-wide-kill-switch","capabilities":p.get("capabilities",{}),"rollback":{"attempted":False,"reason":"no-action-taken"}},4)
     handle=acquire_lock()
     if handle is None: emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"apply-in-progress","rollback":{"attempted":False,"reason":"no-action-taken"}},5)
@@ -192,13 +208,13 @@ def apply(profile_id):
         if regression or final["severity"] in ("red","gray"):
             if transition.get("vpn") in ("rearm","attempt-with-rollback"): rollback_panic("higher-priority-regression" if regression else "postcondition-failed")
             emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"higher-priority-regression" if regression else "postcondition-failed","initial":initial,"postcondition":post,"assessment":final,"actions":evidence,"rollback":{"attempted":bool(rollback),"events":rollback}},3)
-        write_desired(profile_id); emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":True,"initial":initial,"postcondition":post,"assessment":final,"actions":evidence,"rollback":{"attempted":False,"reason":"not-needed"}})
+        write_desired(profile_id); write_enforced(profile_id); emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":True,"initial":initial,"postcondition":post,"assessment":final,"actions":evidence,"rollback":{"attempted":False,"reason":"not-needed"}})
     finally:
         os.close(handle)
         try: LOCK.unlink()
         except FileNotFoundError: pass
 def show():
-    desired=read_desired(); p=get_profile(desired); obs=observed(); emit({"schema":2,"kind":"darkmesh-posture","desiredProfile":desired,"profile":p,"observed":obs,"assessment":assess(p,obs) if p else {"severity":"gray","state":"unavailable","reason":"profile-unselected","required":{},"preferred":{},"forbidden":{}}})
+    desired=read_desired(); p=get_profile(desired); obs=observed(); emit({"schema":2,"kind":"darkmesh-posture","desiredProfile":desired,"enforcedProfile":read_enforced(),"profile":p,"observed":obs,"assessment":assess(p,obs) if p else {"severity":"gray","state":"unavailable","reason":"profile-unselected","required":{},"preferred":{},"forbidden":{}}})
 def report():
     desired=read_desired(); p=get_profile(desired); obs=observed(); ts=tailscale_status()
     audit=run([AUDIT,"--json"],max(12,PROBE_TIMEOUT+2)); doctor=run([DOCTOR,"--check"],max(12,PROBE_TIMEOUT+2))
@@ -210,7 +226,7 @@ def report():
         return value
     transfer=check(doctor); detail=f"{transfer['stdout']}\n{transfer['stderr']}".lower()
     transfer["state"]="ready" if transfer["ok"] else ("unconfigured" if "missing:" in detail or "not configured" in detail else "blocked")
-    emit({"schema":2,"kind":"darkmesh-posture-report","generatedAt":now(),"desiredProfile":desired,"observed":obs,"assessment":assess(p,obs) if p else {"severity":"gray","state":"unavailable","reason":"profile-unselected","required":{},"preferred":{},"forbidden":{}},"tailscale":{"backend":ts.get("backend"),"selfOnline":ts.get("selfOnline"),"warnings":ts.get("healthWarnings",[])},"audit":check(audit,True),"transferReadiness":transfer})
+    emit({"schema":2,"kind":"darkmesh-posture-report","generatedAt":now(),"desiredProfile":desired,"enforcedProfile":read_enforced(),"observed":obs,"assessment":assess(p,obs) if p else {"severity":"gray","state":"unavailable","reason":"profile-unselected","required":{},"preferred":{},"forbidden":{}},"tailscale":{"backend":ts.get("backend"),"selfOnline":ts.get("selfOnline"),"warnings":ts.get("healthWarnings",[])},"audit":check(audit,True),"transferReadiness":transfer})
 def health():
     result=run([HEALTH], max(PROBE_TIMEOUT, 12))
     if not result["ok"]: emit({"schema":2,"kind":"darkmesh-posture-health","available":False,"reason":result["stderr"] or "healthcheck-failed"},1)
@@ -221,7 +237,9 @@ def main():
     args=sys.argv[1:]; command=args[0] if args else "help"
     if command=="profiles" and len(args) in (1,2): emit({"schema":2,"kind":"darkmesh-posture-profiles","profiles":PROFILES})
     if command=="set" and len(args)==2:
-        if not get_profile(args[1]): emit({"schema":2,"kind":"darkmesh-posture-selection","applied":False,"reason":"unknown-profile"},2)
+        profile=get_profile(args[1])
+        if not profile: emit({"schema":2,"kind":"darkmesh-posture-selection","applied":False,"reason":"unknown-profile"},2)
+        if host_policy_conflict(profile): emit({"schema":2,"kind":"darkmesh-posture-selection","profile":args[1],"applied":False,"reason":"host-policy-conflict","requiredByHost":"tailscale"},4)
         write_desired(args[1]); emit({"schema":2,"kind":"darkmesh-posture-selection","profile":args[1],"applied":False,"reason":"desired-recorded"})
     if command=="show" and len(args) in (1,2): show()
     if command=="health" and len(args) in (1,2): health()

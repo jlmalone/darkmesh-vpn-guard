@@ -9,8 +9,11 @@ autoconnect guidance are superseded here.
 
 1. Ordinary internet must recover automatically.
 2. ExpressVPN is the preferred default route.
-3. Tailscale is optional. Its health and DNS integration never gate internet or
-   VPN recovery on a laptop.
+3. Tailscale is optional by default on a laptop. Its health and DNS integration
+   never gate internet recovery. A headless `protect-tailscale=on` override or a
+   successfully applied `tailscale-required-*` posture makes it higher priority
+   than the commercial VPN until the operator applies a different compatible
+   posture.
 4. The transfer client is the only strict fail-closed component.
 5. ExpressVPN Network Lock and built-in autoconnect stay off by default.
 
@@ -34,6 +37,16 @@ Tailscale control state is online and a `100.64/10` sentinel route is owned by
 the same `utun` interface as the saved Tailscale identity. Three consecutive failures trigger one saved VPN
 service stop/start without `tailscale down`, preserving identity and preferences.
 Automatic attempts are limited to one per hour.
+
+When Tailscale is required, three confirmed failures make ExpressVPN yield only
+after transfer containment is established. The reconnect owner then restores
+Tailscale and records a priority standdown that keeps the optional VPN down
+until an explicit `darkmesh up` rearm. A stopped
+`WantRunning=false` backend is re-armed with a bounded settings-free
+`tailscale up`; saved identity and all preferences are compared afterward.
+Logout, reset, reauthentication, and application quit are never automatic. A
+host-level Tailscale requirement also refuses any posture that forbids
+Tailscale.
 
 ## Classification
 

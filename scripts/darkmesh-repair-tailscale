@@ -1,15 +1,22 @@
 #!/bin/bash
-# Repair a macOS Tailscale network extension that reports healthy while its
-# 100.64/10 route is missing. Restart the saved VPN service without `tailscale
-# down`, preserving the existing identity and every stored preference.
+# Repair required Tailscale intent or a macOS network extension whose 100.64/10
+# route is missing. Re-arm with a settings-free `tailscale up`, or restart the
+# saved VPN service, without logout/reset/down and while preserving identity and
+# every stored preference.
 set -uo pipefail
 
 MODE=operator
-case "${1:-}" in
-  "") ;;
-  --auto) MODE=auto ;;
-  *) echo "Usage: darkmesh-repair-tailscale [--auto]" >&2; exit 2 ;;
-esac
+REQUIRED=no
+CHECK_ONLY=no
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --auto) MODE=auto ;;
+    --required) REQUIRED=yes ;;
+    --check) CHECK_ONLY=yes ;;
+    *) echo "Usage: darkmesh-repair-tailscale [--auto] [--required] [--check]" >&2; exit 2 ;;
+  esac
+  shift
+done
 
 TS="${TAILSCALE_CLI:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
 SCUTIL="${DARKMESH_SCUTIL:-/usr/sbin/scutil}"
@@ -28,6 +35,7 @@ CLI_TIMEOUT="${DARKMESH_TAILSCALE_CLI_TIMEOUT:-5}"
 
 umask 077
 prefs_before="$(mktemp -t darkmesh-tailscale-prefs)" || exit 1
+prefs_after="$(mktemp -t darkmesh-tailscale-prefs-after)" || { rm -f "$prefs_before"; exit 1; }
 lock_held=no
 service_stopped=no
 repair_complete=no
@@ -37,7 +45,7 @@ cleanup() {
     "$OPEN" -a Tailscale >/dev/null 2>&1 || true
     "$SCUTIL" --nc start Tailscale >/dev/null 2>&1 || true
   fi
-  rm -f "$prefs_before"
+  rm -f "$prefs_before" "$prefs_after"
   [[ "$lock_held" != yes ]] || rm -rf "$LOCK_DIR"
 }
 trap cleanup EXIT
@@ -68,6 +76,27 @@ tailscale_online() {
   run_with_deadline "$CLI_TIMEOUT" "$TS" status --json | /usr/bin/python3 -c \
     'import json,sys; d=json.load(sys.stdin); raise SystemExit(0 if d.get("BackendState")=="Running" and d.get("Self",{}).get("Online") is True else 1)' \
     >/dev/null 2>&1
+}
+
+prefs_value_is_true() { # <file> <key>
+  /usr/bin/python3 - "$1" "$2" <<'PY' >/dev/null 2>&1
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    value = json.load(stream).get(sys.argv[2])
+raise SystemExit(0 if value is True else 1)
+PY
+}
+
+prefs_preserved_after_rearm() {
+  /usr/bin/python3 - "$prefs_before" "$prefs_after" <<'PY' >/dev/null 2>&1
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    before = json.load(stream)
+with open(sys.argv[2], encoding="utf-8") as stream:
+    after = json.load(stream)
+before["WantRunning"] = True
+raise SystemExit(0 if before == after else 1)
+PY
 }
 
 route_healthy() {
@@ -128,6 +157,8 @@ if tailscale_online && route_healthy; then
   exit 0
 fi
 
+[[ "$CHECK_ONLY" != yes ]] || exit 1
+
 sample=1
 while (( sample < FAIL_SAMPLES )); do
   sleep "$SAMPLE_INTERVAL"
@@ -159,24 +190,56 @@ if tailscale_online && route_healthy; then
   exit 0
 fi
 
-now="$(date +%s)"
-if [[ "$MODE" == auto && -f "$STATE_FILE" ]]; then
-  last="$(stat -f %m "$STATE_FILE" 2>/dev/null || echo 0)"
-  if [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < COOLDOWN )); then exit 0; fi
-fi
-
 identity_before="$(tailnet_ip)"
 [[ -n "$identity_before" ]] || { echo "darkmesh: existing Tailscale identity unavailable; refusing reset" >&2; exit 4; }
 run_with_deadline "$CLI_TIMEOUT" "$TS" debug prefs >"$prefs_before" \
   || { echo "darkmesh: Tailscale preferences unavailable; refusing reset" >&2; exit 4; }
-if ! /usr/bin/python3 - "$prefs_before" <<'PY' >/dev/null 2>&1
-import json, sys
-raise SystemExit(0 if json.load(open(sys.argv[1])).get("WantRunning") is True else 1)
-PY
-then
-  [[ "$MODE" == auto ]] && exit 0
-  echo "darkmesh: Tailscale is intentionally down; refusing service restart" >&2
-  exit 3
+
+if ! prefs_value_is_true "$prefs_before" WantRunning; then
+  if [[ "$REQUIRED" != yes ]]; then
+    [[ "$MODE" == auto ]] && exit 0
+    echo "darkmesh: Tailscale is intentionally down; refusing service restart" >&2
+    exit 3
+  fi
+  if prefs_value_is_true "$prefs_before" LoggedOut; then
+    echo "darkmesh: Tailscale is logged out; refusing automatic authentication" >&2
+    exit 4
+  fi
+
+  mkdir -p "$(dirname "$STATE_FILE")"
+  : >"$STATE_FILE"
+  # With no settings flags, `tailscale up` preserves every saved preference.
+  # Bound it externally so a login requirement cannot hang remote recovery.
+  if ! run_with_deadline "$START_TIMEOUT" "$TS" up >/dev/null; then
+    echo "darkmesh: required Tailscale could not be re-armed without authentication" >&2
+    exit 1
+  fi
+  elapsed=0
+  while (( elapsed < START_TIMEOUT )); do
+    if tailscale_online && route_healthy; then break; fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  if ! tailscale_online || ! route_healthy; then
+    echo "darkmesh: required Tailscale did not converge after re-arm" >&2
+    exit 1
+  fi
+  identity_after="$(tailnet_ip)"
+  [[ "$identity_after" == "$identity_before" ]] \
+    || { echo "darkmesh: Tailscale identity changed unexpectedly" >&2; exit 1; }
+  run_with_deadline "$CLI_TIMEOUT" "$TS" debug prefs >"$prefs_after" \
+    || { echo "darkmesh: could not verify re-armed Tailscale preferences" >&2; exit 1; }
+  prefs_preserved_after_rearm \
+    || { echo "darkmesh: Tailscale preferences changed unexpectedly during re-arm" >&2; exit 1; }
+  repair_complete=yes
+  echo "darkmesh: required Tailscale re-armed with saved identity and preferences"
+  exit 0
+fi
+
+now="$(date +%s)"
+if [[ "$MODE" == auto && -f "$STATE_FILE" ]]; then
+  last="$(stat -f %m "$STATE_FILE" 2>/dev/null || echo 0)"
+  if [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < COOLDOWN )); then exit 0; fi
 fi
 
 mkdir -p "$(dirname "$STATE_FILE")"

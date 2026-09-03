@@ -53,6 +53,9 @@ DOCTOR="${DARKMESH_DOCTOR:-$(command -v transfer-vpn-doctor 2>/dev/null || echo 
 PLAIN_RESTORE="${DARKMESH_PLAIN_RESTORE:-$(command -v darkmesh-restore-plain-network 2>/dev/null || echo "$HOME/.local/bin/darkmesh-restore-plain-network")}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TAILSCALE_REPAIR="${DARKMESH_TAILSCALE_REPAIR:-$(command -v darkmesh-repair-tailscale 2>/dev/null || echo "$SCRIPT_DIR/darkmesh-repair-tailscale")}"
+ENFORCED_POSTURE_FILE="${DARKMESH_ENFORCED_POSTURE_FILE:-$HOME/.config/darkmesh/posture-enforced.json}"
+PROTECT_TAILSCALE_FILE="${DARKMESH_PROTECT_TAILSCALE_FILE:-$HOME/.config/darkmesh/protect-tailscale}"
+TAILSCALE_STANDDOWN_FILE="${DARKMESH_TAILSCALE_STANDDOWN_FILE:-$HOME/.config/darkmesh/tailscale-priority-standdown}"
 VPN_GUARD="${DARKMESH_VPN_GUARD:-$(command -v vpn-guard.sh 2>/dev/null || echo "$SCRIPT_DIR/vpn-guard.sh")}"
 
 INTERVAL_OK="${INTERVAL_OK:-30}"            # poll cadence when healthy / idle
@@ -80,6 +83,7 @@ CONNECT_OBSERVE="${DARKMESH_CONNECT_OBSERVE:-60}"
 APP_QUIT_WAIT="${DARKMESH_APP_QUIT_WAIT:-2}"
 APP_START_WAIT="${DARKMESH_APP_START_WAIT:-8}"
 MAX_TICKS="${DARKMESH_MAX_TICKS:-0}"         # deterministic tests; 0 = unlimited
+TAILSCALE_FAIL_SAMPLES_REQUIRED="${DARKMESH_TAILSCALE_FAIL_SAMPLES:-3}"
 
 mkdir -p "$LOG_DIR" "$(dirname "$DESIRED_FILE")"
 [ -f "$DESIRED_FILE" ] || printf 'on\n' > "$DESIRED_FILE"
@@ -89,6 +93,22 @@ notify() { osascript -e "display notification \"$1\" with title \"darkmesh\"" >/
 
 vpn_state()   { "$CTL" --timeout 4 get connectionstate 2>/dev/null | head -1; }
 desired()     { tr -d '[:space:]' < "$DESIRED_FILE" 2>/dev/null; }
+tailscale_required() {
+  local value=""
+  [ -r "$PROTECT_TAILSCALE_FILE" ] && value="$(tr '[:upper:]' '[:lower:]' < "$PROTECT_TAILSCALE_FILE" | tr -d '[:space:]')"
+  case "$value" in on|yes|1|true) return 0 ;; esac
+  grep -Eq '"profile"[[:space:]]*:[[:space:]]*"(tailscale-required-[^"]+|dual-required-zero-general-egress-leak)"' "$ENFORCED_POSTURE_FILE" 2>/dev/null
+}
+tailscale_ready() {
+  [[ -x "$TAILSCALE_REPAIR" ]] && "$TAILSCALE_REPAIR" --check >/dev/null 2>&1
+}
+open_tailscale_standdown() {
+  local tmp="${TAILSCALE_STANDDOWN_FILE}.tmp.$$"
+  mkdir -p "$(dirname "$TAILSCALE_STANDDOWN_FILE")"
+  printf '%s\n' "$(date -u +%FT%TZ)" > "$tmp" \
+    && chmod 0600 "$tmp" \
+    && mv -f "$tmp" "$TAILSCALE_STANDDOWN_FILE"
+}
 # Classify plain connectivity without treating blocked global probes as proof of
 # a captive portal. Output: open, captive, restricted, or offline.
 classify_plain_network() {
@@ -306,6 +326,7 @@ restricted_window_started=0
 restricted_attempts=0
 next_attempt_at=0
 last_restore_marker=""
+tailscale_fail_samples=0
 
 state_value() { sed -n "s/^$1=//p" "$RECOVERY_STATE" 2>/dev/null | head -1; }
 load_recovery_state() {
@@ -321,6 +342,7 @@ load_recovery_state() {
   v="$(state_value restricted_window_started)"; [[ "$v" =~ ^[0-9]+$ ]] && restricted_window_started="$v"
   v="$(state_value restricted_attempts)"; [[ "$v" =~ ^[0-9]+$ ]] && restricted_attempts="$v"
   v="$(state_value next_attempt_at)"; [[ "$v" =~ ^[0-9]+$ ]] && next_attempt_at="$v"
+  v="$(state_value tailscale_fail_samples)"; [[ "$v" =~ ^[0-9]+$ ]] && tailscale_fail_samples="$v"
   last_network_key="$(state_value last_network_key)"
   last_restore_marker="$(state_value last_restore_marker)"
 }
@@ -338,6 +360,7 @@ persist_recovery_state() {
     printf 'restricted_window_started=%s\n' "$restricted_window_started"
     printf 'restricted_attempts=%s\n' "$restricted_attempts"
     printf 'next_attempt_at=%s\n' "$next_attempt_at"
+    printf 'tailscale_fail_samples=%s\n' "$tailscale_fail_samples"
     printf 'last_restore_marker=%s\n' "$last_restore_marker"
   } > "$tmp" && chmod 0600 "$tmp" && mv -f "$tmp" "$RECOVERY_STATE"
 }
@@ -359,6 +382,9 @@ write_sidecar() {  # <phase> <vpn_state>
     printf '  "gave_up": %s,\n' "$gave_up"
     printf '  "next_attempt_at": %s,\n' "$next_attempt_at"
     printf '  "restricted_attempts": %s,\n' "$restricted_attempts"
+    printf '  "tailscale_required": %s,\n' "$(tailscale_required && printf true || printf false)"
+    printf '  "tailscale_fail_samples": %s,\n' "$tailscale_fail_samples"
+    printf '  "tailscale_priority_standdown": %s,\n' "$([ -f "$TAILSCALE_STANDDOWN_FILE" ] && printf true || printf false)"
     printf '  "tunnel_ip": "%s",\n' "$last_tunnel_ip"
     printf '  "tunnel_iface": "%s"\n' "$last_tunnel_iface"
     printf '}\n'
@@ -450,8 +476,47 @@ while true; do
   s="$(vpn_state)"; d="$(desired)"; d="${d:-on}"
   now="$(date +%s)"
 
-  if [[ "$s" == Disconnected && -x "$TAILSCALE_REPAIR" ]]; then
+  ts_required=no
+  tailscale_required && ts_required=yes
+  if [[ "$ts_required" == yes ]] && ! tailscale_ready; then
+    if [[ "$s" != Disconnected ]]; then
+      tailscale_fail_samples=$((tailscale_fail_samples + 1))
+      if (( tailscale_fail_samples < TAILSCALE_FAIL_SAMPLES_REQUIRED )); then
+        log "required Tailscale unavailable (${tailscale_fail_samples}/${TAILSCALE_FAIL_SAMPLES_REQUIRED}); confirming before VPN yield"
+        write_sidecar "tailscale-required-confirming" "$s"
+        loop_sleep "$INTERVAL_RECOVER" idle || break
+        continue
+      fi
+      log "required Tailscale unavailable; yielding ExpressVPN before guarded recovery"
+      open_tailscale_standdown \
+        || log "could not record Tailscale-priority VPN standdown; continuing guarded recovery"
+      enter_plain_state tailscale-required-recovery "$s"
+      s="$(vpn_state)"; s="${s:-Disconnected}"
+    fi
+    if [[ "$s" == Disconnected && -x "$TAILSCALE_REPAIR" ]]; then
+      "$TAILSCALE_REPAIR" --auto --required >>"$LOG" 2>&1 || true
+    fi
+    if ! tailscale_ready; then
+      write_sidecar "tailscale-required-wait" "$s"
+      loop_sleep "$INTERVAL_RECOVER" backoff || break
+      continue
+    fi
+    log "required Tailscale healthy; optional VPN recovery may proceed"
+    tailscale_fail_samples=0
+    last_restore_marker=""
+  else
+    tailscale_fail_samples=0
+  fi
+
+  if [[ "$s" == Disconnected && "$ts_required" != yes && -x "$TAILSCALE_REPAIR" ]]; then
     "$TAILSCALE_REPAIR" --auto >>"$LOG" 2>&1 || true
+  fi
+
+  if [[ "$s" == Disconnected && -f "$TAILSCALE_STANDDOWN_FILE" ]]; then
+    plain_class=restricted
+    write_sidecar "tailscale-priority-standdown" "$s"
+    loop_sleep "$INTERVAL_OK" idle || break
+    continue
   fi
 
   key="$(network_fingerprint)"

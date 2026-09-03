@@ -22,9 +22,12 @@ darkmesh posture report --json             # combined local read-only peer repor
 darkmesh posture apply                 # explicit live transition only
 ```
 
-`set` records desired local intent in the untracked mode-0600 file
-`~/.config/darkmesh/posture.json`. It never touches a network service. `apply`
-is deliberately separate. Each apply captures the initial status, preflights
+`set` records a selection in the untracked mode-0600 file
+`~/.config/darkmesh/posture.json`. It never touches a network service or changes
+the continuously enforced posture. `apply` is deliberately separate. Each
+successful apply also records the enforced profile in the mode-0600
+`~/.config/darkmesh/posture-enforced.json`; unsuccessful transitions leave the
+previous enforced profile intact. Each apply captures the initial status, preflights
 transfer containment, runs one bounded plan, observes status until its deadline,
 and writes desired posture only after successful postconditions. Failure returns
 structured `initial`, `actions`, `postcondition`, and `rollback` evidence. The
@@ -45,6 +48,21 @@ checks. It has a stable `severity` (`green`, `yellow`, `red`, or `gray`) and a
 telemetry is yellow; unavailable required telemetry is gray unless an observed
 failure already proves red. SSH is deliberately unavailable in `show`, because
 it is only determined by the opt-in peer report below.
+
+`show` includes both `desiredProfile` and the additive `enforcedProfile`. A
+consumer may therefore distinguish a selection awaiting Apply from the last
+successfully converged policy.
+
+A successfully applied Tailscale-required profile is a durable contract. The
+healthcheck and reconnect owner continuously consume the enforced profile. On
+three confirmed misses, the commercial VPN yields after transfer containment,
+required Tailscale is restored, and only then may optional VPN recovery proceed.
+The Tailscale failure records a priority standdown, so optional VPN recovery
+requires an explicit `darkmesh up` rearm instead of risking a reconnect loop.
+The guarded repair can re-arm a stopped `WantRunning=false` backend without
+settings flags, then verifies that identity and saved preferences did not
+change. A host with `protect-tailscale=on` refuses profiles that forbid
+Tailscale.
 
 The two `optional` profiles never start their optional component and its
 absence is yellow. The two `preferred` profiles are secondary-high: absence
@@ -85,6 +103,10 @@ records effective physical-default, Internet-egress, Tailscale-sentinel,
 Tailscale-self, and configured-peer routes. It also includes Tailscale
 self/control health, warnings, and cached peer records. It never pings, opens
 TCP, or opens SSH.
+
+The Tailscale status document is parsed with a separate bounded machine-data
+limit before display fields are capped. Large peer maps must not be truncated
+into invalid JSON and misreported as an unavailable local Tailscale node.
 
 `probe` is the explicit active read-only path. For every valid configured peer it
 performs a bounded `tailscale ping --c 1 --until-direct=false`, TCP/22 check,

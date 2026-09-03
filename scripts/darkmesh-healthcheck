@@ -15,6 +15,7 @@ PF_SIDECAR="${DARKMESH_PF_SIDECAR:-/tmp/darkmesh-pf.json}"
 INFRA_STATUS="${DARKMESH_INFRA_STATUS:-$HOME/Library/Application Support/ServerMonitor/infrastructure-agent-status.json}"
 DESIRED_FILE="${DARKMESH_VPN_DESIRED:-$HOME/.config/darkmesh/vpn-desired}"
 CRD_REQUIRED_FILE="${DARKMESH_CRD_REQUIRED_FILE:-$HOME/.config/darkmesh/crd-required}"
+ENFORCED_POSTURE_FILE="${DARKMESH_ENFORCED_POSTURE_FILE:-$HOME/.config/darkmesh/posture-enforced.json}"
 DNS_OVERRIDE_JOURNAL="${DARKMESH_DNS_OVERRIDE_JOURNAL:-/Library/darkmesh/state/dns-override.state}"
 DNS_RESTORE_FAILURE_MARKER="${DARKMESH_DNS_RESTORE_FAILURE_MARKER:-$HOME/.config/darkmesh/dns-restore-failed}"
 LOG_DIR="${DARKMESH_LOG_DIR:-$HOME/Library/Logs/darkmesh}"
@@ -184,7 +185,10 @@ probe_e2e() {
 }
 
 probe_tailscale() {
-  if [[ ! -x "$TAILSCALE_CLI" ]]; then [[ "$PROTECT_TS" != yes ]]; return; fi
+  if [[ ! -x "$TAILSCALE_CLI" ]]; then
+    tailscale_required && return 1
+    return 0
+  fi
   local js self_ip iface self_iface
   js="$(run_with_deadline "$PROBE_DEADLINE" "$TAILSCALE_CLI" status --json)" || return 1
   grep '"BackendState": *"Running"' >/dev/null <<<"$js" || return 1
@@ -194,6 +198,11 @@ probe_tailscale() {
   iface="$(route -n get 100.64.0.1 2>/dev/null | awk '/interface:/{print $2; exit}')"
   self_iface="$(route -n get "$self_ip" 2>/dev/null | awk '/interface:/{print $2; exit}')"
   [[ "$iface" == utun* && "$iface" == "$self_iface" ]]
+}
+
+tailscale_required() {
+  [[ "$PROTECT_TS" == yes ]] && return 0
+  grep -Eq '"profile"[[:space:]]*:[[:space:]]*"(tailscale-required-[^"]+|dual-required-zero-general-egress-leak)"' "$ENFORCED_POSTURE_FILE" 2>/dev/null
 }
 
 crd_required() {
@@ -659,7 +668,7 @@ probe_and_decide() {
     VPN_PATH_FAIL_TICKS=0
     verdict=NO-GO
     [[ "$WATCH" == yes ]] && recover_crd_tick
-  elif [[ "$ts" == false && "$PROTECT_TS" == yes ]]; then
+  elif [[ "$ts" == false ]] && tailscale_required; then
     VPN_PATH_FAIL_TICKS=0
     verdict=NO-GO
   elif [[ "$ts" == false ]]; then
@@ -687,7 +696,7 @@ probe_and_decide() {
   output="$(status_json "$state" "$ipok" "$e2e" "$dns" "$ts" "$crd" "$crdreq" "$CRD_REASON" "$verdict" "$auto" "$auto_reason" "$auto_at")"
   if [[ "$WATCH" == yes ]]; then write_shared_status "$output"; else printf '%s\n' "$output"; fi
 
-  summary="state=$state ip=$ipok e2e=$e2e dns=$dns tailscale=$ts crd=$crd verdict=$verdict grace=$in_grace"
+  summary="state=$state ip=$ipok e2e=$e2e dns=$dns tailscale=$ts tailscale_required=$(tailscale_required && printf true || printf false) crd=$crd verdict=$verdict grace=$in_grace"
   if [[ "$summary" != "$LAST_SUMMARY" || $((now - LAST_HEARTBEAT)) -ge 600 ]]; then
     log "$summary"; LAST_SUMMARY="$summary"; LAST_HEARTBEAT="$now"
   fi

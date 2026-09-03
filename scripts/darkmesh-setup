@@ -159,10 +159,11 @@ if [[ "$LEGACY" == 0 ]]; then
   UNIFIED=1
 fi
 
-# Decide whether the healthcheck runs with --protect-tailscale. That flag drops the
-# VPN when Tailscale fails: right for a HEADLESS node (the tailnet is the only way
-# in), but it flaps the VPN on a laptop where the operator is present. Default by
-# chassis (a battery means laptop, so off); override with the file
+# Decide whether the healthcheck runs with --protect-tailscale. That flag marks
+# Tailscale as required; the reconnect owner makes the optional VPN yield before
+# guarded recovery. This is right for a HEADLESS node where the tailnet is the
+# command lifeline, but can flap the VPN on a laptop where the operator is
+# present. Default by chassis (a battery means laptop, so off); override with the file
 # ~/.config/darkmesh/protect-tailscale containing "on" or "off".
 protect_ts_repl() {
   local f="$HOME/.config/darkmesh/protect-tailscale" want

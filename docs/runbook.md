@@ -37,8 +37,17 @@ The new darkmesh job is:
   whose `100.64/10` route has fallen back to the physical interface. After
   three failures, restart only the saved macOS Tailscale VPN service, preserving
   identity and preferences and enforcing a one-hour automatic cooldown.
+- When the applied posture or headless override requires Tailscale, make
+  ExpressVPN yield after three confirmed Tailscale failures, restore Tailscale,
+  and keep optional VPN recovery in priority standdown until the operator runs
+  `darkmesh up` after confirming the private overlay is healthy.
 
 Operator repair for that condition is `darkmesh repair-tailscale`.
+
+If required Tailscale was stopped with `WantRunning=false`, the same guarded
+repair uses a bounded settings-free `tailscale up`. It refuses logout or
+authentication flows and verifies that the saved identity and preferences are
+unchanged. It never runs `tailscale down`, logout, reset, or quits the app.
 
 ### vpn-guard
 
@@ -79,6 +88,11 @@ It should be a display and control surface only:
 
 This keeps the Swift menu-bar app from becoming the source of truth for network
 policy.
+
+Selecting a posture and applying it are separate. Only a successful Apply
+writes `~/.config/darkmesh/posture-enforced.json` and changes continuous
+supervision. On a host with `protect-tailscale=on`, a posture that forbids
+Tailscale is rejected before any network action.
 
 ## Current working state
 

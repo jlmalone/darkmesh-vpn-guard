@@ -9,10 +9,12 @@ DESIRED_FILE="${DARKMESH_VPN_DESIRED:-$HOME/.config/darkmesh/vpn-desired}"
 CTL="/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl"
 PID_FILE="${DARKMESH_RECONNECT_PID_FILE:-$HOME/.config/darkmesh/reconnect.pid}"
 REARM_FILE="${DARKMESH_VPN_REARM:-$HOME/.config/darkmesh/vpn-rearm}"
+TAILSCALE_STANDDOWN_FILE="${DARKMESH_TAILSCALE_STANDDOWN_FILE:-$HOME/.config/darkmesh/tailscale-priority-standdown}"
 
 mkdir -p "$(dirname "$DESIRED_FILE")"
 printf 'on\n' > "$DESIRED_FILE"
 : > "$REARM_FILE"
+rm -f "$TAILSCALE_STANDDOWN_FILE"
 echo "darkmesh: vpn-desired=on"
 echo "  the reconnect watchdog will connect the VPN once open internet is detected."
 
