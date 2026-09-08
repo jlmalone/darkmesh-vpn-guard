@@ -8,6 +8,9 @@ All outputs are JSON envelopes with `schema: 2` and a `kind`. Consumers must
 ignore unknown fields and treat an unavailable or newer schema as unavailable,
 not as permission to change networking. Existing schema-4 status keys are not
 renamed or changed.
+The status writer also publishes additive `posture_profile` and
+`posture_reason` strings so lightweight consumers can explain their color
+without running the posture command or opening an active network view.
 
 ## Commands
 

@@ -213,6 +213,17 @@ tailscale_forbidden() {
   grep -Eq '"profile"[[:space:]]*:[[:space:]]*"internet-plain-transfer-contained"' "$ENFORCED_POSTURE_FILE" 2>/dev/null
 }
 
+enforced_posture_profile() {
+  /usr/bin/python3 - "$ENFORCED_POSTURE_FILE" <<'PY' 2>/dev/null
+import json, sys
+try:
+    value = json.load(open(sys.argv[1])).get("profile", "")
+    print(value if isinstance(value, str) else "")
+except Exception:
+    print("")
+PY
+}
+
 crd_required() {
   local configured=""
   [ -f "$CRD_REQUIRED_FILE" ] && configured="$(tr -d '[:space:]' < "$CRD_REQUIRED_FILE")"
@@ -547,7 +558,18 @@ status_json() {
   local state="$1" ipok="$2" e2e="$3" dns="$4" ts="$5" crd="$6" crdreq="$7" reason="$8" verdict="$9"
   shift 9
   local auto="$1" auto_reason="$2" auto_at="$3" desired services=true reconnect pf breakers='{}'
+  local posture_profile posture_reason
   desired="$(desired_state)"
+  posture_profile="$(enforced_posture_profile)"
+  case "$verdict:$posture_profile:$state" in
+    DEGRADED:*vpn-optional:Disconnected) posture_reason=optional-vpn-unavailable ;;
+    GO:*) posture_reason=profile-satisfied ;;
+    NO-GO:*) posture_reason=required-service-or-containment-failure ;;
+    CAPTIVE:*) posture_reason=captive-network-standdown ;;
+    PENDING:*) posture_reason=connectivity-check-pending ;;
+    OFF:*) posture_reason=vpn-intent-off ;;
+    *) posture_reason="status-$(printf '%s' "$verdict" | tr '[:upper:]' '[:lower:]')" ;;
+  esac
   local agent unified=vision.salient.InfrastructureAgent
   if launchctl print "gui/$(id -u)/$unified" >/dev/null 2>&1 && infrastructure_manages_darkmesh; then
     launchctl print "gui/$(id -u)/$unified" 2>/dev/null | grep -E 'state = running|pid = [0-9]+' >/dev/null || services=false
@@ -576,6 +598,8 @@ status_json() {
   "crd_reason": "$(json_escape "$reason")",
   "verdict": "$verdict",
   "desired": "$(json_escape "$desired")",
+  "posture_profile": "$(json_escape "$posture_profile")",
+  "posture_reason": "$(json_escape "$posture_reason")",
   "services_ok": $services,
   "auto_disconnected": $auto,
   "auto_disconnect_reason": "$(json_escape "$auto_reason")",
