@@ -157,14 +157,12 @@ probe_ip() {
 }
 
 probe_dns() {
-  local i result
-  for i in 1 2; do
-    result="$(host -W 3 -t NS . 2>&1)"
-    grep -iE 'name server|NS record' >/dev/null <<<"$result" && return 0
-  done
-  result="$(host -W 3 "$PROBE_NAME" 2>&1)"
-  grep -E 'has address|has IPv6 address' >/dev/null <<<"$result" && return 0
-  return 1
+  # `host` can resolve through BIND's own resolver path even after macOS has
+  # lost its SystemConfiguration DNS table. That proves a recursive resolver
+  # is reachable, not that applications using getaddrinfo can resolve names.
+  # Require both a system nameserver and a lookup through macOS's host cache.
+  system_nameservers | grep -q . || return 1
+  dscacheutil -q host -a name "$PROBE_NAME" 2>/dev/null | grep -q '^ip_address:'
 }
 
 probe_e2e() {
@@ -340,10 +338,14 @@ maybe_restore_override() {
 }
 
 dns_override_supported() {
-  local iface dhcp
+  local iface dhcp current
   iface="$(default_interface)"; [[ -n "$iface" ]] || return 1
   dhcp="$(dhcp_dns_for_interface "$iface")"; [[ -n "$dhcp" ]] || return 1
-  suspicious_resolver_present || return 1
+  # An empty resolver table is as actionable as a stale tunnel resolver. The
+  # direct probe below proves DHCP serves DNS before the root helper installs
+  # its journaled, reversible override.
+  current="$(system_nameservers)"
+  [[ -z "$current" ]] || suspicious_resolver_present || return 1
   probe_resolver_list "$dhcp"
 }
 
@@ -592,6 +594,7 @@ status_json() {
   "inet_e2e_ok": $e2e,
   "inet_ip_ok": $ipok,
   "dns_ok": $dns,
+  "system_dns_ok": $dns,
   "tailscale_ok": $ts,
   "crd_required": $crdreq,
   "crd_ok": $crd,
@@ -725,7 +728,13 @@ probe_and_decide() {
     verdict=DEGRADED
   elif vpn_forbidden; then
     VPN_PATH_FAIL_TICKS=0
-    if [[ "$state" == Disconnected ]]; then verdict=GO; else verdict=NO-GO; fi
+    # VPN/Tailscale being intentionally down is healthy only when the same
+    # real system-DNS and end-to-end checks as every other plain path pass.
+    if [[ "$state" == Disconnected && "$ipok" == true && "$dns" == true && "$e2e" == true ]]; then
+      verdict=GO
+    else
+      verdict=NO-GO
+    fi
   elif [[ "$(desired_state)" != on ]]; then
     VPN_PATH_FAIL_TICKS=0
     verdict=OFF

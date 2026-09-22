@@ -136,15 +136,21 @@ desired-on intent to `darkmesh-up` instead of connecting directly.
 
 ## Healthcheck relationship
 
-The healthcheck remains the safety observer and status writer. A single global
-probe failure reports degradation. Plain-network restoration requires two
-consecutive post-grace failures where end-to-end access is down together with
-DNS or raw IP access. Tailscale remains visible in status but does not trigger
-VPN teardown on a laptop.
+The healthcheck remains the safety observer and status writer. A DNS success
+requires both a nameserver in `scutil --dns` and a lookup through macOS's
+system resolver. A direct `host` lookup is not enough because it can bypass an
+empty SystemConfiguration resolver table. A single global probe failure reports
+degradation. Plain-network restoration requires two consecutive post-grace
+failures where end-to-end access is down together with DNS or raw IP access.
+When the system resolver table is empty, the existing privileged, journaled DNS
+override may promote a DHCP resolver only after directly proving that resolver
+answers. Tailscale remains visible in status but does not trigger VPN teardown
+on a laptop.
 
 Observer liveness is a separate state dimension. Each tick writes a progress
 heartbeat before any probe or recovery action. The supervisor marks the child
 unresponsive after 90 seconds of silence, force-recycles it, and restarts it.
 Status older than its published 60-second maximum is `STALE`, never GO or NO-GO.
 An intentional VPN-off state is `GO` only when an enforced VPN-forbidden posture
-exists and all required connectivity and safety probes pass.
+exists and all required connectivity and safety probes pass, including system
+DNS and end-to-end hostname access.

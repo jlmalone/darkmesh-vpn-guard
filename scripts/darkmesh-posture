@@ -66,7 +66,13 @@ def observed():
     try:
         data=json.loads(STATUS.read_text()); authored=dt.datetime.fromisoformat(data["timestamp"].replace("Z","+00:00")).timestamp()
         limit=data.get("max_age_seconds",60); age=max(0,time.time()-authored,time.time()-STATUS.stat().st_mtime)
-        value.update({"available":True,"fresh":age <= limit,"reason":"ok" if age <= limit else "status-stale","ageSeconds":round(age,3),"maxAgeSeconds":limit,"statusSchema":data.get("schema"),"internet":data.get("internet_ok",data.get("inet_e2e_ok")),"vpn":data.get("vpn_state")=="Connected","vpnState":data.get("vpn_state"),"tailscale":data.get("tailscale_ok"),"transferSafety":(data.get("pf") or {}).get("pf_anchor_evaluated"),"verdict":data.get("verdict")})
+        system_dns=data.get("system_dns_ok",data.get("dns_ok"))
+        internet=data.get("internet_ok",data.get("inet_e2e_ok"))
+        # A producer claiming e2e access without a working macOS resolver is
+        # inconsistent. Fail closed so an internet-required profile is red.
+        if system_dns is not True:
+            internet=False
+        value.update({"available":True,"fresh":age <= limit,"reason":"ok" if age <= limit else "status-stale","ageSeconds":round(age,3),"maxAgeSeconds":limit,"statusSchema":data.get("schema"),"internet":internet,"systemDns":system_dns,"vpn":data.get("vpn_state")=="Connected","vpnState":data.get("vpn_state"),"tailscale":data.get("tailscale_ok"),"transferSafety":(data.get("pf") or {}).get("pf_anchor_evaluated"),"verdict":data.get("verdict")})
     except Exception as exc: value.update({"reason":"status-invalid","detail":str(exc).replace("\n"," ")[:160]})
     return value
 def tailscale_status():
