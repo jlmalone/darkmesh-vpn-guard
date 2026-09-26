@@ -185,6 +185,13 @@ def acquire_lock():
     LOCK.parent.mkdir(parents=True,exist_ok=True)
     try: return os.open(str(LOCK),os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
     except FileExistsError: return None
+def allow_vpn_during_apply(handle):
+    # Keep the old enforced profile until postconditions pass, but let its
+    # reconnect owner attempt the new VPN policy while this apply is alive.
+    os.ftruncate(handle,0)
+    os.lseek(handle,0,os.SEEK_SET)
+    os.write(handle,f"allow-vpn {os.getpid()} {int(time.time())}\n".encode())
+    os.fsync(handle)
 def apply(profile_id):
     p=get_profile(profile_id)
     if not p: emit({"schema":2,"kind":"darkmesh-posture-apply","applied":False,"reason":"unknown-profile"},2)
@@ -204,6 +211,8 @@ def apply(profile_id):
         if transition.get("tailscale")=="down" and initial.get("tailscale") is True and not invoke("tailscale-down",[TS,"down"],evidence): rollback_panic("tailscale-down-failed"); emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"tailscale-down-failed","actions":evidence,"rollback":{"attempted":True,"events":rollback}},3)
         if transition.get("tailscale")=="verify-or-guarded-repair" and initial.get("tailscale") is not True and not invoke("guarded-tailscale-repair",[REPAIR],evidence): emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"tailscale-establishment-failed","actions":evidence,"rollback":{"attempted":False}},3)
         needs_vpn_rearm = initial.get("vpn") is not True or (transition.get("vpn") == "attempt-with-rollback" and initial.get("tailscale") is not True)
+        if transition.get("vpn") in ("rearm","attempt-with-rollback") and needs_vpn_rearm:
+            allow_vpn_during_apply(handle)
         if transition.get("vpn") in ("rearm","attempt-with-rollback") and needs_vpn_rearm and not invoke("vpn-rearm",[UP],evidence): rollback_panic("vpn-rearm-failed"); emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"vpn-rearm-failed","actions":evidence,"rollback":{"attempted":True,"events":rollback}},3)
         if transition.get("tailscale")=="guarded-repair-when-supported" and initial.get("tailscale") is not True: evidence.append({"step":"guarded-tailscale-repair","ok":False,"code":None,"detail":"not-run: VPN-required path lacks plain-network preconditions"})
         deadline=time.monotonic()+APPLY_DEADLINE; post=observed()

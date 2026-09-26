@@ -34,7 +34,11 @@ previous enforced profile intact. Each apply captures the initial status, prefli
 transfer containment, runs one bounded plan, observes status until its deadline,
 and writes desired posture only after successful postconditions. Failure returns
 structured `initial`, `actions`, `postcondition`, and `rollback` evidence. The
-plain profile invokes `darkmesh-panic`, then explicitly runs `tailscale down`.
+reconnect owner temporarily permits a VPN rearm from a VPN-forbidden profile only
+while the applying process is alive and its private apply marker is fresh. The
+marker expires after six minutes and is removed when apply finishes. A failed
+apply rolls back to the prior enforced policy. The plain profile invokes
+`darkmesh-panic`, then explicitly runs `tailscale down`.
 It does not change panic's normal route-preserving behavior. VPN-required plans
 use `darkmesh-up`; required Tailscale uses only `darkmesh-repair-tailscale` when
 that guarded primitive supports the current conditions. No profile enables
