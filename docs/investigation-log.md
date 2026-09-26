@@ -66,6 +66,23 @@ diagnostic data. A MagicSock receive warning remains visible because online
 control state and a route do not prove peer traffic works; a real peer probe
 is the separate dataplane check.
 
+### Shared-supervisor status scope
+
+The Darkmesh audit checked its own two children and `vpn-guard` job, but the
+long-running healthcheck required every job in Server Monitor's shared
+infrastructure agent to have a successful recent run. An unrelated scheduled
+job could therefore set `services_ok=false` while Darkmesh itself reported
+`GO`. Server Monitor interpreted that field as a required Darkmesh failure and
+colored its combined menu item red. The healthcheck now uses the same owned
+child and job scope as the audit. Other jobs retain their own Server Monitor
+status and must not trigger Darkmesh recovery or a false Darkmesh failure.
+
+At 21:54 UTC, after the route-check correction, live IP and web probes failed
+while ExpressVPN was connected, then Tailscale failed repeated checks and the
+safety path yielded the VPN. Disk space was available during this failure.
+The underlying connected-path loss remains unresolved; the scope correction
+does not claim to repair it.
+
 
 ## 2026-07-15: cafe Wi-Fi recovery flap and filtered-region gate
 

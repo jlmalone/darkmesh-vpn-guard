@@ -537,10 +537,11 @@ def job_healthy(row):
     max_age = max(90.0, float(row.get("intervalSeconds", 0)) * 2 + 30)
     return (now - completed).total_seconds() <= max_age
 ok = d.get("configLoaded") is True
-ok = ok and all(key in children for key in ("darkmesh-healthcheck", "darkmesh-reconnect"))
-ok = ok and all(row.get("running") is True and row.get("responsive") is True
-                for row in children.values())
-ok = ok and "vpn-guard" in jobs and all(job_healthy(row) for row in jobs.values())
+owned_children = ("darkmesh-healthcheck", "darkmesh-reconnect")
+ok = ok and all(key in children for key in owned_children)
+ok = ok and all(children[key].get("running") is True and children[key].get("responsive") is True
+                for key in owned_children if key in children)
+ok = ok and "vpn-guard" in jobs and job_healthy(jobs["vpn-guard"])
 raise SystemExit(0 if ok else 1)
 PY
 }
