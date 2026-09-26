@@ -38,18 +38,18 @@ MAX_OUTPUT = 32768
 MAX_JSON_OUTPUT = 1048576
 
 PROFILES = [
- {"id":"internet-plain-transfer-contained","title":"Plain internet with transfer containment","required":{"internet":True,"transferSafety":True},"preferred":{},"forbidden":{"vpn":True,"tailscale":True},"priority":["internet","transferSafety","vpn","tailscale"],"transition":{"vpn":"panic","tailscale":"down","attemptSecondary":False,"rollback":"panic"},"degraded":"VPN and Tailscale are explicitly disabled; transfer containment remains required."},
- {"id":"tailscale-required-vpn-forbidden","title":"Tailscale required, VPN forbidden","required":{"internet":True,"tailscale":True,"transferSafety":True},"preferred":{},"forbidden":{"vpn":True},"priority":["internet","tailscale","transferSafety","vpn"],"transition":{"vpn":"panic","tailscale":"verify-or-guarded-repair","attemptSecondary":False,"rollback":"panic"},"degraded":"Required Tailscale failure or VPN presence is red."},
- {"id":"tailscale-required-vpn-optional","title":"Tailscale required, VPN optional","required":{"internet":True,"tailscale":True,"transferSafety":True},"preferred":{"vpn":True},"forbidden":{},"priority":["internet","tailscale","transferSafety","vpn"],"transition":{"vpn":"panic-before-repair","tailscale":"verify-or-guarded-repair","attemptSecondary":False,"rollback":"panic"},"degraded":"VPN is a nice-to-have: absence is yellow and apply never starts it."},
- {"id":"tailscale-required-vpn-preferred","title":"Tailscale required, VPN secondary-high","required":{"internet":True,"tailscale":True,"transferSafety":True},"preferred":{"vpn":True},"forbidden":{},"priority":["internet","tailscale","transferSafety","vpn"],"transition":{"vpn":"attempt-with-rollback","tailscale":"verify-or-guarded-repair","attemptSecondary":True,"rollback":"panic-if-tailscale-or-ssh-regresses"},"degraded":"VPN absence is yellow; one bounded attempt rolls back on Tailscale or SSH regression."},
- {"id":"vpn-required-tailscale-forbidden","title":"VPN required, Tailscale forbidden","required":{"internet":True,"vpn":True,"transferSafety":True},"preferred":{},"forbidden":{"tailscale":True},"priority":["internet","vpn","transferSafety","tailscale"],"transition":{"vpn":"rearm","tailscale":"down","attemptSecondary":False,"rollback":"rearm-vpn"},"degraded":"Required VPN failure or Tailscale presence is red."},
- {"id":"vpn-required-tailscale-optional","title":"VPN required, Tailscale optional","required":{"internet":True,"vpn":True,"transferSafety":True},"preferred":{"tailscale":True},"forbidden":{},"priority":["internet","vpn","transferSafety","tailscale"],"transition":{"vpn":"rearm","tailscale":"unchanged","attemptSecondary":False,"rollback":"rearm-vpn"},"degraded":"Tailscale is a nice-to-have: absence is yellow and apply never starts it."},
- {"id":"vpn-required-tailscale-preferred","title":"VPN required, Tailscale secondary-high","required":{"internet":True,"vpn":True,"transferSafety":True},"preferred":{"tailscale":True},"forbidden":{},"priority":["internet","vpn","transferSafety","tailscale"],"transition":{"vpn":"rearm","tailscale":"guarded-repair-when-supported","attemptSecondary":True,"rollback":"rearm-vpn"},"degraded":"Tailscale absence is yellow; only a bounded safe repair may be attempted."},
+ {"id":"internet-plain-transfer-contained","title":"Plain internet with transfer containment","required":{"internet":True,"transferSafety":True},"preferred":{},"forbidden":{"vpn":True,"tailscale":True},"priority":["internet","transferSafety","vpn","tailscale"],"transition":{"vpn":"panic","tailscale":"down","attemptSecondary":False,"rollback":"policy-persists"},"degraded":"VPN and Tailscale are explicitly disabled; transfer containment remains required."},
+ {"id":"tailscale-required-vpn-forbidden","title":"Tailscale required, VPN forbidden","required":{"internet":True,"tailscale":True,"transferSafety":True},"preferred":{},"forbidden":{"vpn":True},"priority":["internet","tailscale","transferSafety","vpn"],"transition":{"vpn":"panic","tailscale":"verify-or-guarded-repair","attemptSecondary":False,"rollback":"policy-persists"},"degraded":"Required Tailscale failure or VPN presence is red."},
+ {"id":"tailscale-required-vpn-optional","title":"Tailscale required, VPN optional","required":{"internet":True,"tailscale":True,"transferSafety":True},"preferred":{"vpn":True},"forbidden":{},"priority":["internet","tailscale","transferSafety","vpn"],"transition":{"vpn":"panic-before-repair","tailscale":"verify-or-guarded-repair","attemptSecondary":False,"rollback":"policy-persists"},"degraded":"VPN is a nice-to-have: absence is yellow and apply never starts it."},
+ {"id":"tailscale-required-vpn-preferred","title":"Tailscale required, VPN secondary-high","required":{"internet":True,"tailscale":True,"transferSafety":True},"preferred":{"vpn":True},"forbidden":{},"priority":["internet","tailscale","transferSafety","vpn"],"transition":{"vpn":"attempt-with-rollback","tailscale":"verify-or-guarded-repair","attemptSecondary":True,"rollback":"policy-persists"},"degraded":"VPN absence is yellow; one bounded attempt reports Tailscale or SSH regression."},
+ {"id":"vpn-required-tailscale-forbidden","title":"VPN required, Tailscale forbidden","required":{"internet":True,"vpn":True,"transferSafety":True},"preferred":{},"forbidden":{"tailscale":True},"priority":["internet","vpn","transferSafety","tailscale"],"transition":{"vpn":"rearm","tailscale":"down","attemptSecondary":False,"rollback":"policy-persists"},"degraded":"Required VPN failure or Tailscale presence is red."},
+ {"id":"vpn-required-tailscale-optional","title":"VPN required, Tailscale optional","required":{"internet":True,"vpn":True,"transferSafety":True},"preferred":{"tailscale":True},"forbidden":{},"priority":["internet","vpn","transferSafety","tailscale"],"transition":{"vpn":"rearm","tailscale":"unchanged","attemptSecondary":False,"rollback":"policy-persists"},"degraded":"Tailscale is a nice-to-have: absence is yellow and apply never starts it."},
+ {"id":"vpn-required-tailscale-preferred","title":"VPN required, Tailscale secondary-high","required":{"internet":True,"vpn":True,"transferSafety":True},"preferred":{"tailscale":True},"forbidden":{},"priority":["internet","vpn","transferSafety","tailscale"],"transition":{"vpn":"rearm","tailscale":"guarded-repair-when-supported","attemptSecondary":True,"rollback":"policy-persists"},"degraded":"Tailscale absence is yellow; only a bounded safe repair may be attempted."},
  {"id":"dual-required-zero-general-egress-leak","title":"Strict dual-required, zero general-egress leak","required":{"internet":True,"vpn":True,"tailscale":True,"ssh":True,"transferSafety":True,"zeroGeneralEgressLeak":True},"preferred":{},"forbidden":{},"capabilities":{"zeroGeneralEgressLeak":False},"priority":["internet","vpn","tailscale","ssh","transferSafety","zeroGeneralEgressLeak"],"transition":{"capability":"machine-wide-kill-switch","apply":"refuse"},"degraded":"Unavailable: this installation deliberately has no machine-wide kill switch."}
 ]
 for profile in PROFILES:
-    # A transition can contain several 60-second primitives, convergence, and
-    # rollback. Consumers must not terminate it mid-rollback.
+    # A transition can contain several 60-second primitives and convergence.
+    # Consumers must not terminate it while those actions are in progress.
     profile["timeout_seconds"] = 360
 
 def emit(value, code=0): print(json.dumps(value, separators=(",", ":"), sort_keys=True)); raise SystemExit(code)
@@ -185,13 +185,6 @@ def acquire_lock():
     LOCK.parent.mkdir(parents=True,exist_ok=True)
     try: return os.open(str(LOCK),os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
     except FileExistsError: return None
-def allow_vpn_during_apply(handle):
-    # Keep the old enforced profile until postconditions pass, but let its
-    # reconnect owner attempt the new VPN policy while this apply is alive.
-    os.ftruncate(handle,0)
-    os.lseek(handle,0,os.SEEK_SET)
-    os.write(handle,f"allow-vpn {os.getpid()} {int(time.time())}\n".encode())
-    os.fsync(handle)
 def apply(profile_id):
     p=get_profile(profile_id)
     if not p: emit({"schema":2,"kind":"darkmesh-posture-apply","applied":False,"reason":"unknown-profile"},2)
@@ -202,28 +195,31 @@ def apply(profile_id):
     try:
         initial=observed(); initial["vpnIntent"]=Path(os.environ.get("DARKMESH_VPN_DESIRED", HOME / ".config/darkmesh/vpn-desired")).read_text().strip() if Path(os.environ.get("DARKMESH_VPN_DESIRED", HOME / ".config/darkmesh/vpn-desired")).exists() else None
         if initial.get("fresh") is not True or initial.get("transferSafety") is not True: emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"fresh-transfer-containment-required","initial":initial,"rollback":{"attempted":False,"reason":"preflight-failed"}},3)
-        evidence=[]; rollback=[]; transition=p["transition"]; initial_ssh=ssh_reachability() if transition.get("vpn")=="attempt-with-rollback" else None
-        def rollback_panic(reason):
-            ok=invoke("rollback-plain-network",[PANIC],rollback); rollback.append({"reason":reason,"restoredHigherPriority":"plain-internet-and-transfer-containment","ok":ok})
+        # Apply changes policy immediately. Failed convergence leaves that
+        # policy active and visibly unmet until recovery or another apply.
+        write_desired(profile_id); write_enforced(profile_id)
+        evidence=[]; transition=p["transition"]; initial_ssh=ssh_reachability() if transition.get("vpn")=="attempt-with-rollback" else None
+        def failed(reason, post=None):
+            current=post if post is not None else observed()
+            emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":True,"converged":False,"reason":reason,"initial":initial,"postcondition":current,"assessment":assess(p,current),"actions":evidence,"rollback":{"attempted":False,"reason":"policy-persists"}},3)
         needs_plain_transition = transition.get("vpn") == "panic" or (transition.get("vpn") == "panic-before-repair" and initial.get("tailscale") is not True)
-        if needs_plain_transition and initial.get("vpn") is True and not invoke("plain-network-transition",[PANIC],evidence): emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"plain-network-transition-failed","initial":initial,"actions":evidence,"rollback":{"attempted":False}},3)
-        if transition.get("vpn")=="attempt-with-rollback" and initial.get("vpn") is True and initial.get("tailscale") is not True and not invoke("plain-network-transition",[PANIC],evidence): emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"plain-network-transition-failed","initial":initial,"actions":evidence,"rollback":{"attempted":False}},3)
-        if transition.get("tailscale")=="down" and initial.get("tailscale") is True and not invoke("tailscale-down",[TS,"down"],evidence): rollback_panic("tailscale-down-failed"); emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"tailscale-down-failed","actions":evidence,"rollback":{"attempted":True,"events":rollback}},3)
-        if transition.get("tailscale")=="verify-or-guarded-repair" and initial.get("tailscale") is not True and not invoke("guarded-tailscale-repair",[REPAIR],evidence): emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"tailscale-establishment-failed","actions":evidence,"rollback":{"attempted":False}},3)
-        needs_vpn_rearm = initial.get("vpn") is not True or (transition.get("vpn") == "attempt-with-rollback" and initial.get("tailscale") is not True)
-        if transition.get("vpn") in ("rearm","attempt-with-rollback") and needs_vpn_rearm:
-            allow_vpn_during_apply(handle)
-        if transition.get("vpn") in ("rearm","attempt-with-rollback") and needs_vpn_rearm and not invoke("vpn-rearm",[UP],evidence): rollback_panic("vpn-rearm-failed"); emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"vpn-rearm-failed","actions":evidence,"rollback":{"attempted":True,"events":rollback}},3)
+        if needs_plain_transition and initial.get("vpn") is True and not invoke("plain-network-transition",[PANIC],evidence): failed("plain-network-transition-failed")
+        if transition.get("vpn")=="attempt-with-rollback" and initial.get("vpn") is True and initial.get("tailscale") is not True and not invoke("plain-network-transition",[PANIC],evidence): failed("plain-network-transition-failed")
+        if transition.get("tailscale")=="down" and initial.get("tailscale") is True and not invoke("tailscale-down",[TS,"down"],evidence): failed("tailscale-down-failed")
+        if transition.get("tailscale")=="verify-or-guarded-repair" and initial.get("tailscale") is not True and not invoke("guarded-tailscale-repair",[REPAIR],evidence): failed("tailscale-establishment-failed")
+        needs_vpn_rearm = initial.get("vpn") is not True or initial.get("vpnIntent") != "on" or (transition.get("vpn") == "attempt-with-rollback" and initial.get("tailscale") is not True)
+        if transition.get("vpn") in ("rearm","attempt-with-rollback") and needs_vpn_rearm and not invoke("vpn-rearm",[UP],evidence): failed("vpn-rearm-failed")
         if transition.get("tailscale")=="guarded-repair-when-supported" and initial.get("tailscale") is not True: evidence.append({"step":"guarded-tailscale-repair","ok":False,"code":None,"detail":"not-run: VPN-required path lacks plain-network preconditions"})
         deadline=time.monotonic()+APPLY_DEADLINE; post=observed()
         while time.monotonic()<deadline and assess(p,post)["severity"] in ("red","gray"): time.sleep(.2); post=observed()
         post_ssh=ssh_reachability() if initial_ssh is True else None
         regression=transition.get("vpn")=="attempt-with-rollback" and ((initial.get("tailscale") is True and post.get("tailscale") is not True) or (initial_ssh is True and post_ssh is not True))
         final=assess(p,post,post_ssh)
-        if regression or final["severity"] in ("red","gray"):
-            if transition.get("vpn") in ("rearm","attempt-with-rollback"): rollback_panic("higher-priority-regression" if regression else "postcondition-failed")
-            emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"higher-priority-regression" if regression else "postcondition-failed","initial":initial,"postcondition":post,"assessment":final,"actions":evidence,"rollback":{"attempted":bool(rollback),"events":rollback}},3)
-        write_desired(profile_id); write_enforced(profile_id); emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":True,"initial":initial,"postcondition":post,"assessment":final,"actions":evidence,"rollback":{"attempted":False,"reason":"not-needed"}})
+        if regression:
+            invoke("protect-higher-priority-path",[PANIC],evidence)
+            failed("higher-priority-regression")
+        if final["severity"] in ("red","gray"): failed("postcondition-failed",post)
+        emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":True,"converged":True,"initial":initial,"postcondition":post,"assessment":final,"actions":evidence,"rollback":{"attempted":False,"reason":"policy-persists"}})
     finally:
         os.close(handle)
         try: LOCK.unlink()

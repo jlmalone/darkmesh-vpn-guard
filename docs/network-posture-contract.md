@@ -28,17 +28,15 @@ darkmesh posture apply                 # explicit live transition only
 `set` records a selection in the untracked mode-0600 file
 `~/.config/darkmesh/posture.json`. It never touches a network service or changes
 the continuously enforced posture. `apply` is deliberately separate. Each
-successful apply also records the enforced profile in the mode-0600
-`~/.config/darkmesh/posture-enforced.json`; unsuccessful transitions leave the
-previous enforced profile intact. Each apply captures the initial status, preflights
-transfer containment, runs one bounded plan, observes status until its deadline,
-and writes desired posture only after successful postconditions. Failure returns
-structured `initial`, `actions`, `postcondition`, and `rollback` evidence. The
-reconnect owner temporarily permits a VPN rearm from a VPN-forbidden profile only
-while the applying process is alive and its private apply marker is fresh. The
-marker expires after six minutes and is removed when apply finishes. A failed
-apply rolls back to the prior enforced policy. The plain profile invokes
-`darkmesh-panic`, then explicitly runs `tailscale down`.
+apply also records the enforced profile in the mode-0600
+`~/.config/darkmesh/posture-enforced.json`. After the transfer containment
+preflight, apply records the new policy before attempting network changes. A
+connection or convergence failure leaves that policy active and reports its
+unmet requirements. A rejected selection or failed preflight leaves the old
+policy in place.
+Each apply captures the initial status, runs one bounded plan, and observes
+status until its deadline. The plain profile invokes `darkmesh-panic`, then
+explicitly runs `tailscale down`.
 It does not change panic's normal route-preserving behavior. VPN-required plans
 use `darkmesh-up`; required Tailscale uses only `darkmesh-repair-tailscale` when
 that guarded primitive supports the current conditions. No profile enables
@@ -81,8 +79,9 @@ passed. A connected VPN under the same contract is `NO-GO`.
 The two `optional` profiles never start their optional component and its
 absence is yellow. The two `preferred` profiles are secondary-high: absence
 is yellow and an explicit apply may make one bounded attempt. A Tailscale-first
-VPN attempt rolls back with `darkmesh-panic` if its previously working
-Tailscale path regresses. A VPN-first Tailscale attempt is skipped rather than
+VPN attempt restores the plain network if its previously working Tailscale path
+regresses. The newly applied policy remains active and reports the unmet
+requirement. A VPN-first Tailscale attempt is skipped rather than
 using an unsafe restart when the guarded repair's plain-network preconditions
 do not hold.
 
@@ -97,7 +96,7 @@ the plain path, then use guarded repair; only the secondary-high profile may
 make a later bounded VPN attempt. The strict profile publishes
 `capabilities.zeroGeneralEgressLeak=false`, and refusal echoes that metadata.
 Profiles publish a 360-second consumer deadline so the UI cannot terminate a
-multi-step transition or its rollback merely because an individual primitive
+multi-step transition merely because an individual primitive
 uses the 60-second producer deadline.
 
 ## Peer topology

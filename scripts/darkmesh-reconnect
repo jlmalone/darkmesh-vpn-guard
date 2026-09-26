@@ -54,7 +54,6 @@ PLAIN_RESTORE="${DARKMESH_PLAIN_RESTORE:-$(command -v darkmesh-restore-plain-net
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TAILSCALE_REPAIR="${DARKMESH_TAILSCALE_REPAIR:-$(command -v darkmesh-repair-tailscale 2>/dev/null || echo "$SCRIPT_DIR/darkmesh-repair-tailscale")}"
 ENFORCED_POSTURE_FILE="${DARKMESH_ENFORCED_POSTURE_FILE:-$HOME/.config/darkmesh/posture-enforced.json}"
-POSTURE_APPLY_LOCK="${DARKMESH_POSTURE_LOCK:-$HOME/.config/darkmesh/posture.apply.lock}"
 PROTECT_TAILSCALE_FILE="${DARKMESH_PROTECT_TAILSCALE_FILE:-$HOME/.config/darkmesh/protect-tailscale}"
 TAILSCALE_STANDDOWN_FILE="${DARKMESH_TAILSCALE_STANDDOWN_FILE:-$HOME/.config/darkmesh/tailscale-priority-standdown}"
 VPN_GUARD="${DARKMESH_VPN_GUARD:-$(command -v vpn-guard.sh 2>/dev/null || echo "$SCRIPT_DIR/vpn-guard.sh")}"
@@ -101,16 +100,6 @@ tailscale_required() {
   grep -Eq '"profile"[[:space:]]*:[[:space:]]*"(tailscale-required-[^"]+|dual-required-zero-general-egress-leak)"' "$ENFORCED_POSTURE_FILE" 2>/dev/null
 }
 vpn_forbidden() {
-  local marker="" owner="" started="" now=""
-  if [ -r "$POSTURE_APPLY_LOCK" ]; then
-    read -r marker owner started < "$POSTURE_APPLY_LOCK" || true
-    now="$(date +%s)"
-    if [ "$marker" = allow-vpn ] && [[ "$owner" =~ ^[0-9]+$ ]] \
-      && [[ "$started" =~ ^[0-9]+$ ]] && [ "$started" -le "$now" ] \
-      && [ "$((now - started))" -le 360 ] && kill -0 "$owner" 2>/dev/null; then
-      return 1
-    fi
-  fi
   grep -Eq '"profile"[[:space:]]*:[[:space:]]*"(internet-plain-transfer-contained|tailscale-required-vpn-forbidden)"' "$ENFORCED_POSTURE_FILE" 2>/dev/null
 }
 set_desired_off() {
