@@ -6,6 +6,34 @@ so the reasoning behind past decisions stays intact.
 
 ---
 
+## 2026-09-26: Tailscale extension bypass drift on a local Mac
+
+ExpressVPN 14.3.1 over WireGuard reached `Connected`, then the running
+Tailscale node went offline. Darkmesh yielded ExpressVPN after repeated
+required-Tailscale failures. Lightway UDP on 14.2.0 also failed to preserve
+Tailscale, and on 14.3.1 did not establish a stable VPN connection. These
+observations do not establish that the two products can never coexist.
+
+The ExpressVPN split-app list contained a bypass rule for a Tailscale network
+extension executable that no longer existed. The live Tailscale extension
+process used a different installation UUID. The old `verify` command accepted
+any Tailscale extension rule, and the pre-connect check matched an extension
+version rather than the running executable path. The general audit did not
+inspect the bypass rule. Thus setup could report success while the active
+extension was unbypassed. This is a concrete configuration fault and a plausible
+cause of the immediate Tailscale failure; a corrected-rule live connection has
+not yet established causality.
+
+The `check-bypass` read-only command now requires an exact split-app rule for
+the running extension executable. Setup and verify use it, audit reports a
+failure, and reconnect refuses a new VPN connection under a Tailscale-required
+posture when it fails. The live correction needs the operator to authorize
+ExpressVPN's root-only `set split-app` command. After that, verify the exact
+rule, connect once, and measure sustained VPN, internet, DNS, and tailnet peer
+reachability before calling coexistence fixed. The July 2026 protocol matrix
+already exhausted broad protocol trials without a durable winner.
+
+
 ## 2026-07-15: cafe Wi-Fi recovery flap and filtered-region gate
 
 On a new cafe network, a few global-probe successes caused a VPN attempt. DNS and

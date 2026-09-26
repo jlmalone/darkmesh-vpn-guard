@@ -53,6 +53,7 @@ DOCTOR="${DARKMESH_DOCTOR:-$(command -v transfer-vpn-doctor 2>/dev/null || echo 
 PLAIN_RESTORE="${DARKMESH_PLAIN_RESTORE:-$(command -v darkmesh-restore-plain-network 2>/dev/null || echo "$HOME/.local/bin/darkmesh-restore-plain-network")}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TAILSCALE_REPAIR="${DARKMESH_TAILSCALE_REPAIR:-$(command -v darkmesh-repair-tailscale 2>/dev/null || echo "$SCRIPT_DIR/darkmesh-repair-tailscale")}"
+TAILSCALE_BYPASS_CHECK="${DARKMESH_TAILSCALE_BYPASS_CHECK:-$SCRIPT_DIR/darkmesh-expressvpn-tailscale}"
 ENFORCED_POSTURE_FILE="${DARKMESH_ENFORCED_POSTURE_FILE:-$HOME/.config/darkmesh/posture-enforced.json}"
 PROTECT_TAILSCALE_FILE="${DARKMESH_PROTECT_TAILSCALE_FILE:-$HOME/.config/darkmesh/protect-tailscale}"
 TAILSCALE_STANDDOWN_FILE="${DARKMESH_TAILSCALE_STANDDOWN_FILE:-$HOME/.config/darkmesh/tailscale-priority-standdown}"
@@ -664,6 +665,13 @@ while true; do
     fi
     enter_plain_state plain-cooldown "$s"
     write_sidecar "gave-up" "$s"; loop_sleep "$INTERVAL_OK" backoff || break; continue
+  fi
+
+  if [[ "$ts_required" == yes ]] && ! "$TAILSCALE_BYPASS_CHECK" check-bypass >/dev/null 2>&1; then
+    log "required Tailscale extension has no verified ExpressVPN bypass; refusing VPN connect"
+    write_sidecar "tailscale-bypass-required" "$s"
+    loop_sleep "$INTERVAL_OK" idle || break
+    continue
   fi
 
   log "recovering: state=$s, attempt $(( consecutive_fails + 1 ))"

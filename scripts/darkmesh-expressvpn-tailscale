@@ -20,13 +20,14 @@ CLIENT_PROC="${CLIENT_PROC:-TransferClient}"
 
 usage() {
   cat <<'EOF'
-Usage: darkmesh-expressvpn-tailscale <status|apply [--strict]|verify>
+Usage: darkmesh-expressvpn-tailscale <status|apply [--strict]|verify|check-bypass>
 
 status  Print ExpressVPN, split-tunnel, system-extension, and Tailscale state.
 apply   Enable ExpressVPN split tunneling and bypass Tailscale only. Darkmesh owns connect.
         Network Lock is left OFF by default (relaxed). Pass --strict to force it ON.
 verify  Run status plus Tailscale netcheck and transfer-client binding diagnostics.
         Network Lock is treated as advisory; warns instead of failing when OFF.
+check-bypass  Read-only check that the running Tailscale extension is bypassed.
 
 This tool must never add the transfer client to ExpressVPN split-tunnel bypass rules.
 
@@ -62,6 +63,31 @@ find_tailscale_extensions() {
     -path '*io.tailscale.ipn.macsys.network-extension.systemextension/Contents/MacOS/io.tailscale.ipn.macsys.network-extension' \
     -type f 2>/dev/null)"
   printf '%s\n' "$bundled"
+}
+
+running_tailscale_extensions() {
+  # Process executable paths identify the extension macOS actually launched.
+  # A saved rule for another extension UUID or the same bundle version is not enough.
+  ps -axo comm= 2>/dev/null \
+    | grep -E '^/Library/SystemExtensions/[^/]+/io\.tailscale\.ipn\.macsys\.network-extension\.systemextension/Contents/MacOS/io\.tailscale\.ipn\.macsys\.network-extension$' \
+    | sort -u || true
+}
+
+check_bypass() {
+  local split_apps running_extensions ts_ext
+  [[ "$(express_get splittunnel)" == true ]] || die "ExpressVPN Split Tunnel is not enabled"
+  split_apps="$("$EXPRESSVPN_CTL" get split-app 2>/dev/null)" \
+    || die "cannot read ExpressVPN split-app rules"
+  grep -Fxq -- "bypass:$TAILSCALE_APP" <<<"$split_apps" \
+    || die "Tailscale app is not in the bypass list"
+  running_extensions="$(running_tailscale_extensions)"
+  [[ -n "$running_extensions" ]] || die "cannot identify a running Tailscale network extension"
+  while IFS= read -r ts_ext; do
+    [[ -f "$ts_ext" ]] || die "running Tailscale extension is missing on disk: $ts_ext"
+    grep -Fxq -- "bypass:$ts_ext" <<<"$split_apps" \
+      || die "running Tailscale extension is not in the bypass list: $ts_ext"
+  done <<<"$running_extensions"
+  echo "Running Tailscale extension has an exact ExpressVPN bypass rule."
 }
 
 find_crd_binaries() {
@@ -189,33 +215,9 @@ apply_setup() {
     die "transfer client is present in split-tunnel rules; remove it before continuing"
   fi
 
-  # Pre-connect safety: every active Tailscale extension MUST be in the bypass
-  # list, or connecting will route Tailscale through ExpressVPN and kill SSH.
-  # Determine active versions from systemextensionsctl, then map back to a
-  # bundle path on disk by matching CFBundleShortVersionString.
-  local active_versions extension_root version match
-  active_versions="$(systemextensionsctl list 2>/dev/null \
-    | awk '/io\.tailscale\.ipn\.macsys\.network-extension/ && /activated enabled/ { match($0, /\([^)]+\)/); ver=substr($0, RSTART+1, RLENGTH-2); split(ver, a, "/"); print a[1] }')"
-  while IFS= read -r v; do
-    [[ -z "$v" ]] && continue
-    match=""
-    while IFS= read -r path; do
-      [[ -z "$path" ]] && continue
-      extension_root="${path%/Contents/MacOS/io.tailscale.ipn.macsys.network-extension}"
-      version="$(defaults read "$extension_root/Contents/Info" CFBundleShortVersionString 2>/dev/null || true)"
-      if [[ "$version" == "$v" ]]; then
-        match="$path"
-        break
-      fi
-    done <<<"$ts_extensions"
-    if [[ -z "$match" ]]; then
-      die "active Tailscale extension v$v is not on disk; cannot connect safely"
-    fi
-    if ! grep -F "bypass:$match" >/dev/null <<<"$split_apps"; then
-      die "active Tailscale extension v$v ($match) is NOT in bypass list; aborting before connect"
-    fi
-    echo "Verified bypass for active Tailscale extension v$v"
-  done <<<"$active_versions"
+  # Verify the process path, not a matching bundle version. Extension upgrades
+  # can leave a rule for a dead UUID while the live process uses another.
+  check_bypass
 
   # MagicDNS must be OFF while ExpressVPN is connected. With accept-dns=true,
   # Tailscale hijacks resolution to MagicDNS (100.100.100.100), whose upstream can
@@ -270,8 +272,7 @@ verify_setup() {
   fi
   [[ "$splittunnel" == "true" ]] || die "Split Tunnel is not true"
   [[ "$autoconnect" == "false" ]] || die "ExpressVPN autoconnect is not false; Darkmesh must own connection ordering"
-  grep 'bypass:.*Tailscale.app' >/dev/null <<<"$split_apps" || die "Tailscale app is not in bypass list"
-  grep 'bypass:.*io.tailscale.ipn.macsys.network-extension' >/dev/null <<<"$split_apps" || die "Tailscale network extension is not in bypass list"
+  check_bypass
   if [[ -d /Library/PrivilegedHelperTools/ChromeRemoteDesktopHost.app ]]; then
     grep 'bypass:.*remoting_me2me_host' >/dev/null <<<"$split_apps" \
       || die "Chrome Remote Desktop is installed but its host is not in the bypass list — remote access will break when VPN connects"
@@ -287,6 +288,7 @@ case "$cmd" in
   status) show_status ;;
   apply) apply_setup "$@" ;;
   verify) verify_setup ;;
+  check-bypass) check_bypass ;;
   -h|--help|"") usage ;;
   *) echo "ERROR: unknown command: $cmd" >&2; usage; exit 2 ;;
 esac

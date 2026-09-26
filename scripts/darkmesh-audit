@@ -63,6 +63,13 @@ if [[ -x "$EXPRESSVPN_CTL" ]]; then
     [[ "$networklock" == false ]] \
       && record expressvpn.networklock true "ExpressVPN Network Lock off" \
       || record expressvpn.networklock false "ExpressVPN Network Lock is ${networklock:-unknown}"
+    if ps -axo comm= 2>/dev/null | grep -F '/io.tailscale.ipn.macsys.network-extension.systemextension/Contents/MacOS/io.tailscale.ipn.macsys.network-extension' >/dev/null; then
+      if "$BIN_DIR/darkmesh-expressvpn-tailscale" check-bypass >/dev/null 2>&1; then
+        record expressvpn.tailscale_bypass true "running Tailscale extension bypassed by ExpressVPN"
+      else
+        record expressvpn.tailscale_bypass false "running Tailscale extension lacks an exact ExpressVPN bypass rule"
+      fi
+    fi
   fi
   [[ "$autoconnect" == false ]] \
     && record expressvpn.autoconnect true "ExpressVPN autoconnect off; Darkmesh owns ordering" \
