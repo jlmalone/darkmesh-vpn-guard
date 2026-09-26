@@ -135,10 +135,14 @@ fi
 # reinstate the whole-machine network lock during setup or after a reboot.
 if [[ -x "$EXPRESSVPN_CTL" ]]; then
   log "configuring ExpressVPN recovery ownership"
-  "$EXPRESSVPN_CTL" set autoconnect false \
-    || { warn "failed to disable ExpressVPN autoconnect"; exit 1; }
-  "$EXPRESSVPN_CTL" set networklock false \
-    || { warn "failed to disable ExpressVPN Network Lock"; exit 1; }
+  if [[ "$("$EXPRESSVPN_CTL" get autoconnect 2>/dev/null)" != false ]]; then
+    "$EXPRESSVPN_CTL" set autoconnect false \
+      || { warn "failed to disable ExpressVPN autoconnect"; exit 1; }
+  fi
+  if [[ "$("$EXPRESSVPN_CTL" get networklock 2>/dev/null)" != false ]]; then
+    "$EXPRESSVPN_CTL" set networklock false \
+      || { warn "failed to disable ExpressVPN Network Lock"; exit 1; }
+  fi
 fi
 
 # --- background supervisor ----------------------------------------------------
