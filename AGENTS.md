@@ -65,8 +65,12 @@ The full contract is `docs/availability-recovery-plan.md` section 1. Priority or
 4. VPN-everywhere is best effort.
 5. Green status is informational. Non-green status does not block general connectivity.
 
-The commercial VPN's network lock remains off. DNS stays DHCP-provided and off-tunnel so captive
-portals remain usable.
+The commercial VPN's network lock remains off in ordinary profiles. The explicit
+`vpn-only-block-on-loss` session is an exception: it requires the vendor's
+all-times Network Lock readback, disables split tunneling, forbids Tailscale,
+and stays selected until another profile is applied. Never auto-select it or
+call it active from VPN connection state alone. DNS stays DHCP-provided in
+ordinary profiles so captive portals remain usable.
 
 ## Administrator privilege
 

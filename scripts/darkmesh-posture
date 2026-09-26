@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parent
 HEALTH = os.environ.get("DARKMESH_HEALTHCHECK", str(ROOT / "darkmesh-healthcheck"))
 UP = os.environ.get("DARKMESH_UP", str(ROOT / "darkmesh-up"))
 PANIC = os.environ.get("DARKMESH_PANIC", str(ROOT / "darkmesh-panic"))
+PLAIN_RESTORE = os.environ.get("DARKMESH_PLAIN_RESTORE", str(ROOT / "darkmesh-restore-plain-network"))
 REPAIR = os.environ.get("DARKMESH_REPAIR_TAILSCALE", str(ROOT / "darkmesh-repair-tailscale"))
 TS = os.environ.get("DARKMESH_TAILSCALE", "/Applications/Tailscale.app/Contents/MacOS/Tailscale")
 ROUTE = os.environ.get("DARKMESH_ROUTE", "/sbin/route")
@@ -30,6 +31,8 @@ NC = os.environ.get("DARKMESH_NC", "/usr/bin/nc")
 REMOTE_DARKMESH = os.environ.get("DARKMESH_REMOTE_PATH", "/usr/local/bin/darkmesh")
 AUDIT = os.environ.get("DARKMESH_AUDIT", str(ROOT / "darkmesh-audit"))
 DOCTOR = os.environ.get("DARKMESH_TRANSFER_DOCTOR", str(ROOT / "transfer-vpn-doctor"))
+EXPRESSVPN = os.environ.get("DARKMESH_EXPRESSVPN_CTL", "/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl")
+STRICT_PROFILE = "vpn-only-block-on-loss"
 PROBE_TIMEOUT = max(1, int(os.environ.get("DARKMESH_POSTURE_PROBE_TIMEOUT", "3")))
 APPLY_DEADLINE = max(1, int(os.environ.get("DARKMESH_POSTURE_APPLY_DEADLINE", "60")))
 REMOTE_REPORT_TIMEOUT = max(12, int(os.environ.get("DARKMESH_POSTURE_REMOTE_REPORT_TIMEOUT", "30")))
@@ -45,6 +48,7 @@ PROFILES = [
  {"id":"vpn-required-tailscale-forbidden","title":"VPN required, Tailscale forbidden","required":{"internet":True,"vpn":True,"transferSafety":True},"preferred":{},"forbidden":{"tailscale":True},"priority":["internet","vpn","transferSafety","tailscale"],"transition":{"vpn":"rearm","tailscale":"down","attemptSecondary":False,"rollback":"policy-persists"},"degraded":"Required VPN failure or Tailscale presence is red."},
  {"id":"vpn-required-tailscale-optional","title":"VPN required, Tailscale optional","required":{"internet":True,"vpn":True,"transferSafety":True},"preferred":{"tailscale":True},"forbidden":{},"priority":["internet","vpn","transferSafety","tailscale"],"transition":{"vpn":"rearm","tailscale":"unchanged","attemptSecondary":False,"rollback":"policy-persists"},"degraded":"Tailscale is a nice-to-have: absence is yellow and apply never starts it."},
  {"id":"vpn-required-tailscale-preferred","title":"VPN required, Tailscale secondary-high","required":{"internet":True,"vpn":True,"transferSafety":True},"preferred":{"tailscale":True},"forbidden":{},"priority":["internet","vpn","transferSafety","tailscale"],"transition":{"vpn":"rearm","tailscale":"guarded-repair-when-supported","attemptSecondary":True,"rollback":"policy-persists"},"degraded":"Tailscale absence is yellow; only a bounded safe repair may be attempted."},
+ {"id":STRICT_PROFILE,"title":"VPN only: block internet on loss","required":{"internet":True,"vpn":True,"transferSafety":True,"generalEgressGuard":True},"preferred":{},"forbidden":{"tailscale":True},"priority":["generalEgressGuard","vpn","transferSafety","internet","tailscale"],"transition":{"vpn":"rearm","tailscale":"down","strictSession":True,"rollback":"policy-persists"},"degraded":"Local opt-in session. Internet remains blocked when the VPN is absent; only an explicit posture change exits.","consequence":"Blocks ordinary internet and remote access if the VPN drops. First disable LAN access in ExpressVPN, then apply while at the machine. Select another posture to leave."},
  {"id":"dual-required-zero-general-egress-leak","title":"Strict dual-required, zero general-egress leak","required":{"internet":True,"vpn":True,"tailscale":True,"ssh":True,"transferSafety":True,"zeroGeneralEgressLeak":True},"preferred":{},"forbidden":{},"capabilities":{"zeroGeneralEgressLeak":False},"priority":["internet","vpn","tailscale","ssh","transferSafety","zeroGeneralEgressLeak"],"transition":{"capability":"machine-wide-kill-switch","apply":"refuse"},"degraded":"Unavailable: this installation deliberately has no machine-wide kill switch."}
 ]
 for profile in PROFILES:
@@ -61,6 +65,15 @@ def run(argv, timeout=PROBE_TIMEOUT, max_output=MAX_OUTPUT):
         return {"ok":p.returncode == 0,"code":p.returncode,"stdout":p.stdout[:max_output],"stderr":p.stderr[:512]}
     except FileNotFoundError: return {"ok":False,"code":None,"stdout":"","stderr":"unavailable"}
     except subprocess.TimeoutExpired: return {"ok":False,"code":124,"stdout":"","stderr":"timeout"}
+def vpn_get(setting):
+    result=run([EXPRESSVPN,"--timeout","5","get",setting],timeout=7)
+    return result["stdout"].strip().lower() if result["ok"] else None
+def strict_guard():
+    lock=vpn_get("networklock"); split=vpn_get("splittunnel"); lan=vpn_get("allowlan")
+    status=run([EXPRESSVPN,"--timeout","5","status"],timeout=7)
+    all_times=status["ok"] and "network lock: enabled at all times" in status["stdout"].lower()
+    return {"active":lock=="true" and split=="false" and lan=="false" and all_times,
+            "networkLock":lock,"splitTunnel":split,"allowLAN":lan,"allTimesReadback":all_times}
 def observed():
     value={"available":False,"fresh":False,"reason":"status-unavailable","internet":None,"vpn":None,"tailscale":None,"transferSafety":None}
     try:
@@ -74,6 +87,8 @@ def observed():
             internet=False
         value.update({"available":True,"fresh":age <= limit,"reason":"ok" if age <= limit else "status-stale","ageSeconds":round(age,3),"maxAgeSeconds":limit,"statusSchema":data.get("schema"),"internet":internet,"systemDns":system_dns,"vpn":data.get("vpn_state")=="Connected","vpnState":data.get("vpn_state"),"tailscale":data.get("tailscale_ok"),"transferSafety":(data.get("pf") or {}).get("pf_anchor_evaluated"),"verdict":data.get("verdict")})
     except Exception as exc: value.update({"reason":"status-invalid","detail":str(exc).replace("\n"," ")[:160]})
+    if read_enforced()==STRICT_PROFILE:
+        guard=strict_guard(); value["generalEgressGuard"]=guard["active"]; value["strictGuard"]=guard
     return value
 def tailscale_status():
     # The peer map can legitimately exceed the human-output cap. Parse the
@@ -152,11 +167,13 @@ def probe():
         output.append({"id":item["id"],"target":item["target"],"online":record.get("Online"),"active":record.get("Active"),"relay":record.get("Relay"),"addresses":record.get("TailscaleIPs") or [],"tailscalePing":{"ok":ping["ok"],"reason":"ok" if ping["ok"] else ping["stderr"] or "failed","output":ping_output,"path":path_match.group(1) if path_match else None,"latencyMs":latency_ms},"tcp22":{"ok":tcp["ok"],"reason":"ok" if tcp["ok"] else tcp["stderr"] or "failed"},"ssh":remote_report(item.get("sshTarget"),item.get("remoteDarkmeshPath",REMOTE_DARKMESH))})
     emit({"schema":2,"kind":"darkmesh-posture-probe","generatedAt":now(),"peers":output})
 def assess(p, obs, ssh=None):
-    values={k:obs.get(k) for k in ("internet","vpn","tailscale","transferSafety")}; values.update({"ssh":ssh,"zeroGeneralEgressLeak":None})
+    values={k:obs.get(k) for k in ("internet","vpn","tailscale","transferSafety","generalEgressGuard")}; values.update({"ssh":ssh,"zeroGeneralEgressLeak":None})
     if not obs.get("available") or not obs.get("fresh"):
         for key in ("internet","vpn","tailscale","transferSafety"): values[key]=None
     required={key:values.get(key) for key,on in p["required"].items() if on}; preferred={key:values.get(key) for key,on in p["preferred"].items() if on}; forbidden={key:values.get(key) for key,on in p["forbidden"].items() if on}
-    if any(value is False for value in required.values()) or any(value is True for value in forbidden.values()): severity,state,reason="red","degraded","required-failure-or-forbidden-present"
+    if p["id"]==STRICT_PROFILE and obs.get("fresh") is True and values.get("generalEgressGuard") is True and values.get("vpn") is False and values.get("internet") is False and values.get("transferSafety") is True and values.get("tailscale") is not True:
+        severity,state,reason="yellow","blocked","vpn-unavailable-egress-blocked"
+    elif any(value is False for value in required.values()) or any(value is True for value in forbidden.values()): severity,state,reason="red","degraded","required-failure-or-forbidden-present"
     elif any(value is None for value in list(required.values())+list(forbidden.values())): severity,state,reason="gray","unavailable","telemetry-unavailable"
     elif any(value is not True for value in preferred.values()): severity,state,reason="yellow","degraded","preferred-unavailable"
     else: severity,state,reason="green","healthy","profile-satisfied"
@@ -193,8 +210,9 @@ def apply(profile_id):
     handle=acquire_lock()
     if handle is None: emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"apply-in-progress","rollback":{"attempted":False,"reason":"no-action-taken"}},5)
     try:
-        initial=observed(); initial["vpnIntent"]=Path(os.environ.get("DARKMESH_VPN_DESIRED", HOME / ".config/darkmesh/vpn-desired")).read_text().strip() if Path(os.environ.get("DARKMESH_VPN_DESIRED", HOME / ".config/darkmesh/vpn-desired")).exists() else None
+        previous=read_enforced(); initial=observed(); initial["vpnIntent"]=Path(os.environ.get("DARKMESH_VPN_DESIRED", HOME / ".config/darkmesh/vpn-desired")).read_text().strip() if Path(os.environ.get("DARKMESH_VPN_DESIRED", HOME / ".config/darkmesh/vpn-desired")).exists() else None
         if initial.get("fresh") is not True or initial.get("transferSafety") is not True: emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"fresh-transfer-containment-required","initial":initial,"rollback":{"attempted":False,"reason":"preflight-failed"}},3)
+        if profile_id==STRICT_PROFILE and vpn_get("allowlan")!="false": emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"disable-local-network-access-in-expressvpn-first","rollback":{"attempted":False,"reason":"preflight-failed"}},3)
         # Apply changes policy immediately. Failed convergence leaves that
         # policy active and visibly unmet until recovery or another apply.
         write_desired(profile_id); write_enforced(profile_id)
@@ -202,32 +220,41 @@ def apply(profile_id):
         def failed(reason, post=None):
             current=post if post is not None else observed()
             emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":True,"converged":False,"reason":reason,"initial":initial,"postcondition":current,"assessment":assess(p,current),"actions":evidence,"rollback":{"attempted":False,"reason":"policy-persists"}},3)
+        if profile_id==STRICT_PROFILE:
+            if vpn_get("networklock")!="true" and not invoke("enable-persistent-network-lock",[EXPRESSVPN,"set","networklock","true"],evidence): failed("network-lock-enable-failed")
+            if vpn_get("splittunnel")!="false" and not invoke("disable-split-tunnel",[EXPRESSVPN,"set","splittunnel","false"],evidence): failed("split-tunnel-disable-failed")
+            if not strict_guard()["active"]: failed("strict-guard-readback-failed")
+        if previous==STRICT_PROFILE and profile_id!=STRICT_PROFILE:
+            if vpn_get("networklock")=="true" and not invoke("leave-persistent-network-lock",[EXPRESSVPN,"set","networklock","false"],evidence): failed("strict-guard-exit-failed")
+            if vpn_get("splittunnel")=="false" and not invoke("restore-split-tunnel",[EXPRESSVPN,"set","splittunnel","true"],evidence): failed("split-tunnel-restore-failed")
+        if profile_id==STRICT_PROFILE and initial.get("vpn") is True and initial.get("strictGuard",{}).get("splitTunnel")!="false":
+            if not invoke("reconnect-for-split-tunnel-change",[PLAIN_RESTORE],evidence): failed("strict-reconnect-preparation-failed")
         needs_plain_transition = transition.get("vpn") == "panic" or (transition.get("vpn") == "panic-before-repair" and initial.get("tailscale") is not True)
         if needs_plain_transition and initial.get("vpn") is True and not invoke("plain-network-transition",[PANIC],evidence): failed("plain-network-transition-failed")
         if transition.get("vpn")=="attempt-with-rollback" and initial.get("vpn") is True and initial.get("tailscale") is not True and not invoke("plain-network-transition",[PANIC],evidence): failed("plain-network-transition-failed")
         if transition.get("tailscale")=="down" and initial.get("tailscale") is True and not invoke("tailscale-down",[TS,"down"],evidence): failed("tailscale-down-failed")
         if transition.get("tailscale")=="verify-or-guarded-repair" and initial.get("tailscale") is not True and not invoke("guarded-tailscale-repair",[REPAIR],evidence): failed("tailscale-establishment-failed")
-        needs_vpn_rearm = initial.get("vpn") is not True or initial.get("vpnIntent") != "on" or (transition.get("vpn") == "attempt-with-rollback" and initial.get("tailscale") is not True)
+        needs_vpn_rearm = initial.get("vpn") is not True or initial.get("vpnIntent") != "on" or (transition.get("vpn") == "attempt-with-rollback" and initial.get("tailscale") is not True) or (profile_id==STRICT_PROFILE and initial.get("strictGuard",{}).get("splitTunnel")!="false")
         if transition.get("vpn") in ("rearm","attempt-with-rollback") and needs_vpn_rearm and not invoke("vpn-rearm",[UP],evidence): failed("vpn-rearm-failed")
         if transition.get("tailscale")=="guarded-repair-when-supported" and initial.get("tailscale") is not True: evidence.append({"step":"guarded-tailscale-repair","ok":False,"code":None,"detail":"not-run: VPN-required path lacks plain-network preconditions"})
         deadline=time.monotonic()+APPLY_DEADLINE; post=observed()
-        while time.monotonic()<deadline and assess(p,post)["severity"] in ("red","gray"): time.sleep(.2); post=observed()
+        while time.monotonic()<deadline and (assess(p,post)["severity"] in ("red","gray") or (profile_id==STRICT_PROFILE and assess(p,post)["state"]=="blocked")): time.sleep(.2); post=observed()
         post_ssh=ssh_reachability() if initial_ssh is True else None
         regression=transition.get("vpn")=="attempt-with-rollback" and ((initial.get("tailscale") is True and post.get("tailscale") is not True) or (initial_ssh is True and post_ssh is not True))
         final=assess(p,post,post_ssh)
         if regression:
             invoke("protect-higher-priority-path",[PANIC],evidence)
             failed("higher-priority-regression")
-        if final["severity"] in ("red","gray"): failed("postcondition-failed",post)
+        if final["severity"] in ("red","gray") or (profile_id==STRICT_PROFILE and final["state"]=="blocked"): failed("postcondition-failed",post)
         emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":True,"converged":True,"initial":initial,"postcondition":post,"assessment":final,"actions":evidence,"rollback":{"attempted":False,"reason":"policy-persists"}})
     finally:
         os.close(handle)
         try: LOCK.unlink()
         except FileNotFoundError: pass
 def show():
-    desired=read_desired(); p=get_profile(desired); obs=observed(); emit({"schema":2,"kind":"darkmesh-posture","desiredProfile":desired,"enforcedProfile":read_enforced(),"profile":p,"observed":obs,"assessment":assess(p,obs) if p else {"severity":"gray","state":"unavailable","reason":"profile-unselected","required":{},"preferred":{},"forbidden":{}}})
+    desired=read_desired(); enforced=read_enforced(); p=get_profile(enforced); obs=observed(); emit({"schema":2,"kind":"darkmesh-posture","desiredProfile":desired,"enforcedProfile":enforced,"profile":p,"observed":obs,"assessment":assess(p,obs) if p else {"severity":"gray","state":"unavailable","reason":"profile-unselected","required":{},"preferred":{},"forbidden":{}}})
 def report():
-    desired=read_desired(); p=get_profile(desired); obs=observed(); ts=tailscale_status()
+    desired=read_desired(); enforced=read_enforced(); p=get_profile(enforced); obs=observed(); ts=tailscale_status()
     audit=run([AUDIT,"--json"],max(12,PROBE_TIMEOUT+2)); doctor=run([DOCTOR,"--check"],max(12,PROBE_TIMEOUT+2))
     def check(result, parse_json=False):
         value={"ok":result["ok"],"code":result["code"],"stdout":result["stdout"][:4096],"stderr":result["stderr"][:1024]}
@@ -237,7 +264,7 @@ def report():
         return value
     transfer=check(doctor); detail=f"{transfer['stdout']}\n{transfer['stderr']}".lower()
     transfer["state"]="ready" if transfer["ok"] else ("unconfigured" if "missing:" in detail or "not configured" in detail else "blocked")
-    emit({"schema":2,"kind":"darkmesh-posture-report","generatedAt":now(),"desiredProfile":desired,"enforcedProfile":read_enforced(),"observed":obs,"assessment":assess(p,obs) if p else {"severity":"gray","state":"unavailable","reason":"profile-unselected","required":{},"preferred":{},"forbidden":{}},"tailscale":{"backend":ts.get("backend"),"selfOnline":ts.get("selfOnline"),"warnings":ts.get("healthWarnings",[])},"audit":check(audit,True),"transferReadiness":transfer})
+    emit({"schema":2,"kind":"darkmesh-posture-report","generatedAt":now(),"desiredProfile":desired,"enforcedProfile":enforced,"observed":obs,"assessment":assess(p,obs) if p else {"severity":"gray","state":"unavailable","reason":"profile-unselected","required":{},"preferred":{},"forbidden":{}},"tailscale":{"backend":ts.get("backend"),"selfOnline":ts.get("selfOnline"),"warnings":ts.get("healthWarnings",[])},"audit":check(audit,True),"transferReadiness":transfer})
 def health():
     result=run([HEALTH], max(PROBE_TIMEOUT, 12))
     if not result["ok"]: emit({"schema":2,"kind":"darkmesh-posture-health","available":False,"reason":result["stderr"] or "healthcheck-failed"},1)

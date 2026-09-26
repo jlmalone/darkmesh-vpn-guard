@@ -39,8 +39,24 @@ status until its deadline. The plain profile invokes `darkmesh-panic`, then
 explicitly runs `tailscale down`.
 It does not change panic's normal route-preserving behavior. VPN-required plans
 use `darkmesh-up`; required Tailscale uses only `darkmesh-repair-tailscale` when
-that guarded primitive supports the current conditions. No profile enables
-Network Lock.
+that guarded primitive supports the current conditions. Ordinary profiles keep
+Network Lock off.
+
+`vpn-only-block-on-loss` is a separate opt-in session for a person at the
+machine. Its preflight requires fresh transfer containment and ExpressVPN LAN
+access disabled in the vendor UI. Apply records the new policy before changing
+the VPN, enables persistent Network Lock, disables split tunneling, and accepts
+the guard only when `get networklock`, `get splittunnel`, `get allowlan`, and
+`status` agree that all-times protection is active. Tailscale is stopped. On
+WireGuard, Apply disconnects and rearms the VPN to make the split-tunnel change
+effective. A failed step leaves the selected strict policy visible and unmet;
+it never silently restores the prior posture. The plain-network recovery helper
+preserves the lock and refuses a deliberate disconnect if all-times readback is
+missing. Applying a different posture explicitly leaves strict mode and restores
+the ordinary Network Lock and split-tunnel settings. No timer exits this mode.
+The status `blocked` means the fresh observer sees VPN absent, internet absent,
+transfer containment intact, Tailscale absent, and the all-times guard active.
+It does not mean a connected VPN or a sensitive website has been leak tested.
 
 Every profile includes explicit `required`, `preferred`, `forbidden`, ordered
 `priority`, and `degraded` semantics. Internet remains first, and transfer

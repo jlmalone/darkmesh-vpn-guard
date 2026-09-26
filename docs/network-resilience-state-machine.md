@@ -15,7 +15,9 @@ autoconnect guidance are superseded here.
    than the commercial VPN until the operator applies a different compatible
    posture.
 4. The transfer client is the only strict fail-closed component.
-5. ExpressVPN Network Lock and built-in autoconnect stay off by default.
+5. ExpressVPN Network Lock and built-in autoconnect stay off by default. The
+   explicit `vpn-only-block-on-loss` session keeps the all-times lock active
+   until another posture is applied. Plain-network recovery must preserve it.
 
 ## States
 

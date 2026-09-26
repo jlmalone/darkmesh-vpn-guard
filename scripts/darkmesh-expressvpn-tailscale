@@ -121,6 +121,9 @@ show_status() {
 }
 
 apply_setup() {
+  if grep -Eq '"profile"[[:space:]]*:[[:space:]]*"vpn-only-block-on-loss"' "${DARKMESH_ENFORCED_POSTURE_FILE:-$HOME/.config/darkmesh/posture-enforced.json}" 2>/dev/null; then
+    die "leave strict posture before changing ExpressVPN coexistence settings"
+  fi
   local ts_ext split_apps strict=no
   case "${1:-}" in
     --strict) strict=yes ;;

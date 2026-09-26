@@ -11,6 +11,12 @@
 set -uo pipefail
 
 EXPRESSVPN_CTL="/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl"
+ENFORCED_POSTURE_FILE="${DARKMESH_ENFORCED_POSTURE_FILE:-$HOME/.config/darkmesh/posture-enforced.json}"
+
+if grep -Eq '"profile"[[:space:]]*:[[:space:]]*"vpn-only-block-on-loss"' "$ENFORCED_POSTURE_FILE" 2>/dev/null; then
+  echo "ERROR: strict posture is active; apply a different posture to leave it explicitly." >&2
+  exit 3
+fi
 
 if [[ ! -x "$EXPRESSVPN_CTL" ]]; then
   echo "ERROR: $EXPRESSVPN_CTL not found. ExpressVPN may not be installed." >&2

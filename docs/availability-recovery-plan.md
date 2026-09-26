@@ -54,6 +54,11 @@
 >   2026-06-16: **always-on, captive-aware**) after a public-venue captive-wifi failure on a
 >   member node.
 
+> **2026-09-26 explicit exception:** The later `vpn-only-block-on-loss` posture
+> permits a locally chosen temporary general-traffic block. It is never the
+> default and must remain selected until the operator applies another posture.
+> The ordinary availability invariants below govern every other profile.
+
 ---
 
 ## 0. TL;DR

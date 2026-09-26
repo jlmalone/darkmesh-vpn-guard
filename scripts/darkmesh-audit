@@ -10,6 +10,7 @@ PF_SIDECAR="${DARKMESH_PF_SIDECAR:-/tmp/darkmesh-pf.json}"
 INFRA_STATUS="${DARKMESH_INFRA_STATUS:-$HOME/Library/Application Support/ServerMonitor/infrastructure-agent-status.json}"
 ROOT_HELPER=/Library/darkmesh/bin/darkmesh-root-helper
 EXPRESSVPN_CTL="${EXPRESSVPN_CTL:-/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl}"
+ENFORCED_POSTURE_FILE="${DARKMESH_ENFORCED_POSTURE_FILE:-$HOME/.config/darkmesh/posture-enforced.json}"
 CRD_TARGET_FILE=/Library/darkmesh/config/crd-launchd-target
 NEWSYSLOG=/etc/newsyslog.d/darkmesh.conf
 JSON=no
@@ -49,9 +50,20 @@ done
 if [[ -x "$EXPRESSVPN_CTL" ]]; then
   networklock="$("$EXPRESSVPN_CTL" get networklock 2>/dev/null | head -1)"
   autoconnect="$("$EXPRESSVPN_CTL" get autoconnect 2>/dev/null | head -1)"
-  [[ "$networklock" == false ]] \
-    && record expressvpn.networklock true "ExpressVPN Network Lock off" \
-    || record expressvpn.networklock false "ExpressVPN Network Lock is ${networklock:-unknown}"
+  if grep -Eq '"profile"[[:space:]]*:[[:space:]]*"vpn-only-block-on-loss"' "$ENFORCED_POSTURE_FILE" 2>/dev/null; then
+    split_tunnel="$("$EXPRESSVPN_CTL" get splittunnel 2>/dev/null | head -1)"
+    allow_lan="$("$EXPRESSVPN_CTL" get allowlan 2>/dev/null | head -1)"
+    if [[ "$networklock" == true && "$split_tunnel" == false && "$allow_lan" == false ]] \
+        && "$EXPRESSVPN_CTL" status 2>/dev/null | grep -Fqi 'Network Lock: enabled at all times'; then
+      record expressvpn.networklock true "strict all-times Network Lock active; bypasses disabled"
+    else
+      record expressvpn.networklock false "strict Network Lock or bypass readback failed"
+    fi
+  else
+    [[ "$networklock" == false ]] \
+      && record expressvpn.networklock true "ExpressVPN Network Lock off" \
+      || record expressvpn.networklock false "ExpressVPN Network Lock is ${networklock:-unknown}"
+  fi
   [[ "$autoconnect" == false ]] \
     && record expressvpn.autoconnect true "ExpressVPN autoconnect off; Darkmesh owns ordering" \
     || record expressvpn.autoconnect false "ExpressVPN autoconnect is ${autoconnect:-unknown}"

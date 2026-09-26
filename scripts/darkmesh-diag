@@ -19,6 +19,11 @@
 set -uo pipefail
 
 EXPRESSVPN_CTL="/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl"
+ENFORCED_POSTURE_FILE="${DARKMESH_ENFORCED_POSTURE_FILE:-$HOME/.config/darkmesh/posture-enforced.json}"
+if grep -Eq '"profile"[[:space:]]*:[[:space:]]*"vpn-only-block-on-loss"' "$ENFORCED_POSTURE_FILE" 2>/dev/null; then
+  echo "ERROR: diagnostics disconnects the VPN and disables Network Lock; leave strict posture first." >&2
+  exit 3
+fi
 TAILSCALE_CLI="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 WINDOW=35
 REGION=""

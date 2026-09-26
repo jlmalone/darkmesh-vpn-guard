@@ -4,6 +4,7 @@
 set -uo pipefail
 
 EXPRESSVPN_CTL="${EXPRESSVPN_CTL:-/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl}"
+ENFORCED_POSTURE_FILE="${DARKMESH_ENFORCED_POSTURE_FILE:-$HOME/.config/darkmesh/posture-enforced.json}"
 TAILSCALE_CLI="${TAILSCALE_CLI:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
 ROOT_HELPER="${DARKMESH_ROOT_HELPER:-/Library/darkmesh/bin/darkmesh-root-helper}"
 VPN_GUARD="${DARKMESH_VPN_GUARD:-$(command -v vpn-guard.sh 2>/dev/null || true)}"
@@ -39,7 +40,15 @@ fi
 
 if [[ -x "$EXPRESSVPN_CTL" ]]; then
   "$EXPRESSVPN_CTL" set autoconnect false >/dev/null 2>&1 || true
-  "$EXPRESSVPN_CTL" set networklock false >/dev/null 2>&1 || true
+  if grep -Eq '"profile"[[:space:]]*:[[:space:]]*"vpn-only-block-on-loss"' "$ENFORCED_POSTURE_FILE" 2>/dev/null; then
+    if [[ "$("$EXPRESSVPN_CTL" --timeout 5 get networklock 2>/dev/null)" != true ]] \
+        || ! "$EXPRESSVPN_CTL" --timeout 5 status 2>/dev/null | grep -Fqi 'Network Lock: enabled at all times'; then
+      log "ERROR: persistent Network Lock unverified; refusing strict-session disconnect"
+      exit 1
+    fi
+  else
+    "$EXPRESSVPN_CTL" set networklock false >/dev/null 2>&1 || true
+  fi
   "$EXPRESSVPN_CTL" --timeout 10 disconnect >/dev/null 2>&1 \
     || "$EXPRESSVPN_CTL" disconnect >/dev/null 2>&1 || true
 fi
@@ -58,5 +67,5 @@ if ! host -W 3 -t NS "$PROBE_NAME" >/dev/null 2>&1; then
   root_call dns-override >/dev/null 2>&1 || true
 fi
 
-log "plain network restored (VPN autoconnect off, Network Lock off, DHCP DNS preferred)"
+log "plain network restored (VPN autoconnect off, DHCP DNS preferred; strict lock preserved when selected)"
 exit 0
