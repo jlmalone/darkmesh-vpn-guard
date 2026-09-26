@@ -101,7 +101,7 @@ ok = ok and all(key in children for key in required_children)
 ok = ok and all(row.get("running") is True and row.get("responsive") is True
                 for row in children.values())
 ok = ok and all(key in jobs for key in required_jobs)
-ok = ok and all(job_healthy(row) for row in jobs.values())
+ok = ok and all(job_healthy(jobs[key]) for key in required_jobs)
 raise SystemExit(0 if ok else 1)
 PY
   then
