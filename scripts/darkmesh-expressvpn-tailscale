@@ -1,5 +1,5 @@
 #!/bin/bash
-# Configure Tailscale to coexist with ExpressVPN without disabling Network Lock.
+# Configure Tailscale to coexist with ExpressVPN using the chosen Network Lock mode.
 
 set -uo pipefail
 
@@ -43,6 +43,18 @@ die() {
   exit 1
 }
 
+vendor_set() {
+  local key="$1" value="$2"
+  [[ "$(express_get "$key")" == "$value" ]] && return 0
+  sudo "$EXPRESSVPN_CTL" set "$key" "$value"
+}
+
+vendor_bypass() {
+  local path="$1"
+  "$EXPRESSVPN_CTL" get split-app 2>/dev/null | grep -Fx -- "bypass:$path" >/dev/null && return 0
+  sudo "$EXPRESSVPN_CTL" set split-app "bypass:$path"
+}
+
 need_file() {
   [[ -e "$1" ]] || die "missing: $1"
 }
@@ -84,8 +96,11 @@ check_bypass() {
   [[ -n "$running_extensions" ]] || die "cannot identify a running Tailscale network extension"
   while IFS= read -r ts_ext; do
     [[ -f "$ts_ext" ]] || die "running Tailscale extension is missing on disk: $ts_ext"
-    grep -Fxq -- "bypass:$ts_ext" <<<"$split_apps" \
-      || die "running Tailscale extension is not in the bypass list: $ts_ext"
+    if ! grep -Fxq -- "bypass:$ts_ext" <<<"$split_apps"; then
+      echo "ERROR: running Tailscale extension is not in the bypass list: $ts_ext" >&2
+      echo "At the local Terminal, run: sudo $EXPRESSVPN_CTL set split-app bypass:$ts_ext" >&2
+      return 1
+    fi
   done <<<"$running_extensions"
   echo "Running Tailscale extension has an exact ExpressVPN bypass rule."
 }
@@ -118,8 +133,11 @@ prune_stale_bypass_entries() {
     [[ "$path" == bypass:* ]] || continue
     target="${path#bypass:}"
     if [[ ! -e "$target" ]]; then
-      echo "  Removing stale bypass entry (target missing): $target"
-      "$EXPRESSVPN_CTL" set split-app "remove:$target" >/dev/null 2>&1 || true
+      if sudo "$EXPRESSVPN_CTL" set split-app "remove:$target" >/dev/null 2>&1; then
+        echo "  Removed stale bypass entry (target missing): $target"
+      else
+        echo "  Could not remove stale bypass entry: $target" >&2
+      fi
     fi
   done <<<"$current"
 }
@@ -147,6 +165,7 @@ show_status() {
 }
 
 apply_setup() {
+  [[ "$(id -u)" -ne 0 ]] || die "run apply as your user; it requests administrator access only for ExpressVPN settings"
   if grep -Eq '"profile"[[:space:]]*:[[:space:]]*"vpn-only-block-on-loss"' "${DARKMESH_ENFORCED_POSTURE_FILE:-$HOME/.config/darkmesh/posture-enforced.json}" 2>/dev/null; then
     die "leave strict posture before changing ExpressVPN coexistence settings"
   fi
@@ -166,13 +185,13 @@ apply_setup() {
 
   if [[ "$strict" == "yes" ]]; then
     echo "Enabling ExpressVPN Network Lock (--strict), background mode, and split tunneling..."
-    "$EXPRESSVPN_CTL" set networklock true || die "failed to enable Network Lock"
+    vendor_set networklock true || die "failed to enable Network Lock"
   else
     echo "Leaving Network Lock OFF (relaxed). Enabling background mode and split tunneling..."
-    "$EXPRESSVPN_CTL" set networklock false 2>/dev/null || true
+    vendor_set networklock false || die "failed to disable Network Lock"
   fi
   "$EXPRESSVPN_CTL" background enable || die "failed to enable ExpressVPN background mode"
-  "$EXPRESSVPN_CTL" set autoconnect false || die "failed to disable ExpressVPN autoconnect"
+  vendor_set autoconnect false || die "failed to disable ExpressVPN autoconnect"
 
   # Set bypass entries BEFORE enabling split tunneling.
   # Enabling split tunnel immediately activates the SplitTunnelProxyExtension,
@@ -181,13 +200,13 @@ apply_setup() {
   # bypasses while split tunnel is off avoids this race.
   echo "Bypassing Tailscale app:"
   echo "  $TAILSCALE_APP"
-  "$EXPRESSVPN_CTL" set split-app "bypass:$TAILSCALE_APP" || die "failed to bypass Tailscale app"
+  vendor_bypass "$TAILSCALE_APP" || die "failed to bypass Tailscale app"
 
   echo "Bypassing Tailscale network extensions:"
   while IFS= read -r ts_ext; do
     [[ -z "$ts_ext" ]] && continue
     echo "  $ts_ext"
-    "$EXPRESSVPN_CTL" set split-app "bypass:$ts_ext" || die "failed to bypass Tailscale network extension: $ts_ext"
+    vendor_bypass "$ts_ext" || die "failed to bypass Tailscale network extension: $ts_ext"
   done <<<"$ts_extensions"
 
   local crd_bins
@@ -197,7 +216,7 @@ apply_setup() {
     while IFS= read -r crd_bin; do
       [[ -z "$crd_bin" ]] && continue
       echo "  $crd_bin"
-      "$EXPRESSVPN_CTL" set split-app "bypass:$crd_bin" || die "failed to bypass CRD binary: $crd_bin"
+      vendor_bypass "$crd_bin" || die "failed to bypass CRD binary: $crd_bin"
     done <<<"$crd_bins"
   else
     echo "Chrome Remote Desktop host not installed; skipping CRD bypass entries."
@@ -206,7 +225,7 @@ apply_setup() {
   echo "Pruning stale bypass entries (targets missing on disk):"
   prune_stale_bypass_entries
 
-  "$EXPRESSVPN_CTL" set splittunnel true || die "failed to enable split tunneling"
+  vendor_set splittunnel true || die "failed to enable split tunneling"
 
   split_apps="$("$EXPRESSVPN_CTL" get split-app 2>/dev/null)"
   local blocked_proc

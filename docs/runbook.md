@@ -31,7 +31,8 @@ The new darkmesh job is:
   trap general internet). Connectivity is paramount.
 - Enable ExpressVPN split tunneling.
 - Bypass only Tailscale's app and network extension.
-- Keep MagicDNS working.
+- Keep Tailscale DNS acceptance off on this Mac when ExpressVPN supplies DNS;
+  retain tailnet traffic through the exact running extension bypass.
 - Never add the transfer client to ExpressVPN bypass rules.
 - While ExpressVPN is disconnected, detect a nominally online Tailscale service
   whose `100.64/10` route has fallen back to the physical interface. After
@@ -129,7 +130,8 @@ ExpressVPN:
 - Split Tunnel: enabled.
 - Autoconnect: off; Darkmesh owns connection ordering through its captive-aware
   reconnect watchdog.
-- Split Tunnel bypass list:
+- Split Tunnel bypass list, checked against the running executable after every
+  Tailscale extension upgrade:
   - `/Applications/Tailscale.app/Contents/MacOS/Tailscale`
   - `/Library/SystemExtensions/.../io.tailscale.ipn.macsys.network-extension.systemextension/Contents/MacOS/io.tailscale.ipn.macsys.network-extension`
 

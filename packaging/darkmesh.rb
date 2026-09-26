@@ -1,8 +1,8 @@
 class Darkmesh < Formula
   desc "Self-healing Tailscale + VPN coexistence guard with port-scoped fail-closed"
   homepage "https://github.com/jlmalone/darkmesh-vpn-guard"
-  url "https://github.com/jlmalone/homebrew-tap/releases/download/darkmesh-v0.1.50/darkmesh-0.1.50.tar.gz"
-  sha256 "3bb98262abbaefb6fde67b23df136b11245e5c5709fd136078495751def7a51f"
+  url "https://github.com/jlmalone/homebrew-tap/releases/download/darkmesh-v0.1.51/darkmesh-0.1.51.tar.gz"
+  sha256 "PENDING_ARCHIVE_CHECKSUM"
   license "MIT"
 
   depends_on :macos
@@ -44,10 +44,16 @@ class Darkmesh < Formula
 
         darkmesh setup
 
-      Then verify:
+      At the local console, configure ExpressVPN's exact Tailscale bypass.
+      This asks for administrator approval only when a vendor setting changes:
 
+        darkmesh-expressvpn-tailscale apply
+        darkmesh-expressvpn-tailscale check-bypass
         darkmesh audit
         darkmesh status
+
+      Fresh setup may report a failed audit until the bypass is applied. A
+      passing audit and fresh status are the installation receipt.
 
       After `brew upgrade darkmesh`, re-run `darkmesh setup` so the supervisor
       restarts its long-lived children on the new code.

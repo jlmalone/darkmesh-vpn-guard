@@ -128,8 +128,10 @@ host-b host-b -
 
 `topology` is deliberately passive so Server Monitor can poll it only while its
 lazy Network window is open. It enumerates local interfaces and addresses, then
-records effective physical-default, Internet-egress, Tailscale-sentinel,
-Tailscale-self, and configured-peer routes. It also includes Tailscale
+records effective physical-default, Internet-egress, legacy Tailscale-sentinel,
+Tailscale-self, and configured-peer routes. The sentinel is diagnostic only:
+macOS need not route an unused `100.64/10` address through Tailscale. Health and
+topology use the assigned self address route. It also includes Tailscale
 self/control health, warnings, and cached peer records. It never pings, opens
 TCP, or opens SSH.
 

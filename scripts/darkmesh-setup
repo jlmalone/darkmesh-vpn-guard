@@ -321,6 +321,9 @@ if [[ "$UNIFIED" == 1 ]]; then
 fi
 ROLLBACK_AGENT_CONFIG=0
 echo
-"$BIN/darkmesh-audit" || true
+if ! "$BIN/darkmesh-audit"; then
+  warn "setup configured the stack, but audit failed; inspect the failing checks before connecting ExpressVPN"
+  exit 1
+fi
 echo
-log "done. Status any time:  darkmesh status     Re-verify:  darkmesh audit"
+log "setup verified. Status any time:  darkmesh status     Re-verify:  darkmesh audit"

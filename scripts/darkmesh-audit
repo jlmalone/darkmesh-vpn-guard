@@ -17,7 +17,7 @@ JSON=no
 [[ "${1:-}" == --json ]] && JSON=yes
 uid="$(id -u)"
 fail=0
-RESULTS="$(mktemp -t darkmesh-audit)"
+RESULTS="$(mktemp -t darkmesh-audit)" || { echo "darkmesh-audit: cannot create temporary results file" >&2; exit 1; }
 trap 'rm -f "$RESULTS"' EXIT
 
 escape_json() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/[[:cntrl:]]/ /g'; }

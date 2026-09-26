@@ -1,6 +1,6 @@
 #!/bin/bash
-# Repair required Tailscale intent or a macOS network extension whose 100.64/10
-# route is missing. Re-arm with a settings-free `tailscale up`, or restart the
+# Repair required Tailscale intent or a macOS network extension whose own
+# tailnet address route is missing. Re-arm with a settings-free `tailscale up`, or restart the
 # saved VPN service, without logout/reset/down and while preserving identity and
 # every stored preference.
 set -uo pipefail
@@ -25,7 +25,7 @@ OPEN="${DARKMESH_OPEN:-/usr/bin/open}"
 EXPRESSVPN_CTL="${EXPRESSVPN_CTL:-/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl}"
 STATE_FILE="${DARKMESH_TAILSCALE_REPAIR_STATE:-$HOME/.config/darkmesh/tailscale-repair-at}"
 LOCK_DIR="${DARKMESH_TAILSCALE_REPAIR_LOCK:-$HOME/.config/darkmesh/tailscale-repair.lock}"
-CHECK_IP="${DARKMESH_TAILSCALE_CHECK_IP:-100.64.0.1}"
+CHECK_IP="${DARKMESH_TAILSCALE_CHECK_IP:-}"
 FAIL_SAMPLES="${DARKMESH_TAILSCALE_FAIL_SAMPLES:-3}"
 SAMPLE_INTERVAL="${DARKMESH_TAILSCALE_SAMPLE_INTERVAL:-2}"
 STOP_TIMEOUT="${DARKMESH_TAILSCALE_STOP_TIMEOUT:-15}"
@@ -102,9 +102,15 @@ PY
 route_healthy() {
   local iface self_ip self_iface
   self_ip="$(tailnet_ip)"; [[ -n "$self_ip" ]] || return 1
-  iface="$("$ROUTE" -n get "$CHECK_IP" 2>/dev/null | awk '/interface:/{print $2; exit}')"
   self_iface="$("$ROUTE" -n get "$self_ip" 2>/dev/null | awk '/interface:/{print $2; exit}')"
-  [[ "$iface" == utun* && "$iface" == "$self_iface" ]]
+  [[ "$self_iface" == utun* ]] || return 1
+  # An explicit check address remains available for site-specific routing;
+  # arbitrary unused 100.64/10 addresses are not guaranteed Tailscale routes.
+  if [[ -n "$CHECK_IP" ]]; then
+    iface="$("$ROUTE" -n get "$CHECK_IP" 2>/dev/null | awk '/interface:/{print $2; exit}')"
+    [[ "$iface" == "$self_iface" ]] || return 1
+  fi
+  return 0
 }
 
 plain_network_present() {
@@ -279,4 +285,4 @@ cmp -s "$prefs_before" <(printf '%s\n' "$prefs_after") \
   || { echo "darkmesh: Tailscale preferences changed unexpectedly" >&2; exit 1; }
 
 repair_complete=yes
-echo "darkmesh: Tailscale route restored on $("$ROUTE" -n get "$CHECK_IP" 2>/dev/null | awk '/interface:/{print $2; exit}')"
+echo "darkmesh: Tailscale route restored on $("$ROUTE" -n get "$(tailnet_ip)" 2>/dev/null | awk '/interface:/{print $2; exit}')"

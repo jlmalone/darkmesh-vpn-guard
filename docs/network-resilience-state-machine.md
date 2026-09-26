@@ -36,8 +36,9 @@ autoconnect guidance are superseded here.
 | `connected` | Re-pin the transfer client to the live tunnel interface and address. The guard resumes only the hashes owned by the current incident after positive Wi-Fi trust, fresh internet and DNS health, exact tunnel-binding readback, and a direct tunnel probe all pass. | VPN or physical network changes. |
 
 While ExpressVPN is disconnected, each reconcile pass also checks that the
-Tailscale control state is online and a `100.64/10` sentinel route is owned by
-the same `utun` interface as the saved Tailscale identity. Three consecutive failures trigger one saved VPN
+Tailscale control state is online and the currently assigned Tailscale self
+address routes through a `utun` interface. An arbitrary unused address in
+`100.64/10` is not a reliable sentinel on macOS. Three consecutive failures trigger one saved VPN
 service stop/start without `tailscale down`, preserving identity and preferences.
 Automatic attempts are limited to one per hour.
 

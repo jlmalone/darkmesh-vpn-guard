@@ -64,16 +64,11 @@ Keychain using service `vpn-guard-client`. The script reads it on each run via
 
 ### Managing The Stored Password
 
-```bash
-# Print the currently stored password
-security find-generic-password -s vpn-guard-client -w
-
-# Force vpn-guard-install.sh to re-prompt next run
-security delete-generic-password -s vpn-guard-client
-
-# Update in place
-security add-generic-password -a "$USER" -s vpn-guard-client -w NEWPASSWORD -U
-```
+Run `vpn-guard-install.sh` again to validate the existing Keychain credential.
+If the transfer client rejects it, the installer prompts for a replacement and
+updates Keychain after validation. Avoid printing the credential or passing it
+as a command-line argument, where it could appear in terminal history or process
+listings.
 
 ## Verify
 

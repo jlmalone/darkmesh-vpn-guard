@@ -211,12 +211,12 @@ when convenient. Future sessions can pick any of these up.
   `darkmesh-ssh-proxy` keeps private aliases independent of the Tailscale app
   path, prefers the daemon transport, and has a bounded existing-route fallback.
   It selects once before SSH begins and never replays commands.
-- **Stale 1.86.2 Tailscale extension cleanup on reboot**: macOS will
-  finish uninstalling the old extension on next reboot, after which
-  the `find_tailscale_extensions` helper will no longer find a stale
-  entry. Verify after reboot; remove the `prune_stale_bypass_entries`
-  step from the apply path only if it stops finding anything for a
-  sustained period (it's defense-in-depth; safe to keep).
+- **Tailscale extension bypass drift (fixed locally 2026-09-26):** an old
+  installation UUID remained in ExpressVPN's bypass list after the running
+  extension moved. `check-bypass`, setup verification, audit, and the
+  Tailscale-required reconnect guard now require the running executable's
+  exact path. Recheck after each Tailscale upgrade. Old entries may be pruned
+  during an operator-run apply; they do not substitute for the current rule.
 - **Network Lock = on, opportunistic**: currently relaxed. Investigate
   whether the new WireGuard + auto-toggle stack is robust enough to
   re-enable Network Lock without trapping internet on tunnel hiccups.

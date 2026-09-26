@@ -1,6 +1,6 @@
 # darkmesh-vpn-guard
 
-Tailscale + ExpressVPN coexistence with a fail-closed transfer client on macOS.
+Network recovery and transfer containment for ExpressVPN and Tailscale on macOS.
 
 This project documents and packages the working setup for one strict invariant:
 
@@ -16,7 +16,7 @@ ExpressVPN owns the public internet tunnel.
 Split-tunnel bypass list (everything else goes through ExpressVPN):
 
 - `/Applications/Tailscale.app/Contents/MacOS/Tailscale` — so the tailnet stays usable
-- `io.tailscale.ipn.macsys.network-extension` (every version on disk) — actual Tailscale network traffic
+- The exact running `io.tailscale.ipn.macsys.network-extension` executable — actual Tailscale network traffic; recheck after upgrades
 - Chrome Remote Desktop host binaries under `/Library/PrivilegedHelperTools/ChromeRemoteDesktopHost.app/`
   (`remoting_me2me_host`, `remoting_me2me_host_service`, `remoting_agent_process_broker`,
   `NativeMessagingHost.app/Contents/MacOS/native_messaging_host`) — so remote access never breaks
@@ -83,9 +83,9 @@ Tailscale DNS acceptance is disabled, and DHCP DNS is preferred. Tailscale stays
 running but is never required for laptop internet or VPN recovery. See
 [`docs/network-resilience-state-machine.md`](docs/network-resilience-state-machine.md).
 
-On macOS, Tailscale can remain nominally online while the system silently loses
-its `100.64/10` tunnel route after a physical-network change. While ExpressVPN
-is disconnected, Darkmesh detects that exact condition and performs a bounded
+On macOS, Tailscale can remain nominally online while its assigned address loses
+the tunnel route after a physical-network change. While ExpressVPN is
+disconnected, Darkmesh checks that address and performs a bounded
 restart of the saved Tailscale VPN service after three failed samples. The
 repair preserves the existing identity and preferences and has a one-hour
 automatic retry cooldown. An operator can run `darkmesh repair-tailscale` for
@@ -218,7 +218,7 @@ Expected (relaxed mode — connectivity is paramount; see `docs/availability-rec
 - Split Tunnel enabled.
 - Split app list bypasses **Tailscale and Chrome Remote Desktop** (so remote access
   survives the VPN), and **never** the transfer client.
-- Tailscale netcheck has `UDP: true` and DERP latency results.
+- Tailscale has a working path to a peer; direct UDP is optional when a relay works.
 - `transfer-vpn-doctor` says the client binding matches the current ExpressVPN
   tunnel.
 - `vpn-guard.sh` reports `SAFE` when ExpressVPN is connected and the current
@@ -237,8 +237,12 @@ Configure the signed supervisor and packet-filter protection:
 
 ```bash
 darkmesh setup
-darkmesh audit
 ```
+
+The first setup can exit nonzero if ExpressVPN's bypass is not configured yet.
+It reports the failed audit instead of claiming completion. At the local Mac,
+run the next command as your user. It asks for administrator authorization for
+needed ExpressVPN settings, then arms VPN recovery:
 
 Run `darkmesh setup --legacy-agents` only on a machine without the companion
 Server Monitor app. Contributors working from a checkout can install its scripts
@@ -248,6 +252,8 @@ Apply or verify the ExpressVPN / Tailscale split-tunnel setup:
 
 ```bash
 darkmesh-expressvpn-tailscale apply
+darkmesh-expressvpn-tailscale check-bypass
+darkmesh audit
 ```
 
 If macOS asks for Network Extension approval, approve ExpressVPN's
@@ -272,8 +278,14 @@ Then verify:
 
 ```bash
 darkmesh-expressvpn-tailscale verify
-transfer-vpn-doctor
+transfer-vpn-doctor --check
 ```
+
+The Tailscale extension's installation UUID changes after some app updates.
+`check-bypass` compares ExpressVPN's rules to the executable actually running
+and prints the exact administrator command if it is missing. Recheck after
+Tailscale upgrades. The full local-console installation and verification
+sequence is in [macOS ExpressVPN + Tailscale](docs/macos-expressvpn-tailscale.md).
 
 If the transfer client is already installed, quit it before refreshing its
 binding:

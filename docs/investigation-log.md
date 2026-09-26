@@ -41,6 +41,31 @@ This confirms local coexistence in that window; longer-term stability and other
 machines remain unproven. The removed extension's old bypass rule remains in
 ExpressVPN's list but is not used by the running extension.
 
+### Later observation and route-check correction
+
+At 21:28 UTC, about eight minutes after reconnect, the healthcheck recorded
+failed IP, web, DNS, and Tailscale samples; ExpressVPN was disconnected by the
+ordinary-profile safety path. The data volume then ran out of space, and
+Darkmesh's audit and sidecar writes failed to create temporary files. These
+events are correlated in time; the first cause of the failed network samples
+was not established. An unused Server Monitor debug build was removed to
+restore temporary-file capacity.
+
+After plain internet and Tailscale peer traffic recovered, the old Tailscale
+health probe still reported failure: it required a route for arbitrary address
+`100.64.0.1` through the same tunnel as this machine's Tailscale address.
+macOS routed that unused address over the physical interface while the assigned
+self address and a responding tailnet peer both routed through Tailscale. The
+repair helper would therefore regard a working extension as broken and could
+restart its saved VPN service unnecessarily. The healthcheck and repair helper
+now require the *assigned self address* to route through a `utun`; an optional
+configured check address remains available where a site owns a real target.
+Server Monitor's topology graph now uses the self-address route for its
+Tailscale node. The legacy sentinel remains in the topology contract only as
+diagnostic data. A MagicSock receive warning remains visible because online
+control state and a route do not prove peer traffic works; a real peer probe
+is the separate dataplane check.
+
 
 ## 2026-07-15: cafe Wi-Fi recovery flap and filtered-region gate
 

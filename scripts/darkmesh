@@ -67,7 +67,7 @@ print("verdict=%s vpn=%s internet=%s dns=%s tailscale=%s pf_wired=%s" % (
   d.get("dns_ok"), d.get("tailscale_ok"), pf.get("pf_anchor_evaluated")))
 PY
     else
-      echo "no status file ($f) — is the healthcheck agent loaded?  (darkmesh audit)"
+      echo "verdict=UNKNOWN error=status-unavailable detail=no-readable-status-file; run darkmesh audit"
       exit 3
     fi
     ;;

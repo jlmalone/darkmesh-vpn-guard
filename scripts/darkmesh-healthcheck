@@ -187,15 +187,14 @@ probe_tailscale() {
     tailscale_required && return 1
     return 0
   fi
-  local js self_ip iface self_iface
+  local js self_ip self_iface
   js="$(run_with_deadline "$PROBE_DEADLINE" "$TAILSCALE_CLI" status --json)" || return 1
   grep '"BackendState": *"Running"' >/dev/null <<<"$js" || return 1
   awk '/"Self": \{/{f=1} f&&/"Online"/{print; exit}' <<<"$js" | grep true >/dev/null || return 1
   self_ip="$(/usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((ip for ip in d.get("Self",{}).get("TailscaleIPs",[]) if ip.startswith("100.")), ""))' <<<"$js" 2>/dev/null)"
   [[ -n "$self_ip" ]] || return 1
-  iface="$(route -n get 100.64.0.1 2>/dev/null | awk '/interface:/{print $2; exit}')"
   self_iface="$(route -n get "$self_ip" 2>/dev/null | awk '/interface:/{print $2; exit}')"
-  [[ "$iface" == utun* && "$iface" == "$self_iface" ]]
+  [[ "$self_iface" == utun* ]]
 }
 
 tailscale_required() {
@@ -644,7 +643,7 @@ probe_and_decide() {
   # Independent probes run concurrently so one tick is bounded by the slowest
   # probe rather than the sum of all timeouts.
   local pdir p_ip p_dns p_e2e p_ts p_crd=""
-  pdir="$(mktemp -d -t darkmesh-probes)"
+  pdir="$(mktemp -d -t darkmesh-probes)" || { log "probe workspace unavailable"; return 1; }
   (probe_ip && : > "$pdir/ip") & p_ip=$!
   (probe_dns && : > "$pdir/dns") & p_dns=$!
   (probe_e2e && : > "$pdir/e2e") & p_e2e=$!

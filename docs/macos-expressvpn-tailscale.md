@@ -1,6 +1,6 @@
 # macOS ExpressVPN + Tailscale
 
-## Working Approach
+## Network boundary
 
 Use ExpressVPN's own split-tunnel support.
 
@@ -11,27 +11,41 @@ Bypass only:
 
 Keep every other application, including the transfer client, inside ExpressVPN.
 
-## Commands
+## Install or upgrade on one Mac
+
+Install the signed ExpressVPN and Tailscale apps and the signed Server Monitor
+app first. Install Darkmesh from the Homebrew tap. Run commands below as the
+signed-in user at the Mac, with a working plain-network recovery path.
 
 ```bash
-/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl set networklock false
-/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl background enable
-/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl set autoconnect false
-/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl set splittunnel true
-/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl set split-app bypass:/Applications/Tailscale.app/Contents/MacOS/Tailscale
-/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl set split-app bypass:/Library/SystemExtensions/<UUID>/io.tailscale.ipn.macsys.network-extension.systemextension/Contents/MacOS/io.tailscale.ipn.macsys.network-extension
+brew install jlmalone/tap/darkmesh
+darkmesh setup
+darkmesh-expressvpn-tailscale apply
+darkmesh-expressvpn-tailscale check-bypass
+darkmesh audit
 ```
 
-Darkmesh owns ExpressVPN connection ordering. Network Lock and ExpressVPN
-autoconnect stay off so the VPN cannot trap general connectivity before the
-bypass and recovery layers are ready.
+`darkmesh setup` configures the signed supervisor and scoped transfer
+containment. It now exits with a failure if its final audit fails. On a fresh
+install, that first audit may report a missing ExpressVPN bypass. Continue with
+the next step at the local console, then require a passing audit before calling
+the installation verified.
 
-The UUID under `/Library/SystemExtensions` changes. Use the helper instead of
-typing it manually:
+`apply` runs as the user, requests administrator authorization only for
+ExpressVPN settings that actually need changing, then arms Darkmesh's VPN
+reconnect intent. Do not run the whole helper under `sudo`: that would write
+user state as root. It configures Tailscale's app and the running network
+extension as bypasses, plus installed remote desktop host binaries. It never
+bypasses the transfer client. ExpressVPN Network Lock stays off in ordinary
+profiles; built-in autoconnect stays off so Darkmesh owns ordering.
 
-```bash
-scripts/darkmesh-expressvpn-tailscale apply
-```
+The Tailscale extension path contains a changing installation UUID. A saved
+rule for an old UUID does not protect the running extension. After every
+Tailscale extension update, run `check-bypass` again. If it fails, it prints
+the exact root-only `expressvpnctl set split-app bypass:<running-path>` command
+to run locally. Then rerun `check-bypass` and `darkmesh audit`. Darkmesh refuses
+a new VPN connection under a Tailscale-required posture while the exact rule
+is missing.
 
 ## macOS Approval
 
@@ -81,23 +95,40 @@ After local approval, check the state before reconnecting:
 systemextensionsctl list | grep -i com.expressvpn.vpn.splittunnel
 ```
 
-Run the first reconnect from a console or with a tested plain-network rollback
+Run the first reconnect from a console or with a tested plain-network recovery
 path. If the reconnect drops Tailscale or remote access, use `darkmesh captive`
 from the surviving console and leave ExpressVPN disconnected.
 
 ## Verification
 
 ```bash
-scripts/darkmesh-expressvpn-tailscale verify
+darkmesh-expressvpn-tailscale verify
+darkmesh audit
+darkmesh status
+transfer-vpn-doctor --check
 ```
 
-Healthy Tailscale output includes:
+Require a fresh Darkmesh status, internet and DNS access, an exact bypass rule,
+Tailscale's own node online, and one reachable tailnet peer. Check transfer
+binding against the live ExpressVPN tunnel. A temporary `GO` does not establish
+long-term stability. Keep the ordinary profile active while checking for
+post-connect failures.
+
+Tailscale may report a `MagicSock ReceiveIPv4` warning while peer traffic still
+works. Keep the warning visible and test a real peer; online control state alone
+does not prove that the receive path works. Do not turn an otherwise satisfied
+posture red solely from the warning, and do not treat the warning as harmless
+without a peer check.
+
+Healthy Tailscale netcheck output often includes:
 
 ```text
 UDP: true
-Nearest DERP: Seattle
+Nearest DERP: <region>
 DERP latency:
 ```
 
-Direct peer connections are nice but not required. DERP connectivity still means
-Tailscale is usable.
+Direct peer connections are optional. A working DERP path can carry peer traffic.
+The fixed `100.64.0.1` route is not a valid universal Tailscale health check:
+macOS may route only assigned self and peer addresses through the extension.
+Darkmesh checks the current self address's tunnel route instead.
