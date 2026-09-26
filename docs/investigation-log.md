@@ -27,11 +27,19 @@ not yet established causality.
 The `check-bypass` read-only command now requires an exact split-app rule for
 the running extension executable. Setup and verify use it, audit reports a
 failure, and reconnect refuses a new VPN connection under a Tailscale-required
-posture when it fails. The live correction needs the operator to authorize
-ExpressVPN's root-only `set split-app` command. After that, verify the exact
-rule, connect once, and measure sustained VPN, internet, DNS, and tailnet peer
-reachability before calling coexistence fixed. The July 2026 protocol matrix
-already exhausted broad protocol trials without a durable winner.
+posture when it fails. The July 2026 protocol matrix already exhausted broad
+protocol trials without a durable winner.
+
+The operator authorized ExpressVPN's root-only `set split-app` command for the
+running extension. The installed audit changed from failure to pass. One
+WireGuard reconnect at 21:20 UTC reached `Connected`; the local status became
+`GO` with VPN, Tailscale, internet, DNS, and PF checks true. A tailnet peer
+responded through TSMP, an explicit VPN-interface HTTPS request succeeded, and
+the transfer client's interface and address matched the new VPN tunnel. The
+connection remained healthy through repeated checks for more than two minutes.
+This confirms local coexistence in that window; longer-term stability and other
+machines remain unproven. The removed extension's old bypass rule remains in
+ExpressVPN's list but is not used by the running extension.
 
 
 ## 2026-07-15: cafe Wi-Fi recovery flap and filtered-region gate
