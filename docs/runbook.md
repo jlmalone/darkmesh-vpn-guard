@@ -92,8 +92,8 @@ policy.
 
 Selecting a posture and applying it are separate. Only a successful Apply
 writes `~/.config/darkmesh/posture-enforced.json` and changes continuous
-supervision. On a host with `protect-tailscale=on`, a posture that forbids
-Tailscale is rejected before any network action.
+supervision. On a host with `protect-tailscale=on`, a posture that does not
+require Tailscale is rejected before any network action.
 
 The `tailscale-required-vpn-forbidden` profile is the recovery-host posture when
 private-overlay reachability has priority over the commercial VPN. Its

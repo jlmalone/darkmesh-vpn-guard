@@ -82,8 +82,9 @@ The Tailscale failure records a priority standdown, so optional VPN recovery
 requires an explicit `darkmesh up` rearm instead of risking a reconnect loop.
 The guarded repair can re-arm a stopped `WantRunning=false` backend without
 settings flags, then verifies that identity and saved preferences did not
-change. A host with `protect-tailscale=on` refuses profiles that forbid
-Tailscale.
+change. A host with `protect-tailscale=on` refuses every profile that does not
+require Tailscale. Treating it as merely preferred is insufficient for a host
+whose recovery path depends on the tailnet.
 
 VPN-forbidden profiles are durable contracts as well. The reconnect owner
 atomically restores desired VPN state to `off`, contains the transfer client,

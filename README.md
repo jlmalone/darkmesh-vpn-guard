@@ -348,8 +348,10 @@ throughout: they are the subject of the toolkit, not the sensitive part.
 One other per-host knob: `protect-tailscale` makes Tailscale the required
 remote-access path. It is decided at setup by chassis, on for a headless node
 where the tailnet is the command lifeline and off for a laptop where an operator
-is present. On a confirmed failure, the reconnect owner contains transfers,
-lets the optional VPN yield, and runs guarded Tailscale recovery. Override with
+is present. When enabled, posture selection and Apply reject any profile that
+does not require Tailscale, including profiles that list it only as preferred.
+On a confirmed failure, the reconnect owner contains transfers, lets the optional
+VPN yield, and runs guarded Tailscale recovery. Override with
 `~/.config/darkmesh/protect-tailscale` containing `on` or `off`.
 
 See [`docs/TRUSTED_MACHINE_CONTEXT.md`](docs/TRUSTED_MACHINE_CONTEXT.md) for keeping
