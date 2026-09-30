@@ -354,6 +354,7 @@ next_attempt_at=0
 last_restore_marker=""
 tailscale_fail_samples=0
 login_session_id=""
+last_rearm_at=0
 
 state_value() { sed -n "s/^$1=//p" "$RECOVERY_STATE" 2>/dev/null | head -1; }
 load_recovery_state() {
@@ -371,6 +372,7 @@ load_recovery_state() {
   v="$(state_value next_attempt_at)"; [[ "$v" =~ ^[0-9]+$ ]] && next_attempt_at="$v"
   v="$(state_value tailscale_fail_samples)"; [[ "$v" =~ ^[0-9]+$ ]] && tailscale_fail_samples="$v"
   login_session_id="$(state_value login_session_id)"
+  v="$(state_value last_rearm_at)"; [[ "$v" =~ ^[0-9]+$ ]] && last_rearm_at="$v"
   last_network_key="$(state_value last_network_key)"
   last_restore_marker="$(state_value last_restore_marker)"
 }
@@ -390,6 +392,7 @@ persist_recovery_state() {
     printf 'next_attempt_at=%s\n' "$next_attempt_at"
     printf 'tailscale_fail_samples=%s\n' "$tailscale_fail_samples"
     printf 'login_session_id=%s\n' "$login_session_id"
+    printf 'last_rearm_at=%s\n' "$last_rearm_at"
     printf 'last_restore_marker=%s\n' "$last_restore_marker"
   } > "$tmp" && chmod 0600 "$tmp" && mv -f "$tmp" "$RECOVERY_STATE"
 }
@@ -514,6 +517,16 @@ enter_plain_state() { # <phase> <vpn-state>
 while true; do
   s="$(vpn_state)"; d="$(desired)"; d="${d:-on}"
   now="$(date +%s)"
+
+  # An explicit up/setup request must reopen an exhausted connection budget.
+  # Keep the marker: the healthcheck safety window also uses its timestamp.
+  rearm_at="$(stat -f %m "$REARM_FILE" 2>/dev/null || echo 0)"
+  if (( rearm_at > last_rearm_at )); then
+    reset_connection_budget
+    last_rearm_at="$rearm_at"
+    persist_recovery_state
+    log "explicit VPN rearm requested; reset connection recovery budget"
+  fi
 
   ts_required=no
   tailscale_required && ts_required=yes

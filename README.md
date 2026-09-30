@@ -359,6 +359,8 @@ reconnect owner. It resets the connection retry window, preserves persistent app
 limits, and retries with exponential backoff. A temporary Tailscale-priority standdown is
 cleared automatically after required Tailscale recovers. The scoped root helper also
 restores exact Tailscale split-tunnel bypass settings if ExpressVPN drops them after restart.
+An explicit `darkmesh up` request, including the request made by setup, also reopens
+the connection retry budget without resetting the separate app-restart limits.
 
 See [`docs/TRUSTED_MACHINE_CONTEXT.md`](docs/TRUSTED_MACHINE_CONTEXT.md) for keeping
 private agent context, runtime configuration, credentials, and operational data in the
