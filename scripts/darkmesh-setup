@@ -92,6 +92,7 @@ privileged_bootstrap_current() {
   cmp -s "$SHARE/unsafe.pf.conf" "$ROOT_PF_CONF" || return 1
   permissions="$(sudo -n -l 2>/dev/null)" || return 1
   printf '%s\n' "$permissions" | grep -Fq "$ROOT_HELPER dns-flush" || return 1
+  printf '%s\n' "$permissions" | grep -Fq "$ROOT_HELPER expressvpn-coexistence" || return 1
   printf '%s\n' "$permissions" | grep -Fq '/sbin/pfctl -a com.apple/vpn-guard -f /usr/local/etc/vpn-guard/unsafe.pf.conf' || return 1
   printf '%s\n' "$permissions" | grep -Fq '/sbin/pfctl -a com.apple/vpn-guard -F all' || return 1
   printf '%s\n' "$permissions" | grep -Fq '/sbin/pfctl -s info' || return 1

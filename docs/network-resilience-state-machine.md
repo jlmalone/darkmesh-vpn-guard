@@ -137,6 +137,14 @@ The legacy `--once` path only forwards a signal to the long-running process.
 ExpressVPN built-in autoconnect is disabled, and the configuration command hands
 desired-on intent to `darkmesh-up` instead of connecting directly.
 
+The signed supervisor starts the reconnect owner at login and forwards network-change
+signals to it. A new login session and a changed physical-network fingerprint reset only
+the bounded connection retry budget. App-restart limits remain persistent. When required
+Tailscale recovers, the reconnect owner clears its temporary priority standdown and resumes
+exponential optional-VPN retries. If ExpressVPN loses split-tunnel coexistence settings
+across an app or system restart, the fixed root helper restores only Network Lock off,
+autoconnect off, Tailscale bypasses, and split tunneling before the next connection attempt.
+
 ## Healthcheck relationship
 
 The healthcheck remains the safety observer and status writer. A DNS success

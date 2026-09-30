@@ -354,6 +354,12 @@ On a confirmed failure, the reconnect owner contains transfers, lets the optiona
 VPN yield, and runs guarded Tailscale recovery. Override with
 `~/.config/darkmesh/protect-tailscale` containing `on` or `off`.
 
+At login and after a physical network change, the signed supervisor wakes the sole
+reconnect owner. It resets the connection retry window, preserves persistent app-restart
+limits, and retries with exponential backoff. A temporary Tailscale-priority standdown is
+cleared automatically after required Tailscale recovers. The scoped root helper also
+restores exact Tailscale split-tunnel bypass settings if ExpressVPN drops them after restart.
+
 See [`docs/TRUSTED_MACHINE_CONTEXT.md`](docs/TRUSTED_MACHINE_CONTEXT.md) for keeping
 private agent context, runtime configuration, credentials, and operational data in the
 correct places when provisioning another trusted machine.

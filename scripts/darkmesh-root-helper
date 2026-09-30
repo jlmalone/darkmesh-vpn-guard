@@ -8,6 +8,8 @@ STATE_DIR=/Library/darkmesh/state
 CONFIG_DIR=/Library/darkmesh/config
 JOURNAL="$STATE_DIR/dns-override.state"
 CRD_TARGET_FILE="$CONFIG_DIR/crd-launchd-target"
+EXPRESSVPN_CTL=/Applications/ExpressVPN.app/Contents/MacOS/expressvpnctl
+TAILSCALE_APP=/Applications/Tailscale.app/Contents/MacOS/Tailscale
 LOG=/var/log/darkmesh-root-helper.log
 
 [[ "$(id -u)" -eq 0 ]] || { echo "darkmesh-root-helper: must run as root" >&2; exit 3; }
@@ -202,10 +204,29 @@ restart_crd() {
   log restart-crd "target=$target"
 }
 
+expressvpn_coexistence() {
+  [[ -x "$EXPRESSVPN_CTL" && -x "$TAILSCALE_APP" ]] \
+    || { log expressvpn-coexistence "refused: required app missing"; return 1; }
+  local extension count=0
+  "$EXPRESSVPN_CTL" set networklock false
+  "$EXPRESSVPN_CTL" set autoconnect false
+  "$EXPRESSVPN_CTL" set split-app "bypass:$TAILSCALE_APP"
+  while IFS= read -r extension; do
+    [[ "$extension" =~ ^/Library/SystemExtensions/[A-F0-9-]+/io\.tailscale\.ipn\.macsys\.network-extension\.systemextension/Contents/MacOS/io\.tailscale\.ipn\.macsys\.network-extension$ ]] || continue
+    [[ -f "$extension" ]] || continue
+    "$EXPRESSVPN_CTL" set split-app "bypass:$extension"
+    count=$((count + 1))
+  done < <(ps -axo comm= 2>/dev/null | sort -u)
+  (( count > 0 )) || { log expressvpn-coexistence "refused: active Tailscale extension unavailable"; return 1; }
+  "$EXPRESSVPN_CTL" set splittunnel true
+  log expressvpn-coexistence "ok extensions=$count"
+}
+
 case "$1" in
   dns-flush)    flush_dns;   log dns-flush "ok" ;;
   dns-override) override_dns ;;
   dns-restore)  restore_dns ;;
   restart-crd)  restart_crd ;;
+  expressvpn-coexistence) expressvpn_coexistence ;;
   *) echo "darkmesh-root-helper: unknown verb" >&2; exit 2 ;;
 esac

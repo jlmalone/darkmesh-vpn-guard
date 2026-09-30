@@ -65,7 +65,7 @@ fi
 
 tmp="$(mktemp)"
 {
-  printf 'Cmnd_Alias DARKMESH_RECOVER = %s dns-flush, %s dns-override, %s dns-restore' "$DST" "$DST" "$DST"
+  printf 'Cmnd_Alias DARKMESH_RECOVER = %s dns-flush, %s dns-override, %s dns-restore, %s expressvpn-coexistence' "$DST" "$DST" "$DST" "$DST"
   [[ -n "$crd_target" ]] && printf ', %s restart-crd' "$DST"
   printf '\n%s ALL=(root) NOPASSWD: DARKMESH_RECOVER\n' "$TARGET_USER"
 } > "$tmp"

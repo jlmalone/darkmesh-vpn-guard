@@ -57,6 +57,7 @@ TAILSCALE_BYPASS_CHECK="${DARKMESH_TAILSCALE_BYPASS_CHECK:-$SCRIPT_DIR/darkmesh-
 ENFORCED_POSTURE_FILE="${DARKMESH_ENFORCED_POSTURE_FILE:-$HOME/.config/darkmesh/posture-enforced.json}"
 PROTECT_TAILSCALE_FILE="${DARKMESH_PROTECT_TAILSCALE_FILE:-$HOME/.config/darkmesh/protect-tailscale}"
 TAILSCALE_STANDDOWN_FILE="${DARKMESH_TAILSCALE_STANDDOWN_FILE:-$HOME/.config/darkmesh/tailscale-priority-standdown}"
+ROOT_HELPER="${DARKMESH_ROOT_HELPER:-/Library/darkmesh/bin/darkmesh-root-helper}"
 VPN_GUARD="${DARKMESH_VPN_GUARD:-$(command -v vpn-guard.sh 2>/dev/null || echo "$SCRIPT_DIR/vpn-guard.sh")}"
 
 INTERVAL_OK="${INTERVAL_OK:-30}"            # poll cadence when healthy / idle
@@ -118,6 +119,21 @@ open_tailscale_standdown() {
   printf '%s\n' "$(date -u +%FT%TZ)" > "$tmp" \
     && chmod 0600 "$tmp" \
     && mv -f "$tmp" "$TAILSCALE_STANDDOWN_FILE"
+}
+clear_tailscale_standdown() {
+  [[ -f "$TAILSCALE_STANDDOWN_FILE" ]] || return 0
+  rm -f "$TAILSCALE_STANDDOWN_FILE"
+  log "required Tailscale recovered; cleared priority standdown"
+}
+reset_connection_budget() {
+  consecutive_fails=0; failing_since=0; gave_up=false; gave_up_at=0
+  restricted_window_started=0; restricted_attempts=0; next_attempt_at=0
+  captive_ticks=0; clear_ticks=0; backoff="$INTERVAL_RECOVER"
+  last_restore_marker=""
+}
+repair_coexistence() {
+  [[ -x "$ROOT_HELPER" ]] || return 1
+  sudo -n "$ROOT_HELPER" expressvpn-coexistence >>"$LOG" 2>&1
 }
 # Classify plain connectivity without treating blocked global probes as proof of
 # a captive portal. Output: open, captive, restricted, or offline.
@@ -337,6 +353,7 @@ restricted_attempts=0
 next_attempt_at=0
 last_restore_marker=""
 tailscale_fail_samples=0
+login_session_id=""
 
 state_value() { sed -n "s/^$1=//p" "$RECOVERY_STATE" 2>/dev/null | head -1; }
 load_recovery_state() {
@@ -353,6 +370,7 @@ load_recovery_state() {
   v="$(state_value restricted_attempts)"; [[ "$v" =~ ^[0-9]+$ ]] && restricted_attempts="$v"
   v="$(state_value next_attempt_at)"; [[ "$v" =~ ^[0-9]+$ ]] && next_attempt_at="$v"
   v="$(state_value tailscale_fail_samples)"; [[ "$v" =~ ^[0-9]+$ ]] && tailscale_fail_samples="$v"
+  login_session_id="$(state_value login_session_id)"
   last_network_key="$(state_value last_network_key)"
   last_restore_marker="$(state_value last_restore_marker)"
 }
@@ -371,10 +389,20 @@ persist_recovery_state() {
     printf 'restricted_attempts=%s\n' "$restricted_attempts"
     printf 'next_attempt_at=%s\n' "$next_attempt_at"
     printf 'tailscale_fail_samples=%s\n' "$tailscale_fail_samples"
+    printf 'login_session_id=%s\n' "$login_session_id"
     printf 'last_restore_marker=%s\n' "$last_restore_marker"
   } > "$tmp" && chmod 0600 "$tmp" && mv -f "$tmp" "$RECOVERY_STATE"
 }
 load_recovery_state
+current_login_session_id="$(launchctl print "gui/$(id -u)" 2>/dev/null | awk '/asid =/{print $3; exit}')"
+startup_rearm=no
+if [[ -n "$current_login_session_id" && "$current_login_session_id" != "$login_session_id" ]]; then
+  login_session_id="$current_login_session_id"
+  last_network_key=""
+  network_started_at="$(date +%s)"
+  reset_connection_budget
+  startup_rearm=yes
+fi
 
 write_sidecar() {  # <phase> <vpn_state>
   local tmp="${SIDECAR}.tmp.$$"
@@ -420,6 +448,7 @@ trap cleanup EXIT
 trap 'exit 0' INT TERM
 
 log "reconnect watchdog start (interval ok=${INTERVAL_OK}s recover=${INTERVAL_RECOVER}s, desired-file=$DESIRED_FILE)"
+[[ "$startup_rearm" != yes ]] || log "new login session detected; reset VPN recovery budget"
 backoff="$INTERVAL_RECOVER"
 loop_ticks=0
 safety_standdown_announced=no
@@ -488,7 +517,9 @@ while true; do
 
   ts_required=no
   tailscale_required && ts_required=yes
-  if [[ "$ts_required" == yes ]] && ! tailscale_ready; then
+  ts_ready=no
+  tailscale_ready && ts_ready=yes
+  if [[ "$ts_required" == yes && "$ts_ready" != yes ]]; then
     if [[ "$s" != Disconnected ]]; then
       tailscale_fail_samples=$((tailscale_fail_samples + 1))
       if (( tailscale_fail_samples < TAILSCALE_FAIL_SAMPLES_REQUIRED )); then
@@ -511,11 +542,16 @@ while true; do
       loop_sleep "$INTERVAL_RECOVER" backoff || break
       continue
     fi
+    ts_ready=yes
     log "required Tailscale healthy; optional VPN recovery may proceed"
     tailscale_fail_samples=0
     last_restore_marker=""
   else
     tailscale_fail_samples=0
+  fi
+  if [[ "$ts_required" == yes && "$ts_ready" == yes && -f "$TAILSCALE_STANDDOWN_FILE" ]]; then
+    clear_tailscale_standdown
+    reset_connection_budget
   fi
 
   # A successfully applied VPN-forbidden posture is continuous policy, not a
@@ -554,9 +590,7 @@ while true; do
   elif [[ -n "$key" && "$key" != "$last_network_key" ]]; then
     log "physical network changed; resetting per-network recovery budget"
     last_network_key="$key"; network_started_at="$now"
-    restricted_window_started=0; restricted_attempts=0; next_attempt_at=0
-    consecutive_fails=0; failing_since=0; captive_ticks=0; clear_ticks=0
-    backoff="$INTERVAL_RECOVER"; last_restore_marker=""
+    reset_connection_budget
     enter_plain_state settling "$s"
     s="$(vpn_state)"; s="${s:-Disconnected}"
   fi
@@ -668,10 +702,17 @@ while true; do
   fi
 
   if [[ "$ts_required" == yes ]] && ! "$TAILSCALE_BYPASS_CHECK" check-bypass >/dev/null 2>&1; then
-    log "required Tailscale extension has no verified ExpressVPN bypass; refusing VPN connect"
-    write_sidecar "tailscale-bypass-required" "$s"
-    loop_sleep "$INTERVAL_OK" idle || break
-    continue
+    log "required Tailscale coexistence settings drifted; attempting scoped repair"
+    if ! repair_coexistence || ! "$TAILSCALE_BYPASS_CHECK" check-bypass >/dev/null 2>&1; then
+      wait_for="$backoff"
+      next_attempt_at=$(( now + wait_for ))
+      backoff=$(( backoff * 2 )); [ "$backoff" -gt "$MAX_BACKOFF" ] && backoff="$MAX_BACKOFF"
+      log "coexistence repair unavailable; retry not before ${next_attempt_at} (${wait_for}s)"
+      write_sidecar "tailscale-bypass-required" "$s"
+      loop_sleep "$wait_for" backoff || break
+      continue
+    fi
+    log "required Tailscale coexistence settings restored"
   fi
 
   log "recovering: state=$s, attempt $(( consecutive_fails + 1 ))"
