@@ -312,6 +312,13 @@ else
 fi
 
 # --- arm now + verify ---------------------------------------------------------
+if [[ -n "$PROTECT_TS_REPL" ]] \
+    && grep -Eq '"profile"[[:space:]]*:[[:space:]]*"tailscale-required-vpn-(optional|preferred)"' "$ENFORCED_POSTURE_FILE" 2>/dev/null; then
+  log "restoring Tailscale-first ExpressVPN coexistence settings"
+  sudo -n "$ROOT_HELPER" expressvpn-coexistence \
+    || { warn "scoped ExpressVPN coexistence repair failed"; exit 1; }
+  "$BIN/darkmesh-up"
+fi
 "$BIN/vpn-guard.sh" >/dev/null 2>&1 || true   # write the PF sidecar immediately
 if [[ "$UNIFIED" == 1 ]]; then
   log "registering signed supervisor and retiring legacy background items"
