@@ -5,3 +5,4 @@ docs/server-monitor-darkmesh-brief.md
 
 # macOS cruft
 .DS_Store
+/build/
