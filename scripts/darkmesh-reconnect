@@ -104,6 +104,9 @@ tailscale_required() {
 vpn_forbidden() {
   grep -Eq '"profile"[[:space:]]*:[[:space:]]*"(internet-plain-transfer-contained|tailscale-required-vpn-forbidden)"' "$ENFORCED_POSTURE_FILE" 2>/dev/null
 }
+tailscale_forbidden() {
+  grep -Eq '"profile"[[:space:]]*:[[:space:]]*"(internet-plain-transfer-contained|vpn-required-tailscale-forbidden|vpn-only-block-on-loss)"' "$ENFORCED_POSTURE_FILE" 2>/dev/null
+}
 set_desired_off() {
   local tmp="${DESIRED_FILE}.tmp.$$"
   printf 'off\n' > "$tmp" \
@@ -586,7 +589,7 @@ while true; do
     continue
   fi
 
-  if [[ "$s" == Disconnected && "$ts_required" != yes && -x "$TAILSCALE_REPAIR" ]]; then
+  if [[ "$s" == Disconnected && "$ts_required" != yes && -x "$TAILSCALE_REPAIR" ]] && ! tailscale_forbidden; then
     "$TAILSCALE_REPAIR" --auto >>"$LOG" 2>&1 || true
   fi
 

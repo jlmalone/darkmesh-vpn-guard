@@ -202,10 +202,10 @@ def acquire_lock():
     LOCK.parent.mkdir(parents=True,exist_ok=True)
     try: return os.open(str(LOCK),os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
     except FileExistsError: return None
-def apply(profile_id):
+def apply(profile_id, replace_host_policy=False):
     p=get_profile(profile_id)
     if not p: emit({"schema":2,"kind":"darkmesh-posture-apply","applied":False,"reason":"unknown-profile"},2)
-    if host_policy_conflict(p): emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"host-policy-conflict","requiredByHost":"tailscale","rollback":{"attempted":False,"reason":"no-action-taken"}},4)
+    if host_policy_conflict(p) and not replace_host_policy: emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"host-policy-conflict","requiredByHost":"tailscale","rollback":{"attempted":False,"reason":"no-action-taken"}},4)
     if p["transition"].get("apply")=="refuse": emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"capability-unavailable","requiredCapability":"machine-wide-kill-switch","capabilities":p.get("capabilities",{}),"rollback":{"attempted":False,"reason":"no-action-taken"}},4)
     handle=acquire_lock()
     if handle is None: emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"apply-in-progress","rollback":{"attempted":False,"reason":"no-action-taken"}},5)
@@ -215,8 +215,13 @@ def apply(profile_id):
         if profile_id==STRICT_PROFILE and vpn_get("allowlan")!="false": emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":False,"reason":"disable-local-network-access-in-expressvpn-first","rollback":{"attempted":False,"reason":"preflight-failed"}},3)
         # Apply changes policy immediately. Failed convergence leaves that
         # policy active and visibly unmet until recovery or another apply.
+        evidence=[]
+        if host_policy_conflict(p):
+            temp=PROTECT_TAILSCALE.with_name(PROTECT_TAILSCALE.name+f".tmp.{os.getpid()}")
+            temp.write_text("off\n"); os.chmod(temp,0o600); temp.replace(PROTECT_TAILSCALE)
+            evidence.append({"step":"replace-host-policy","ok":True,"detail":"explicit apply replaced host Tailscale requirement"})
         write_desired(profile_id); write_enforced(profile_id)
-        evidence=[]; transition=p["transition"]; initial_ssh=ssh_reachability() if transition.get("vpn")=="attempt-with-rollback" else None
+        transition=p["transition"]; initial_ssh=ssh_reachability() if transition.get("vpn")=="attempt-with-rollback" else None
         def failed(reason, post=None):
             current=post if post is not None else observed()
             emit({"schema":2,"kind":"darkmesh-posture-apply","profile":profile_id,"applied":True,"converged":False,"reason":reason,"initial":initial,"postcondition":current,"assessment":assess(p,current),"actions":evidence,"rollback":{"attempted":False,"reason":"policy-persists"}},3)
@@ -284,6 +289,9 @@ def main():
     if command=="topology" and len(args) in (1,2): topology()
     if command=="probe" and len(args) in (1,2): probe()
     if command=="report" and len(args) in (1,2): report()
-    if command=="apply" and len(args) in (1,2): apply(args[1] if len(args)==2 else read_desired())
+    if command=="apply":
+        replace_host_policy="--replace-host-policy" in args[1:]
+        apply_args=[arg for arg in args[1:] if arg!="--replace-host-policy"]
+        if len(apply_args)<=1: apply(apply_args[0] if apply_args else read_desired(),replace_host_policy)
     print("Usage: darkmesh posture {profiles|show|set <id>|topology|probe|report|apply [id]} [--json]",file=sys.stderr); raise SystemExit(2)
 if __name__=="__main__": main()

@@ -93,7 +93,17 @@ policy.
 Selecting a posture and applying it are separate. Only a successful Apply
 writes `~/.config/darkmesh/posture-enforced.json` and changes continuous
 supervision. On a host with `protect-tailscale=on`, a posture that does not
-require Tailscale is rejected before any network action.
+require Tailscale is rejected before any network action unless the explicit
+`--replace-host-policy` option is supplied. Server Monitor's confirmed Apply
+command should include that option. After the containment and capability
+preflights pass, it atomically saves `protect-tailscale=off` when the chosen
+profile conflicts with that host requirement. The selected policy persists
+even if its network requirements have not yet converged.
+
+The healthcheck reads the saved host requirement on every tick. An explicit
+`off` supersedes an old `--protect-tailscale` startup argument; an applied
+Tailscale-required profile still requires Tailscale. Profiles forbidding
+Tailscale suppress automatic Tailscale repair in both supervisors.
 
 The `tailscale-required-vpn-forbidden` profile is the recovery-host posture when
 private-overlay reachability has priority over the commercial VPN. Its

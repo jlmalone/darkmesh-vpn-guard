@@ -49,8 +49,12 @@ until an explicit `darkmesh up` rearm. A stopped
 `WantRunning=false` backend is re-armed with a bounded settings-free
 `tailscale up`; saved identity and all preferences are compared afterward.
 Logout, reset, reauthentication, and application quit are never automatic. A
-host-level Tailscale requirement also refuses any posture that forbids
-Tailscale.
+host-level Tailscale requirement refuses conflicting postures unless the
+operator explicitly applies with `--replace-host-policy`. Confirmed local
+Apply uses that option and persists the replacement after safety preflights.
+Saved `protect-tailscale=off` supersedes old healthcheck startup arguments.
+Neither supervisor automatically repairs Tailscale while the applied profile
+forbids it.
 
 An enforced VPN-forbidden posture supersedes a later desired-on request. Every
 reconcile pass atomically restores desired-off and keeps the contained plain

@@ -198,7 +198,13 @@ probe_tailscale() {
 }
 
 tailscale_required() {
-  [[ "$PROTECT_TS" == yes ]] && return 0
+  local host_policy=""
+  [[ ! -r "${DARKMESH_PROTECT_TAILSCALE_FILE:-$HOME/.config/darkmesh/protect-tailscale}" ]] || host_policy="$(tr '[:upper:]' '[:lower:]' < "${DARKMESH_PROTECT_TAILSCALE_FILE:-$HOME/.config/darkmesh/protect-tailscale}" | tr -d '[:space:]')"
+  case "$host_policy" in
+    on|yes|1|true) return 0 ;;
+    off|no|0|false) ;;
+    *) [[ "$PROTECT_TS" != yes ]] || return 0 ;;
+  esac
   grep -Eq '"profile"[[:space:]]*:[[:space:]]*"(tailscale-required-[^"]+|dual-required-zero-general-egress-leak)"' "$ENFORCED_POSTURE_FILE" 2>/dev/null
 }
 
@@ -207,7 +213,7 @@ vpn_forbidden() {
 }
 
 tailscale_forbidden() {
-  grep -Eq '"profile"[[:space:]]*:[[:space:]]*"internet-plain-transfer-contained"' "$ENFORCED_POSTURE_FILE" 2>/dev/null
+  grep -Eq '"profile"[[:space:]]*:[[:space:]]*"(internet-plain-transfer-contained|vpn-required-tailscale-forbidden|vpn-only-block-on-loss)"' "$ENFORCED_POSTURE_FILE" 2>/dev/null
 }
 
 enforced_posture_profile() {
