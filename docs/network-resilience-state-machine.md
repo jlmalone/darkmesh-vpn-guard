@@ -31,7 +31,7 @@ autoconnect guidance are superseded here.
 | `captive-clear-wait` | Require stable exact success before a normal-region VPN attempt. | Required clear samples pass. |
 | `restricted-wait` | No positive portal evidence, but the normal probes are blocked or unavailable. | The initial plain-network window expires. |
 | `retrying` | One serialized VPN attempt failed. Restore plain networking and preserve the absolute retry deadline. | Deadline expires. |
-| `safety-standdown` | A connected tunnel failed the healthcheck safety gate. Prefer stable plain networking for one hour. | The standdown expires or the operator explicitly runs `darkmesh up`. |
+| `safety-standdown` | A connected tunnel failed the healthcheck safety gate. Settle for 60 seconds when the applied profile requires VPN; otherwise prefer plain networking for one hour. | Automatically retry after settling and stable clear probes, or the operator explicitly runs `darkmesh up`. |
 | `plain-cooldown` | Per-network restricted-attempt budget is exhausted. | Cooldown expires or the physical network changes. |
 | `connected` | Re-pin the transfer client to the live tunnel interface and address. The guard resumes only the hashes owned by the current incident after positive Wi-Fi trust, fresh internet and DNS health, exact tunnel-binding readback, and a direct tunnel probe all pass. | VPN or physical network changes. |
 

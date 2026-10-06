@@ -64,6 +64,7 @@ INTERVAL_OK="${INTERVAL_OK:-30}"            # poll cadence when healthy / idle
 INTERVAL_RECOVER="${INTERVAL_RECOVER:-10}"  # poll cadence while recovering
 MAX_BACKOFF="${MAX_BACKOFF:-300}"           # cap reconnect backoff
 SAFETY_WINDOW="${SAFETY_WINDOW:-3600}"      # prefer stable plain networking after a safety disconnect
+REQUIRED_VPN_SAFETY_WINDOW="${REQUIRED_VPN_SAFETY_WINDOW:-60}" # short settle before required-VPN retries
 WEDGE_FAILS="${WEDGE_FAILS:-3}"             # failed connects before declaring the app wedged
 MAX_APP_RESTARTS="${MAX_APP_RESTARTS:-3}"   # app restarts allowed per RESTART_WINDOW
 RESTART_WINDOW="${RESTART_WINDOW:-3600}"
@@ -106,6 +107,9 @@ vpn_forbidden() {
 }
 tailscale_forbidden() {
   grep -Eq '"profile"[[:space:]]*:[[:space:]]*"(internet-plain-transfer-contained|vpn-required-tailscale-forbidden|vpn-only-block-on-loss)"' "$ENFORCED_POSTURE_FILE" 2>/dev/null
+}
+vpn_required() {
+  grep -Eq '"profile"[[:space:]]*:[[:space:]]*"(vpn-required-tailscale-(forbidden|optional|preferred)|vpn-only-block-on-loss|dual-required-zero-general-egress-leak)"' "$ENFORCED_POSTURE_FILE" 2>/dev/null
 }
 set_desired_off() {
   local tmp="${DESIRED_FILE}.tmp.$$"
@@ -271,7 +275,8 @@ guard_after_repin() {
 }
 
 recently_auto_disconnected() {
-  local at epoch now rearm_at=0
+  local at epoch now rearm_at=0 safety_window="$SAFETY_WINDOW"
+  vpn_required && safety_window="$REQUIRED_VPN_SAFETY_WINDOW"
   at="$(grep -oE '"auto_disconnect_at"[[:space:]]*:[[:space:]]*"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z"' "$STATUS_FILE" 2>/dev/null | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z')"
   [ -n "$at" ] || return 1
   epoch="$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%SZ" "$at" +%s 2>/dev/null)" || return 1
@@ -280,7 +285,7 @@ recently_auto_disconnected() {
   # rearm in that same second as newer so `darkmesh up` always wins promptly.
   (( rearm_at < epoch )) || return 1
   now="$(date +%s)"
-  [ $(( now - epoch )) -lt "$SAFETY_WINDOW" ]
+  [ $(( now - epoch )) -lt "$safety_window" ]
 }
 
 # Re-point the transfer client at the live tunnel ONLY when its binding is stale.
@@ -642,7 +647,9 @@ while true; do
   if recently_auto_disconnected; then
     clear_ticks=0
     if [[ "$safety_standdown_announced" != yes ]]; then
-      log "healthcheck auto-disconnected recently; standing down for up to ${SAFETY_WINDOW}s"
+      safety_window="$SAFETY_WINDOW"
+      vpn_required && safety_window="$REQUIRED_VPN_SAFETY_WINDOW"
+      log "healthcheck auto-disconnected recently; standing down for up to ${safety_window}s"
       safety_standdown_announced=yes
     fi
     plain_class=restricted
