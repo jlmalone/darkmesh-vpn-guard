@@ -1,6 +1,7 @@
 # Packaging darkmesh for Homebrew (`jlmalone/tap`)
 
-`darkmesh.rb` is the formula. The pure-shell payload has no compilation step. Release
+`darkmesh.rb` is the formula. Shell tools have no compilation step; the optional
+profile-client launcher requires Kotlin/JVM. Release
 tarballs currently live on the public tap repository (`jlmalone/homebrew-tap`) so
 Homebrew can fetch them without authentication.
 
@@ -13,7 +14,7 @@ Homebrew can fetch them without authentication.
    ```
    git archive --format=tar.gz --prefix=darkmesh-X.Y.Z/ \
      -o /tmp/darkmesh-X.Y.Z.tar.gz HEAD scripts vpn-guard newsyslog \
-     experiment.conf.example README.md LICENSE
+     experiment.conf.example README.md LICENSE docs/profile-client-launcher.md
    ```
 3. Compute the sha and paste it into `darkmesh.rb`:
    ```

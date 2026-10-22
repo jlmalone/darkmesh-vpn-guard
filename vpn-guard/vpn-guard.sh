@@ -75,12 +75,12 @@ transfer_desired() {
 
 is_vpn_connected() {
   # Strict: requires the daemon to report active tunnel, not "app running but disconnected".
-  # Live output (connected): first line is exactly "Connected to <region>".
-  # Connecting or disconnected states are explicitly not considered safe.
+  # Use the daemon state rather than its human-readable region label, which can
+  # contain spaces and additional display text. Transitional states stay unsafe.
   [[ -x "$EXPRESSVPN_CTL" ]] || { log "expressvpnctl missing at $EXPRESSVPN_CTL"; return 1; }
   local line
-  line="$("$EXPRESSVPN_CTL" --timeout 3 status 2>/dev/null | head -n1)"
-  [[ "$line" =~ ^Connected\ to\ [^[:space:]]+$ ]]
+  line="$("$EXPRESSVPN_CTL" --timeout 3 get connectionstate 2>/dev/null | head -n1)" || return 1
+  [[ "$line" == Connected ]]
 }
 
 active_wifi_iface() {

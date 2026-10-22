@@ -368,6 +368,14 @@ correct places when provisioning another trusted machine.
 
 ## Helpers
 
+### Profile-based client launcher
+
+`scripts/launch-profile-client.main.kts` runs a configured client only after
+refreshing its VPN binding, then stops it when the tunnel changes. It requires
+Kotlin/JVM and private per-host arguments. Optional runtime checksums detect
+incompatible dependency changes before launch. See
+[`docs/profile-client-launcher.md`](docs/profile-client-launcher.md).
+
 ### `scripts/darkmesh-experiment`
 
 Runs the convergence-based WireGuard and Lightway coexistence suite with exact
