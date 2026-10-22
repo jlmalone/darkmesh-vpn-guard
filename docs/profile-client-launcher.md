@@ -26,6 +26,9 @@ Configure these environment variables in the private service definition:
 Arguments are passed directly to the executable and never evaluated as shell
 code. Keep the argument file and client configuration private. The service
 definition must supply any runtime plugin paths required by its chosen client.
+The guard can use an existing client-side localhost authentication bypass for
+loopback HTTP endpoints. It does not enable that bypass; other endpoints keep
+using Keychain credentials.
 
 For clients using private library APIs, supply a runtime manifest. Each line
 contains a lowercase SHA-256, a tab, and the absolute library path. A mismatch

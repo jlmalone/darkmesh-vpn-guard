@@ -194,6 +194,15 @@ client_password() {
 }
 
 client_login() {
+  # Respect an existing client-side localhost authentication bypass. Never
+  # enable that policy here, and keep remote endpoints on Keychain login.
+  case "$CLIENT_WEB_HOST" in
+    http://127.0.0.1:*|http://localhost:*)
+      if curl -fsS --max-time 5 -H "Referer: $CLIENT_WEB_HOST" \
+        "$CLIENT_WEB_HOST/api/v2/app/version" >/dev/null 2>&1; then
+        return 0
+      fi ;;
+  esac
   # Exit codes: 0 ok, 2 no keychain entry, 3 bad password, 4 unreachable/unexpected.
   local pw resp http body body_file
   body_file="/tmp/.vpn-guard-login-body.$$"
