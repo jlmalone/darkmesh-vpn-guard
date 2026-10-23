@@ -190,8 +190,8 @@ tunnel_iface() {
 vpn_recovery_verified() {
   if [ -n "${DARKMESH_VPN_VERIFY_CMD:-}" ]; then "$DARKMESH_VPN_VERIFY_CMD"; return; fi
   local status tif tip bound code
-  status="$("$EXPRESSVPN_CTL" --timeout 3 status 2>/dev/null | head -1)"
-  [[ "$status" =~ ^Connected\ to\ [^[:space:]]+$ ]] || return 1
+  status="$("$EXPRESSVPN_CTL" --timeout 3 get connectionstate 2>/dev/null | head -1)" || return 1
+  [ "$status" = Connected ] || return 1
   tif="$(tunnel_iface)"; [ -n "$tif" ] || return 1
   tip="$(ifconfig "$tif" 2>/dev/null | awk '/inet / {print $2; exit}')"; [ -n "$tip" ] || return 1
   bound="$(client_api GET /api/v2/app/preferences | python3 -c '
