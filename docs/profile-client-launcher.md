@@ -9,6 +9,9 @@ client, it refreshes and checks the binding through `transfer-vpn-doctor`. It
 refuses to edit a profile when the configured client process already exists.
 Only one launcher may hold its state-directory lock. A changed or unavailable
 tunnel stops the owned client, allowing its supervisor to retry later.
+When the private binding configuration names a process different from its
+desktop app, the binding tool checks and quits that exact background process.
+An unrelated desktop process cannot prevent background-profile recovery.
 
 Configure these environment variables in the private service definition:
 

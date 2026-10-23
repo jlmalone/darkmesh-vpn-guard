@@ -93,6 +93,12 @@ conf_get() {
 }
 
 client_running() {
+  # A separately named background client owns its own profile. A desktop app
+  # with the same product identity must not block that profile's recovery.
+  if [[ "$CLIENT_PROC" != "$CLIENT_APP" ]]; then
+    pgrep -x "$CLIENT_PROC" >/dev/null 2>&1
+    return $?
+  fi
   osascript -e "application \"$CLIENT_APP\" is running" 2>/dev/null | grep -q true
 }
 
@@ -269,7 +275,11 @@ fi
 if client_running; then
   if [[ "$QUIT_CLIENT" == "yes" ]]; then
     echo "Quitting transfer client..."
-    osascript -e "quit app \"$CLIENT_APP\"" >/dev/null 2>&1 || die "failed to ask client to quit"
+    if [[ "$CLIENT_PROC" != "$CLIENT_APP" ]]; then
+      pkill -TERM -x "$CLIENT_PROC" || die "failed to ask background client to quit"
+    else
+      osascript -e "quit app \"$CLIENT_APP\"" >/dev/null 2>&1 || die "failed to ask client to quit"
+    fi
     wait_for_client_exit || die "client did not quit within 20 seconds; not editing config"
   else
     die "client is running. Quit it first, or run transfer-vpn-doctor --fix --quit"
