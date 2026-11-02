@@ -45,7 +45,7 @@ Automatic attempts are limited to one per hour.
 When Tailscale is required, three confirmed failures make ExpressVPN yield only
 after transfer containment is established. The reconnect owner then restores
 Tailscale and records a priority standdown that keeps the optional VPN down
-until an explicit `darkmesh up` rearm. A stopped
+for one hour, or until an explicit `darkmesh up` rearm. A stopped
 `WantRunning=false` backend is re-armed with a bounded settings-free
 `tailscale up`; saved identity and all preferences are compared afterward.
 Logout, reset, reauthentication, and application quit are never automatic. A
@@ -144,8 +144,10 @@ desired-on intent to `darkmesh-up` instead of connecting directly.
 The signed supervisor starts the reconnect owner at login and forwards network-change
 signals to it. A new login session and a changed physical-network fingerprint reset only
 the bounded connection retry budget. App-restart limits remain persistent. When required
-Tailscale recovers, the reconnect owner clears its temporary priority standdown and resumes
-exponential optional-VPN retries. If ExpressVPN loses split-tunnel coexistence settings
+Tailscale recovers, the reconnect owner retains its priority standdown for one hour
+from the confirmed coexistence failure before resuming optional-VPN retries.
+Healthy off-VPN samples and process restarts do not shorten this cooldown.
+An explicit `darkmesh up` clears it immediately. If ExpressVPN loses split-tunnel coexistence settings
 across an app or system restart, the fixed root helper restores only Network Lock off,
 autoconnect off, Tailscale bypasses, and split tunneling before the next connection attempt.
 

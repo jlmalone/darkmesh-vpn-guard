@@ -564,15 +564,21 @@ while true; do
       continue
     fi
     ts_ready=yes
-    log "required Tailscale healthy; optional VPN recovery may proceed"
+    log "required Tailscale healthy; preserving VPN cooldown after coexistence failure"
     tailscale_fail_samples=0
     last_restore_marker=""
   else
     tailscale_fail_samples=0
   fi
   if [[ "$ts_required" == yes && "$ts_ready" == yes && -f "$TAILSCALE_STANDDOWN_FILE" ]]; then
-    clear_tailscale_standdown
-    reset_connection_budget
+    # Recovery off-VPN does not prove coexistence works. Keep the durable marker
+    # through healthy samples and process restarts, or every recovery immediately
+    # recreates the same outage. Explicit darkmesh up removes it independently.
+    standdown_at="$(stat -f %m "$TAILSCALE_STANDDOWN_FILE" 2>/dev/null || echo 0)"
+    if (( standdown_at > 0 && now - standdown_at >= SAFETY_WINDOW )); then
+      clear_tailscale_standdown
+      reset_connection_budget
+    fi
   fi
 
   # A successfully applied VPN-forbidden posture is continuous policy, not a

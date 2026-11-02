@@ -94,7 +94,8 @@ the same checked repair on demand.
 An applied Tailscale-required posture, or `protect-tailscale=on` on a headless
 host, is continuously enforced. After three confirmed misses, Darkmesh contains
 the transfer client, lets ExpressVPN yield, restores Tailscale, and blocks an
-optional VPN reconnect until the operator explicitly runs `darkmesh up`. If
+optional VPN reconnect for one hour. The operator can explicitly run `darkmesh up`
+to retry sooner. Healthy off-VPN samples do not clear this cooldown. If
 `WantRunning` was cleared, the guarded repair uses settings-free `tailscale up`
 and verifies the saved
 identity and preferences afterward. It never logs out, resets, runs
