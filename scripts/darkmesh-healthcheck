@@ -570,7 +570,7 @@ status_json() {
   desired="$(desired_state)"
   posture_profile="$(enforced_posture_profile)"
   case "$verdict:$posture_profile:$state" in
-    DEGRADED:*vpn-optional:Disconnected) posture_reason=optional-vpn-unavailable ;;
+    DEGRADED:tailscale-required-vpn-optional:Disconnected|DEGRADED:tailscale-required-vpn-preferred:Disconnected) posture_reason=optional-vpn-unavailable ;;
     GO:*) posture_reason=profile-satisfied ;;
     NO-GO:*) posture_reason=required-service-or-containment-failure ;;
     CAPTIVE:*) posture_reason=captive-network-standdown ;;
@@ -747,6 +747,13 @@ probe_and_decide() {
   elif [[ "$state" == Connected ]]; then
     VPN_PATH_FAIL_TICKS=0
     verdict=GO
+  elif [[ "$state" == Disconnected ]] &&
+      [[ "$(enforced_posture_profile)" == tailscale-required-vpn-optional ||
+         "$(enforced_posture_profile)" == tailscale-required-vpn-preferred ]]; then
+    # Required connectivity checks above still fail red. An unavailable
+    # secondary VPN alone is degradation after Tailscale has recovered.
+    VPN_PATH_FAIL_TICKS=0
+    verdict=DEGRADED
   else
     VPN_PATH_FAIL_TICKS=0
     verdict=NO-GO
