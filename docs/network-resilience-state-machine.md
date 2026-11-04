@@ -147,9 +147,15 @@ the bounded connection retry budget. App-restart limits remain persistent. When 
 Tailscale recovers, the reconnect owner retains its priority standdown for one hour
 from the confirmed coexistence failure before resuming optional-VPN retries.
 Healthy off-VPN samples and process restarts do not shorten this cooldown.
-An explicit `darkmesh up` clears it immediately. If ExpressVPN loses split-tunnel coexistence settings
-across an app or system restart, the fixed root helper restores only Network Lock off,
-autoconnect off, Tailscale bypasses, and split tunneling before the next connection attempt.
+An explicit `darkmesh up` clears it immediately. Before the first VPN connection attempt
+in each Tailscale-required recovery sequence, the fixed root helper reapplies Network
+Lock off, autoconnect off, Tailscale bypasses, and split tunneling. This also refreshes
+vendor state when the exact bypass rule is already present. Readback must confirm all
+four settings before connecting. Failed repairs use the existing exponential backoff
+and recovery breaker; healthy connected tunnels are left alone. Missing bypass rules
+trigger another repair even within the same sequence. This runs inside Server Monitor's
+existing reconnect child, without another scheduled job or administrator prompt.
+Explicit desired-off and VPN-forbidden policies remain authoritative.
 
 ## Healthcheck relationship
 

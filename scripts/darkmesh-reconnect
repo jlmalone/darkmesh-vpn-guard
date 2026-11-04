@@ -133,6 +133,7 @@ clear_tailscale_standdown() {
   log "required Tailscale recovered; cleared priority standdown"
 }
 reset_connection_budget() {
+  coexistence_prepared=no
   consecutive_fails=0; failing_since=0; gave_up=false; gave_up_at=0
   restricted_window_started=0; restricted_attempts=0; next_attempt_at=0
   captive_ticks=0; clear_ticks=0; backoff="$INTERVAL_RECOVER"
@@ -140,7 +141,11 @@ reset_connection_budget() {
 }
 repair_coexistence() {
   [[ -x "$ROOT_HELPER" ]] || return 1
-  sudo -n "$ROOT_HELPER" expressvpn-coexistence >>"$LOG" 2>&1
+  sudo -n "$ROOT_HELPER" expressvpn-coexistence >>"$LOG" 2>&1 || return 1
+  "$TAILSCALE_BYPASS_CHECK" check-bypass >/dev/null 2>&1 \
+    && [[ "$("$CTL" --timeout 4 get networklock 2>/dev/null | head -1)" == false ]] \
+    && [[ "$("$CTL" --timeout 4 get autoconnect 2>/dev/null | head -1)" == false ]] \
+    && [[ "$("$CTL" --timeout 4 get splittunnel 2>/dev/null | head -1)" == true ]]
 }
 # Classify plain connectivity without treating blocked global probes as proof of
 # a captive portal. Output: open, captive, restricted, or offline.
@@ -363,6 +368,7 @@ last_restore_marker=""
 tailscale_fail_samples=0
 login_session_id=""
 last_rearm_at=0
+coexistence_prepared=no
 
 state_value() { sed -n "s/^$1=//p" "$RECOVERY_STATE" 2>/dev/null | head -1; }
 load_recovery_state() {
@@ -634,6 +640,9 @@ while true; do
 
   # --- healthy: keep the binding live; resume on a green (re)appearance ---
   if [ "$s" = "Connected" ]; then
+    # The next disconnected recovery sequence gets one fresh vendor repair.
+    # Never reconfigure a healthy connected tunnel merely to refresh settings.
+    coexistence_prepared=no
     tif="$(tunnel_iface)"; ip=""
     [ -n "$tif" ] && ip="$(ifconfig "$tif" 2>/dev/null | awk '/inet /{print $2; exit}')"
     if [ -n "$ip" ]; then
@@ -730,9 +739,10 @@ while true; do
     write_sidecar "gave-up" "$s"; loop_sleep "$INTERVAL_OK" backoff || break; continue
   fi
 
-  if [[ "$ts_required" == yes ]] && ! "$TAILSCALE_BYPASS_CHECK" check-bypass >/dev/null 2>&1; then
-    log "required Tailscale coexistence settings drifted; attempting scoped repair"
-    if ! repair_coexistence || ! "$TAILSCALE_BYPASS_CHECK" check-bypass >/dev/null 2>&1; then
+  if [[ "$ts_required" == yes ]] && { [[ "$coexistence_prepared" != yes ]] || ! "$TAILSCALE_BYPASS_CHECK" check-bypass >/dev/null 2>&1; }; then
+    log "preparing required Tailscale coexistence before VPN recovery"
+    write_sidecar "coexistence-repair" "$s"
+    if ! repair_coexistence; then
       wait_for="$backoff"
       next_attempt_at=$(( now + wait_for ))
       backoff=$(( backoff * 2 )); [ "$backoff" -gt "$MAX_BACKOFF" ] && backoff="$MAX_BACKOFF"
@@ -741,6 +751,7 @@ while true; do
       loop_sleep "$wait_for" backoff || break
       continue
     fi
+    coexistence_prepared=yes
     log "required Tailscale coexistence settings restored"
   fi
 

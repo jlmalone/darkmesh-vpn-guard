@@ -357,9 +357,12 @@ VPN yield, and runs guarded Tailscale recovery. Override with
 
 At login and after a physical network change, the signed supervisor wakes the sole
 reconnect owner. It resets the connection retry window, preserves persistent app-restart
-limits, and retries with exponential backoff. A temporary Tailscale-priority standdown is
-cleared automatically after required Tailscale recovers. The scoped root helper also
-restores exact Tailscale split-tunnel bypass settings if ExpressVPN drops them after restart.
+limits, and retries with exponential backoff. A temporary Tailscale-priority standdown
+remains for one hour after a confirmed coexistence failure, even after required
+Tailscale recovers. Before each new VPN recovery sequence under a Tailscale-required
+profile, the scoped root helper reapplies and verifies the coexistence settings,
+including when the bypass rule already exists. Server Monitor's existing reconnect
+child owns this work. Healthy connected tunnels and explicit VPN-off choices remain unchanged.
 An explicit `darkmesh up` request, including the request made by setup, also reopens
 the connection retry budget without resetting the separate app-restart limits.
 

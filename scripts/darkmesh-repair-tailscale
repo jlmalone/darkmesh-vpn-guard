@@ -201,6 +201,12 @@ identity_before="$(tailnet_ip)"
 run_with_deadline "$CLI_TIMEOUT" "$TS" debug prefs >"$prefs_before" \
   || { echo "darkmesh: Tailscale preferences unavailable; refusing reset" >&2; exit 4; }
 
+now="$(date +%s)"
+if [[ "$MODE" == auto && -f "$STATE_FILE" ]]; then
+  last="$(stat -f %m "$STATE_FILE" 2>/dev/null || echo 0)"
+  if [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < COOLDOWN )); then exit 0; fi
+fi
+
 if ! prefs_value_is_true "$prefs_before" WantRunning; then
   if [[ "$REQUIRED" != yes ]]; then
     [[ "$MODE" == auto ]] && exit 0
@@ -242,12 +248,6 @@ if ! prefs_value_is_true "$prefs_before" WantRunning; then
   exit 0
 fi
 
-now="$(date +%s)"
-if [[ "$MODE" == auto && -f "$STATE_FILE" ]]; then
-  last="$(stat -f %m "$STATE_FILE" 2>/dev/null || echo 0)"
-  if [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < COOLDOWN )); then exit 0; fi
-fi
-
 mkdir -p "$(dirname "$STATE_FILE")"
 : >"$STATE_FILE"
 
@@ -279,9 +279,9 @@ fi
 identity_after="$(tailnet_ip)"
 [[ "$identity_after" == "$identity_before" ]] \
   || { echo "darkmesh: Tailscale identity changed unexpectedly" >&2; exit 1; }
-prefs_after="$(run_with_deadline "$CLI_TIMEOUT" "$TS" debug prefs)" \
+run_with_deadline "$CLI_TIMEOUT" "$TS" debug prefs >"$prefs_after" \
   || { echo "darkmesh: could not verify restored Tailscale preferences" >&2; exit 1; }
-cmp -s "$prefs_before" <(printf '%s\n' "$prefs_after") \
+cmp -s "$prefs_before" "$prefs_after" \
   || { echo "darkmesh: Tailscale preferences changed unexpectedly" >&2; exit 1; }
 
 repair_complete=yes
