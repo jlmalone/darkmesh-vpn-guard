@@ -218,7 +218,7 @@ tunnel_iface() {
 # Session\Interface preference, which is set ONLY by the WebUI's
 # current_network_interface key — NOT the legacy ini Connection\* keys the doctor
 # used to write. So we re-pin the RUNNING session through the API: correct key,
-# applied LIVE, no restart, no clobber race. (Transfer nodes run WebUI
+# applied through the current session or a contained restart. (Transfer nodes run WebUI
 # LocalHostAuth=off, so localhost needs no login; we attempt a keychain login if a
 # node requires auth.)
 # Real transfer-client specifics (app / process / .ini section / API base) load
@@ -254,22 +254,30 @@ prefs=json.load(sys.stdin)
 print("{}/{}".format(prefs.get("current_network_interface", ""), prefs.get("current_interface_address", "")))
 ' 2>/dev/null
 }
-client_repin() {  # <iface> <addr>
-  client_api POST /api/v2/app/setPreferences --data-urlencode "json={\"current_network_interface\":\"$1\",\"current_interface_address\":\"$2\"}" >/dev/null 2>&1
-}
-# Re-pin the transfer client's listen binding to the live tunnel via the Web UI
-# (live, no restart). No-op when already correct; falls back to the doctor only
-# when the Web UI is unreachable. <iface> <addr>
+# A preference readback alone does not prove the engine reopened its sockets.
+# Contain and restart on a changed binding; preserve the incident-owned set.
+# Limit restart attempts across supervisor restarts to one per five minutes.
 repin_only() {
   local tif="$1" ip="$2" cur expected
   if client_reachable; then
     cur="$(client_binding)"; expected="$tif/$ip"
     [ "$cur" = "$expected" ] && return 0
-    if client_repin "$tif" "$ip"; then
-      log "  re-pinned transfer client to ${tif:-?}/$ip via Web UI (was ${cur:-unset})"
-    else
-      log "  Web UI re-pin failed, falling back to transfer-vpn-doctor"; rebind_client
-    fi
+    (( now >= client_rebind_after )) || return 1
+    client_rebind_after=$((now + 300))
+    persist_recovery_state
+    "$VPN_GUARD" --force-unsafe >>"$LOG" 2>&1 || return 1
+    log "  changed transfer binding; restarting contained client for $expected"
+    "$DOCTOR" --fix --quit --relaunch >>"$LOG" 2>&1 || return 1
+    local attempt
+    for attempt in 1 2 3 4 5; do
+      if client_reachable && [[ "$(client_binding)" == "$expected" ]]; then
+        log "  restarted transfer client; binding verified as $expected"
+        return 0
+      fi
+      sleep 1
+    done
+    log "  transfer client restart not verified; containment retained"
+    return 1
   else
     rebind_client   # client/Web UI not up; doctor check (no-op if current)
   fi
@@ -369,6 +377,7 @@ tailscale_fail_samples=0
 login_session_id=""
 last_rearm_at=0
 coexistence_prepared=no
+client_rebind_after=0
 
 state_value() { sed -n "s/^$1=//p" "$RECOVERY_STATE" 2>/dev/null | head -1; }
 load_recovery_state() {
@@ -387,6 +396,7 @@ load_recovery_state() {
   v="$(state_value tailscale_fail_samples)"; [[ "$v" =~ ^[0-9]+$ ]] && tailscale_fail_samples="$v"
   login_session_id="$(state_value login_session_id)"
   v="$(state_value last_rearm_at)"; [[ "$v" =~ ^[0-9]+$ ]] && last_rearm_at="$v"
+  v="$(state_value client_rebind_after)"; [[ "$v" =~ ^[0-9]+$ ]] && client_rebind_after="$v"
   last_network_key="$(state_value last_network_key)"
   last_restore_marker="$(state_value last_restore_marker)"
 }
@@ -407,6 +417,7 @@ persist_recovery_state() {
     printf 'tailscale_fail_samples=%s\n' "$tailscale_fail_samples"
     printf 'login_session_id=%s\n' "$login_session_id"
     printf 'last_rearm_at=%s\n' "$last_rearm_at"
+    printf 'client_rebind_after=%s\n' "$client_rebind_after"
     printf 'last_restore_marker=%s\n' "$last_restore_marker"
   } > "$tmp" && chmod 0600 "$tmp" && mv -f "$tmp" "$RECOVERY_STATE"
 }
@@ -544,6 +555,40 @@ while true; do
 
   ts_required=no
   tailscale_required && ts_required=yes
+  # Extension UUIDs can change at reboot/update while the VPN reconnects first.
+  # Repair this concrete configuration defect before classifying a coexistence
+  # failure or honoring its cooldown. Never clear a cooldown for healthy rules.
+  if [[ "$d" == on && "$ts_required" == yes ]] && ! vpn_forbidden \
+    && ! "$TAILSCALE_BYPASS_CHECK" check-bypass >/dev/null 2>&1; then
+    if [[ "$s" != Disconnected ]]; then
+      enter_plain_state stale-tailscale-bypass "$s"
+      s="$(vpn_state)"; s="${s:-Disconnected}"
+    fi
+    if [[ "$s" != Disconnected ]]; then
+      write_sidecar "tailscale-bypass-required" "$s"
+      loop_sleep "$INTERVAL_RECOVER" backoff || break
+      continue
+    fi
+    if (( now < next_attempt_at )); then
+      write_sidecar "tailscale-bypass-required" "$s"
+      loop_sleep "$INTERVAL_RECOVER" backoff || break
+      continue
+    fi
+    if repair_coexistence; then
+      log "stale Tailscale bypass repaired; reopening bounded VPN recovery"
+      clear_tailscale_standdown
+      reset_connection_budget
+      coexistence_prepared=yes
+      persist_recovery_state
+    else
+      next_attempt_at=$((now + 300))
+      persist_recovery_state
+      log "stale Tailscale bypass repair failed; retry in 300 seconds"
+      write_sidecar "tailscale-bypass-required" "$s"
+      loop_sleep "$INTERVAL_RECOVER" backoff || break
+      continue
+    fi
+  fi
   ts_ready=no
   tailscale_ready && ts_ready=yes
   if [[ "$ts_required" == yes && "$ts_ready" != yes ]]; then
@@ -646,7 +691,11 @@ while true; do
     tif="$(tunnel_iface)"; ip=""
     [ -n "$tif" ] && ip="$(ifconfig "$tif" 2>/dev/null | awk '/inet /{print $2; exit}')"
     if [ -n "$ip" ]; then
-      repin_only "$tif" "$ip"
+      if ! repin_only "$tif" "$ip"; then
+        write_sidecar "transfer-rebind-wait" "$s"
+        loop_sleep "$INTERVAL_OK" idle || break
+        continue
+      fi
       if [ "$ip" != "$last_tunnel_ip" ] || [ "$tif" != "$last_tunnel_iface" ]; then
         log "tunnel up/changed (${last_tunnel_iface:-none}/${last_tunnel_ip:-none} -> $tif/$ip)"
         last_tunnel_ip="$ip"; last_tunnel_iface="$tif"

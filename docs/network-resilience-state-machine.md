@@ -157,6 +157,20 @@ trigger another repair even within the same sequence. This runs inside Server Mo
 existing reconnect child, without another scheduled job or administrator prompt.
 Explicit desired-off and VPN-forbidden policies remain authoritative.
 
+A missing exact bypass for the running Tailscale extension is repaired before
+the priority cooldown gate, including when the VPN connected during login.
+The owner first establishes transfer containment and restores plain networking,
+then uses the existing scoped helper. Only successful repair of that concrete
+defect clears the cooldown. Failed repairs wait five minutes between attempts;
+an intact bypass never clears a coexistence cooldown by itself.
+
+When a running transfer client's binding changes, preference readback is not
+sufficient socket-recovery evidence. The owner contains and journals the active
+set, gracefully restarts the client with the current tunnel binding, and verifies
+its API binding before ordinary guarded recovery. Restart attempts are limited
+to one per five minutes across supervisor restarts. Previously paused items stay
+outside the incident recovery set. A failed restart retains containment.
+
 ## Healthcheck relationship
 
 The healthcheck remains the safety observer and status writer. A DNS success
